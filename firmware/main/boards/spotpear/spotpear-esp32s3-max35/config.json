@@ -1,0 +1,15 @@
+{
+    "manufacturer": "spotpear",
+    "type": "spotpear-esp32s3-max35",
+    "target": "esp32s3",
+    "builds": [
+        {
+            "name": "spotpear-esp32s3-max35",
+            "sdkconfig_append": [
+                "CONFIG_SPIRAM_MODE_OCT=y",
+                "CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y",
+                "CONFIG_LV_USE_TABVIEW=y"
+            ]
+        }
+    ]
+}

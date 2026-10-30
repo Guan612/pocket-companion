@@ -443,6 +443,9 @@ choice BOARD_TYPE
     config BOARD_TYPE_SPOTPEAR_ESP32_S3_1_54_MUMA
         bool "Spotpear ESP32-S3 1.54 MUMA"
         depends on IDF_TARGET_ESP32S3
+    config BOARD_TYPE_SPOTPEAR_ESP32S3_MAX35
+        bool "SpotPear ESP32-S3 3.5-inch AI (MAX35, Nomi face)"
+        depends on IDF_TARGET_ESP32S3
     config BOARD_TYPE_SURFER_C3_1_14TFT
         bool "Surfer C3 1.14-inch TFT"
         depends on IDF_TARGET_ESP32C3
@@ -645,6 +648,14 @@ choice BOARD_TYPE
         bool "Zhengchen AI Camera Wi-Fi (征辰科技)"
         depends on IDF_TARGET_ESP32S3
 endchoice
+
+config DIRECT_API
+    bool "Talk to OpenAI-compatible APIs directly (no XiaoZhi server)"
+    default y if BOARD_TYPE_SPOTPEAR_ESP32S3_MAX35
+    default n
+    help
+        设备直接调用 OpenAI 兼容的 ASR / LLM / TTS 接口，不连小智服务器，
+        也跳过官方激活和 OTA。API 在设备的网页设置页里填写。
 
 choice XIAOZHI_NETWORK_TYPE
     prompt "Network Type"

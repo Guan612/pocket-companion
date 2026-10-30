@@ -11,6 +11,9 @@
 #include "system_info.h"
 #include "text_glyph_payload.h"
 #include "websocket_protocol.h"
+#if CONFIG_DIRECT_API
+#include "direct_api_protocol.h"
+#endif
 
 #include <driver/gpio.h>
 #include <esp_log.h>
@@ -366,11 +369,16 @@ void Application::ActivationTask() {
     // Create OTA object for activation process
     ota_ = std::make_unique<Ota>();
 
+#if CONFIG_DIRECT_API
+    // 直连 API 不连小智服务器：不激活，也不让官方 OTA 覆盖我们的固件
+    ota_->MarkCurrentVersionValid();
+#else
     // Check for new assets version
     CheckAssetsVersion();
 
     // Check for new firmware version
     CheckNewVersion();
+#endif
 
     // Initialize the protocol
     InitializeProtocol();
@@ -535,6 +543,11 @@ void Application::InitializeProtocol() {
 
     display->SetStatus(Lang::Strings::LOADING_PROTOCOL);
 
+#if CONFIG_DIRECT_API
+    if (true) {
+        protocol_ = std::make_unique<DirectApiProtocol>();
+    } else
+#endif
     if (ota_->HasMqttConfig()) {
         protocol_ = std::make_unique<MqttProtocol>();
     } else if (ota_->HasWebsocketConfig()) {
