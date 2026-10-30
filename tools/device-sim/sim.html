@@ -21,8 +21,9 @@ kbd{background:var(--card);border:1px solid #2c3040;border-radius:4px;padding:0 
 <body>
 <h1>设备模拟器 · 480×320</h1>
 <p>运行的是固件里同一份界面代码（nomi_ui.c、face.c，LVGL 9.5，小智的中文字体），鼠标当触摸。
-点一下屏幕开始说话，再点一下结束；长按屏幕打开设置菜单；右边圆钮或 <kbd>空格</kbd> 是 BOOT 键。空闲 60 秒会闭眼调暗（按 <kbd>Z</kbd> 立刻睡着），点屏幕唤醒。
-对话内容是模拟的，真正调 API 只在设备上。</p>
+左右滑切换 Nomi / 视觉模式，从顶部往下拉打开设置、往上推收起。
+说话用右边圆钮或 <kbd>空格</kbd>（BOOT 键，默认按住说话）。按 <kbd>Z</kbd> 立刻睡着，点屏幕唤醒。
+对话内容和视觉模式的取景画面都是模拟的，真正的摄像头和 API 只在设备上。</p>
 <div class="device">
   <canvas id="lcd" width="480" height="320"></canvas>
   <button class="boot" id="boot" title="BOOT 键">BOOT</button>
@@ -60,11 +61,16 @@ kbd{background:var(--card);border:1px solid #2c3040;border-radius:4px;padding:0 
     cv.addEventListener('pointermove',ev=>point(ev,down?1:0));
     cv.addEventListener('pointerup',ev=>{down=false;point(ev,0)});
     cv.addEventListener('contextmenu',ev=>ev.preventDefault());
-    document.getElementById('boot').onclick=()=>e.sim_boot_button();
+    // BOOT 键：按下 / 松开分开传，支持按住说话
+    const boot=document.getElementById('boot');
+    boot.addEventListener('pointerdown',()=>e.sim_boot_down());
+    boot.addEventListener('pointerup',()=>e.sim_boot_up());
+    boot.addEventListener('pointerleave',()=>e.sim_boot_up());
     addEventListener('keydown',ev=>{
-      if(ev.code==='Space'){ev.preventDefault();e.sim_boot_button()}
-      if(ev.code==='KeyZ')e.sim_force_sleep();  // 不用干等 60 秒
+      if(ev.code==='Space'){ev.preventDefault();if(!ev.repeat)e.sim_boot_down()}
+      if(ev.code==='KeyZ')e.sim_force_sleep();  // 不用干等调暗时间
     });
+    addEventListener('keyup',ev=>{if(ev.code==='Space')e.sim_boot_up()});
 
     let frames=0,area=0;
     const loop=()=>{

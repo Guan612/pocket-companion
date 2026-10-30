@@ -11,6 +11,7 @@
 #include "direct_api_protocol.h"
 #endif
 #include "nomi_display.h"
+#include "nomi_ui.h"
 #include "power_save_timer.h"
 #include "wifi_board.h"
 
@@ -25,6 +26,9 @@
 #include <esp_log.h>
 #include <esp_lvgl_port.h>
 
+#include <atomic>
+#include <mutex>
+
 #define TAG "SpotpearMax35"
 
 class SpotpearMax35Board : public WifiBoard {
@@ -35,6 +39,10 @@ private:
     AdcBatteryMonitor* battery_ = nullptr;
     PowerSaveTimer* power_save_timer_ = nullptr;
     Esp32Camera* camera_ = nullptr;
+    std::mutex camera_mutex_;        // 取景任务和提问时抓拍不能同时拿帧
+    std::atomic<bool> vision_on_{false};
+    std::atomic<bool> sleeping_{false};
+    bool holding_ = false;           // BOOT 键按住说话中
 
     // ES8311、GT911、摄像头 SCCB 共用这条总线
     void InitializeI2c() {
@@ -155,10 +163,12 @@ private:
         NomiDisplay::GetIdleSeconds(dim_seconds, off_seconds);
         power_save_timer_ = new PowerSaveTimer(-1, dim_seconds, off_seconds);
         power_save_timer_->OnEnterSleepMode([this]() {
+            sleeping_ = true;  // 取景也停掉
             display_->SetSleep(true);
             GetBacklight()->SetBrightness(DIM_BRIGHTNESS);
         });
         power_save_timer_->OnExitSleepMode([this]() {
+            sleeping_ = false;
             display_->SetSleep(false);
             GetBacklight()->RestoreBrightness();
         });
@@ -205,36 +215,54 @@ private:
         config.pixel_format = PIXFORMAT_RGB565;
         config.frame_size = FRAMESIZE_VGA;  // 640×480，识图够清楚，JPEG 约几十 KB
         config.jpeg_quality = 12;
-        config.fb_count = 2;  // Capture() 会占住一帧做预览，另一帧给大模型
+        config.fb_count = 2;  // 取景和提问时抓拍可能同时要帧
         config.fb_location = CAMERA_FB_IN_PSRAM;
-        config.grab_mode = CAMERA_GRAB_WHEN_EMPTY;
+        config.grab_mode = CAMERA_GRAB_LATEST;  // 取景要最新的一帧，不要排队的旧帧
         camera_ = new Esp32Camera(config);
 
-        // 拍一张给大模型看：屏幕先预览拍到的画面，然后开始聆听，用户说出问题后图文一起发出去
-        NomiDisplay::on_take_photo = [this]() {
-            power_save_timer_->WakeUp();
-            if (!camera_->Capture()) {
-                display_->ShowNotification("拍照失败，检查摄像头排线", 4000);
-                return;
-            }
+        vision_on_ = NomiDisplay::GetSavedInt(NOMI_KEY_MODE, NOMI_MODE_CHAT) == NOMI_MODE_VISION;
+        NomiDisplay::on_mode_changed = [this](int mode) { vision_on_ = mode == NOMI_MODE_VISION; };
 #if CONFIG_DIRECT_API
-            std::string jpeg = CaptureJpeg();
-            if (jpeg.empty()) {
-                display_->ShowNotification("照片编码失败", 4000);
-                return;
-            }
-            DirectApiProtocol::AttachImage(std::move(jpeg));
-            display_->ShowNotification("拍好了，说出你的问题", 3000);
-            auto& app = Application::GetInstance();
-            if (app.GetDeviceState() == kDeviceStateIdle) {
-                app.ToggleChatState();
-            }
-#endif
+        // 视觉模式：每轮说完话时抓一帧，和问题一起发给支持图片输入的大模型
+        DirectApiProtocol::image_provider = [this]() {
+            return vision_on_ ? CaptureJpeg() : std::string();
         };
+#endif
+        xTaskCreatePinnedToCore(PreviewTask, "cam_preview", 4096, this, 2, nullptr, 1);
     }
 
-    // 另取一帧 RGB565 转成 JPEG。摄像头输出是大端 RGB565，编码器要小端，先换字节
+    // 视觉模式且醒着时，约每 150 毫秒取一帧，缩成 320×240 送给界面做取景
+    static void PreviewTask(void* arg) {
+        auto* self = static_cast<SpotpearMax35Board*>(arg);
+        auto* preview = static_cast<uint16_t*>(
+            heap_caps_malloc(NOMI_PREVIEW_W * NOMI_PREVIEW_H * sizeof(uint16_t), MALLOC_CAP_SPIRAM));
+        while (preview != nullptr) {
+            vTaskDelay(pdMS_TO_TICKS(150));
+            if (!self->vision_on_ || self->sleeping_) continue;
+            std::lock_guard<std::mutex> lock(self->camera_mutex_);
+            camera_fb_t* fb = esp_camera_fb_get();
+            if (fb == nullptr) continue;
+            if (fb->format == PIXFORMAT_RGB565 && fb->width >= NOMI_PREVIEW_W &&
+                fb->height >= NOMI_PREVIEW_H) {
+                // 按比例抽点缩小，同时把摄像头的大端 RGB565 换成本机字节序
+                auto* src = reinterpret_cast<const uint16_t*>(fb->buf);
+                for (int y = 0; y < NOMI_PREVIEW_H; y++) {
+                    const uint16_t* row = src + (y * fb->height / NOMI_PREVIEW_H) * fb->width;
+                    for (int x = 0; x < NOMI_PREVIEW_W; x++) {
+                        preview[y * NOMI_PREVIEW_W + x] =
+                            __builtin_bswap16(row[x * fb->width / NOMI_PREVIEW_W]);
+                    }
+                }
+                self->display_->SetPreview(preview);
+            }
+            esp_camera_fb_return(fb);
+        }
+        vTaskDelete(nullptr);
+    }
+
+    // 取一帧 RGB565 转成 JPEG。摄像头输出是大端 RGB565，编码器要小端，先换字节
     std::string CaptureJpeg() {
+        std::lock_guard<std::mutex> lock(camera_mutex_);
         camera_fb_t* fb = esp_camera_fb_get();
         if (fb == nullptr) return "";
         std::string jpeg;
@@ -258,15 +286,31 @@ private:
         return jpeg;
     }
 
+    // BOOT 键说话：默认按住说话（像对讲机），设置里可改成点一下开始、说完自动结束
+    bool HoldToTalk() { return NomiDisplay::GetSavedInt(NOMI_KEY_TALK_KEY, 0) == 0; }
+
     void InitializeButtons() {
-        boot_button_.OnClick([this]() {
+        boot_button_.OnPressDown([this]() {
             power_save_timer_->WakeUp();
+            auto& app = Application::GetInstance();
+            if (HoldToTalk() && app.GetDeviceState() != kDeviceStateStarting) {
+                holding_ = true;
+                app.StartListening();
+            }
+        });
+        boot_button_.OnPressUp([this]() {
+            if (holding_) {
+                holding_ = false;
+                Application::GetInstance().StopListening();
+            }
+        });
+        boot_button_.OnClick([this]() {
             auto& app = Application::GetInstance();
             if (app.GetDeviceState() == kDeviceStateStarting) {
                 EnterWifiConfigMode();
                 return;
             }
-            app.ToggleChatState();
+            if (!HoldToTalk()) app.ToggleChatState();
         });
     }
 

@@ -35,6 +35,11 @@ const Field kAsr[] = {
     {"asr_model", "模型", "whisper-1", false},
     {"asr_lang", "语言", "zh", false},
 };
+const Field kVision[] = {
+    {"vision_url", "地址", "留空沿用大模型的地址", false},
+    {"vision_key", "Key", "留空沿用大模型的 key", true},
+    {"vision_model", "模型", "留空沿用大模型；需支持图片输入，如 gpt-4o-mini、qwen-vl-max", false},
+};
 const Field kTts[] = {
     {"tts_url", "地址", "留空沿用大模型的地址", false},
     {"tts_key", "Key", "留空沿用大模型的 key", true},
@@ -124,6 +129,7 @@ esp_err_t HandleIndex(httpd_req_t* req) {
     html += "<fieldset><legend>人设提示词</legend><textarea name=prompt rows=4 "
             "placeholder='留空用默认提示词'>" +
             HtmlEscape(s.GetString("prompt")) + "</textarea></fieldset>";
+    AppendGroup(html, s, "视觉模式大模型（带图提问时用）", kVision, std::size(kVision));
     AppendGroup(html, s, "语音识别 ASR", kAsr, std::size(kAsr));
     AppendGroup(html, s, "语音合成 TTS", kTts, std::size(kTts));
     html += "<button>保存</button></form></main></html>";
@@ -169,6 +175,7 @@ esp_err_t HandleSave(httpd_req_t* req) {
             continue;
         }
         SaveField(s, kLlm, std::size(kLlm), key, value);
+        SaveField(s, kVision, std::size(kVision), key, value);
         SaveField(s, kAsr, std::size(kAsr), key, value);
         SaveField(s, kTts, std::size(kTts), key, value);
     }

@@ -201,6 +201,11 @@ DirectApiConfig DirectApiConfig::Load() {
     if (c.asr.key.empty()) c.asr.key = c.llm.key;
     if (c.tts.url.empty()) c.tts.url = c.llm.url;
     if (c.tts.key.empty()) c.tts.key = c.llm.key;
+    c.vision = {TrimSlash(s.GetString("vision_url", c.llm.url)), s.GetString("vision_key", c.llm.key),
+                s.GetString("vision_model", c.llm.model)};
+    if (c.vision.url.empty()) c.vision.url = c.llm.url;
+    if (c.vision.key.empty()) c.vision.key = c.llm.key;
+    if (c.vision.model.empty()) c.vision.model = c.llm.model;
     c.tts_voice = s.GetString("tts_voice", "alloy");
     c.asr_language = s.GetString("asr_lang", "zh");
     c.system_prompt = s.GetString("prompt", kDefaultPrompt);
@@ -383,6 +388,11 @@ void DirectApiProtocol::RunTurn(std::vector<std::vector<uint8_t>> packets) {
     std::string text = Transcribe(cfg, packets);
     packets.clear();
     if (cancel_) return;
+    // 视觉模式：说完话的这一刻拍一张，和问题一起发
+    if (!text.empty() && !HasPendingImage() && image_provider) {
+        std::string jpeg = image_provider();
+        if (!jpeg.empty()) AttachImage(std::move(jpeg));
+    }
     if (text.empty() && HasPendingImage()) {
         text = kDefaultImageQuestion;  // 拍了照但没说话
     }
@@ -469,8 +479,11 @@ std::string DirectApiProtocol::Transcribe(const DirectApiConfig& cfg,
 std::string DirectApiProtocol::Chat(const DirectApiConfig& cfg, const std::string& user_text) {
     history_.emplace_back("user", user_text);
 
+    // 这一轮带图就用视觉模型（可在网页设置页单独配置，默认和对话模型一样）
+    std::string image = TakePendingImage();
+    const DirectApiEndpoint& ep = image.empty() ? cfg.llm : cfg.vision;
     cJSON* req = cJSON_CreateObject();
-    cJSON_AddStringToObject(req, "model", cfg.llm.model.c_str());
+    cJSON_AddStringToObject(req, "model", ep.model.c_str());
     cJSON* messages = cJSON_AddArrayToObject(req, "messages");
     auto add = [messages](const std::string& role, const std::string& content) {
         cJSON* m = cJSON_CreateObject();
@@ -480,7 +493,6 @@ std::string DirectApiProtocol::Chat(const DirectApiConfig& cfg, const std::strin
     };
     add("system", cfg.system_prompt);
     // 历史只存文字；这一轮如果拍了照，用户消息改成"文字 + 图片"的多模态格式
-    std::string image = TakePendingImage();
     for (size_t i = 0; i < history_.size(); i++) {
         if (i + 1 < history_.size() || image.empty()) {
             add(history_[i].first, history_[i].second);
@@ -504,11 +516,11 @@ std::string DirectApiProtocol::Chat(const DirectApiConfig& cfg, const std::strin
     char* json = cJSON_PrintUnformatted(req);
     cJSON_Delete(req);
 
-    auto http = NewHttp(cfg.llm.key);
+    auto http = NewHttp(ep.key);
     http->SetHeader("Content-Type", "application/json");
     http->SetContent(std::string(json));
     cJSON_free(json);
-    if (!http->Open("POST", cfg.llm.url + "/chat/completions")) {
+    if (!http->Open("POST", ep.url + "/chat/completions")) {
         history_.pop_back();
         SetError("大模型连接失败");
         return "";
@@ -609,6 +621,8 @@ static int PostStatus(Http& http, const std::string& url) {
     auto status = http.GetStatusCode();
     return status ? *status : 0;
 }
+
+std::function<std::string()> DirectApiProtocol::image_provider;
 
 void DirectApiProtocol::AttachImage(std::string jpeg) {
     std::lock_guard<std::mutex> lock(g_image_mutex);

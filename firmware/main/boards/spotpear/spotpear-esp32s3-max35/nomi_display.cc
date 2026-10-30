@@ -70,10 +70,6 @@ nomi_state_t GetState() {
     }
 }
 
-void ToggleChat() { Application::GetInstance().ToggleChatState(); }
-void StartListening() { Application::GetInstance().StartListening(); }
-void StopListening() { Application::GetInstance().StopListening(); }
-
 void UserActivity() {
     if (NomiDisplay::on_user_activity) NomiDisplay::on_user_activity();
 }
@@ -134,7 +130,9 @@ void SetInt(const char* key, int value, bool final) {
     }
 
     Settings(kNomiNs, true).SetInt(key, value);
-    if (!strcmp(key, NOMI_KEY_AEC)) {
+    if (!strcmp(key, NOMI_KEY_MODE)) {
+        if (NomiDisplay::on_mode_changed) NomiDisplay::on_mode_changed(value);
+    } else if (!strcmp(key, NOMI_KEY_AEC)) {
         ApplyAec(value);
     } else if (!strcmp(key, NOMI_KEY_DIM) || !strcmp(key, NOMI_KEY_OFF)) {
         if (NomiDisplay::on_power_timing_changed) NomiDisplay::on_power_timing_changed();
@@ -179,12 +177,7 @@ const char* GetText(const char* key) {
 
 void Action(const char* name) {
     auto& app = Application::GetInstance();
-    if (!strcmp(name, "take_photo")) {
-        // 拍照会阻塞几百毫秒，放到主循环里做，别卡住 LVGL 任务
-        app.Schedule([]() {
-            if (NomiDisplay::on_take_photo) NomiDisplay::on_take_photo();
-        });
-    } else if (!strcmp(name, "reconfigure_wifi")) {
+    if (!strcmp(name, "reconfigure_wifi")) {
         app.Schedule([]() { static_cast<WifiBoard&>(Board::GetInstance()).EnterWifiConfigMode(); });
     } else if (!strcmp(name, "factory_reset")) {
         app.Schedule([]() {
@@ -213,7 +206,7 @@ void Action(const char* name) {
 
 bool NomiDisplay::aec_supported = false;
 std::function<void()> NomiDisplay::on_user_activity;
-std::function<void()> NomiDisplay::on_take_photo;
+std::function<void(int)> NomiDisplay::on_mode_changed;
 std::function<void()> NomiDisplay::on_power_timing_changed;
 
 NomiDisplay::NomiDisplay(esp_lcd_panel_io_handle_t panel_io, esp_lcd_panel_handle_t panel,
@@ -254,9 +247,6 @@ void NomiDisplay::SetupUI() {
 
     static const nomi_ui_callbacks_t callbacks = {
         .get_state = GetState,
-        .toggle_chat = ToggleChat,
-        .start_listening = StartListening,
-        .stop_listening = StopListening,
         .user_activity = UserActivity,
         .get_int = GetInt,
         .set_int = SetInt,
@@ -341,6 +331,14 @@ void NomiDisplay::SetPreviewImage(std::unique_ptr<LvglImage> image) {
     // 小智的预览图在我们的界面下面，提到最上层；它自己的定时器到时会再隐藏
     DisplayLockGuard lock(this);
     lv_obj_move_foreground(preview_image_);
+}
+
+int NomiDisplay::GetSavedInt(const char* key, int def) { return Settings(kNomiNs).GetInt(key, def); }
+
+void NomiDisplay::SetPreview(const uint16_t* pixels) {
+    if (!ui_ready_) return;
+    DisplayLockGuard lock(this);
+    nomi_ui_set_preview(pixels);
 }
 
 void NomiDisplay::SetSleep(bool sleeping) {

@@ -17,18 +17,25 @@
 #define C_CONTROL 0x2c3040
 #define C_ACCENT 0x6aa6ff
 #define C_DANGER 0xff6b6b
+#define C_PAGE 0x111318
 
 static nomi_ui_callbacks_t s_cb;
 static const lv_font_t *s_font;
 static uint16_t *s_buf;
-static lv_obj_t *s_screen, *s_canvas, *s_status, *s_battery, *s_gear, *s_subtitle, *s_toast;
-static lv_obj_t *s_settings;  // 设置页，打开时才创建
-static lv_obj_t *s_camera;    // 相机页，打开时才创建
+
+// 页面结构：外层上下翻（设置 / 主界面），主界面里左右翻（Nomi / 视觉），状态栏和字幕浮在主界面上
+static lv_obj_t *s_outer, *s_settings_tile, *s_main_tile;
+static lv_obj_t *s_modes, *s_chat_tile, *s_vision_tile;
+static lv_obj_t *s_canvas, *s_mini_face, *s_preview, *s_preview_hint;
+static lv_obj_t *s_status, *s_mode_label, *s_battery, *s_subtitle, *s_toast;
+static lv_draw_buf_t *s_preview_buf;
 static lv_timer_t *s_toast_timer;
 static uint32_t s_last_ms, s_emotion_until;
 static float s_acc;
 static face_mode_t s_emotion_mode = FACE_IDLE;
-static bool s_sleeping, s_subtitles_on = true, s_holding;
+static bool s_sleeping, s_subtitles_on = true;
+static int s_mode = NOMI_MODE_CHAT;
+static bool s_mode_by_code;  // 代码切换模式时不当作用户选择保存
 
 static int get_int(const char *key, int def) { return s_cb.get_int ? s_cb.get_int(key, def) : def; }
 static void set_int(const char *key, int value, bool final)
@@ -44,9 +51,14 @@ static void action(const char *name)
 {
     if (s_cb.action) s_cb.action(name);
 }
+static void user_activity(void)
+{
+    if (s_cb.user_activity) s_cb.user_activity();
+}
 
-static void close_settings(void);
-static void close_camera(void);
+static void show_main(bool anim);
+static void show_mode(int mode, bool anim);
+static void on_face_pressed(lv_event_t *e);
 
 // 二维码用 Nayuki 的 qrcodegen：设备上由小智依赖的 esp_emote_gfx 带进来，模拟器里由 LVGL 带进来。
 // 两份同名，不能同时链接，所以不打开 LVGL 的 qrcode 控件，只声明这里用到的三个函数。
@@ -95,7 +107,7 @@ static lv_obj_t *s_zzz[ZZZ_COUNT];
 static void update_zzz(uint32_t now)
 {
     for (int i = 0; i < ZZZ_COUNT; i++) {
-        if (!s_sleeping || s_settings || s_camera) {
+        if (!s_sleeping) {
             lv_obj_add_flag(s_zzz[i], LV_OBJ_FLAG_HIDDEN);
             continue;
         }
@@ -125,13 +137,12 @@ static void face_tick(lv_timer_t *timer)
     lv_obj_set_flag(s_status, LV_OBJ_FLAG_HIDDEN, state == NOMI_STATE_IDLE || s_sleeping);
     update_zzz(now);
 
-    // 设置页、相机页盖住整屏时不用重画脸
-    if (s_settings || s_camera) return;
-    // 表情直接画进画布缓冲，只通知 LVGL 重画变化的那块
+    // 表情直接画进画布缓冲，只通知 LVGL 重画变化的那块；视觉模式角落的小脸用的是同一块缓冲
     rrect_t d = face_render(s_buf);
     if (!rrect_empty(d)) {
         lv_area_t area = {d.x0, d.y0, d.x1 - 1, d.y1 - 1};
         lv_obj_invalidate_area(s_canvas, &area);
+        if (s_mode == NOMI_MODE_VISION) lv_obj_invalidate(s_mini_face);
     }
 }
 
@@ -149,12 +160,12 @@ static void set_color(lv_obj_t *obj, uint32_t color)
     lv_obj_set_style_text_color(obj, lv_color_hex(color), 0);
 }
 
-// 字体设在几个顶层对象上，设置页里的文字跟着继承
+// 字体设在几个顶层对象上，里面的文字跟着继承
 void nomi_ui_set_font(const lv_font_t *font)
 {
     if (!font) return;
     s_font = font;
-    lv_obj_t *roots[] = {s_status, s_subtitle, s_toast, s_settings};
+    lv_obj_t *roots[] = {s_status, s_mode_label, s_subtitle, s_toast, s_settings_tile, s_vision_tile};
     for (size_t i = 0; i < sizeof(roots) / sizeof(roots[0]); i++) {
         if (roots[i]) lv_obj_set_style_text_font(roots[i], font, 0);
     }
@@ -197,14 +208,21 @@ void nomi_ui_set_battery(int level, bool charging)
     lv_obj_remove_flag(s_battery, LV_OBJ_FLAG_HIDDEN);
 }
 
+// 睡着时回到主界面、显示大脸（取景也停了）；醒来回到原来的模式
 void nomi_ui_set_sleep(bool sleeping)
 {
     s_sleeping = sleeping;
     face_set_sleep(sleeping);
     if (sleeping) {
         lv_obj_add_flag(s_subtitle, LV_OBJ_FLAG_HIDDEN);
-        close_settings();
-        close_camera();
+        show_main(false);
+        if (s_mode == NOMI_MODE_VISION) {
+            s_mode_by_code = true;
+            lv_tileview_set_tile(s_modes, s_chat_tile, LV_ANIM_OFF);
+            s_mode_by_code = false;
+        }
+    } else if (s_mode == NOMI_MODE_VISION) {
+        show_mode(NOMI_MODE_VISION, false);
     }
 }
 
@@ -224,6 +242,49 @@ void nomi_ui_notify(const char *text, uint32_t duration_ms)
     if (s_toast_timer) lv_timer_delete(s_toast_timer);
     s_toast_timer = lv_timer_create(hide_toast, duration_ms, NULL);
     lv_timer_set_repeat_count(s_toast_timer, 1);
+}
+
+/* ---------- 视觉模式：实时取景 ---------- */
+
+void nomi_ui_set_preview(const uint16_t *pixels)
+{
+    if (!s_preview_buf || !pixels) return;
+    memcpy(s_preview_buf->data, pixels, NOMI_PREVIEW_W * NOMI_PREVIEW_H * sizeof(uint16_t));
+    lv_obj_add_flag(s_preview_hint, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_invalidate(s_preview);
+}
+
+static void build_vision(void)
+{
+    // 取景画面 320×240，放大 1.5 倍铺满 480×320（上下各裁掉一点）
+    s_preview_buf = lv_draw_buf_create(NOMI_PREVIEW_W, NOMI_PREVIEW_H, LV_COLOR_FORMAT_RGB565, 0);
+    if (s_preview_buf) {
+        memset(s_preview_buf->data, 0, s_preview_buf->data_size);
+        s_preview = lv_image_create(s_vision_tile);
+        lv_image_set_src(s_preview, s_preview_buf);
+        lv_image_set_scale(s_preview, 384);  // 256 为原大小
+        lv_obj_center(s_preview);
+    }
+
+    s_preview_hint = lv_label_create(s_vision_tile);
+    lv_label_set_text(s_preview_hint, "正在打开摄像头…");
+    set_color(s_preview_hint, C_MUTED);
+    lv_obj_center(s_preview_hint);
+
+    // 角落里的小号 Nomi：直接缩放显示大脸那块缓冲，状态和大脸完全同步
+    s_mini_face = lv_image_create(s_vision_tile);
+    lv_image_set_src(s_mini_face, lv_canvas_get_draw_buf(s_canvas));
+    lv_image_set_scale(s_mini_face, 72);  // 约 135×90
+    lv_image_set_inner_align(s_mini_face, LV_IMAGE_ALIGN_CENTER);
+    lv_obj_set_size(s_mini_face, 136, 90);
+    lv_obj_set_style_radius(s_mini_face, 14, 0);
+    lv_obj_set_style_clip_corner(s_mini_face, true, 0);
+    lv_obj_set_style_border_color(s_mini_face, lv_color_hex(C_CONTROL), 0);
+    lv_obj_set_style_border_width(s_mini_face, 2, 0);
+    lv_obj_align(s_mini_face, LV_ALIGN_BOTTOM_RIGHT, -10, -10);
+
+    lv_obj_add_flag(s_vision_tile, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(s_vision_tile, on_face_pressed, LV_EVENT_PRESSED, NULL);
 }
 
 /* ---------- 设置页的小部件 ---------- */
@@ -364,7 +425,7 @@ static int build_map(const char *list, char *buf, size_t buf_size, const char **
 static lv_obj_t *add_qrcode(lv_obj_t *parent, const char *text)
 {
     static uint8_t qr[512], tmp[512];  // 版本 10 以内够用，网址很短
-    static uint16_t *pixels;           // 画布缓冲常驻，不随设置页释放（删除是异步的）
+    static uint16_t *pixels;           // 画布缓冲常驻，设置页重建时不用重新分配
     if (!qrcodegen_encodeText(text, tmp, qr, 0, 1, 10, -1, true)) return NULL;
     if (!pixels) pixels = malloc(QR_MAX_PX * QR_MAX_PX * sizeof(uint16_t));
     if (!pixels) return NULL;
@@ -402,7 +463,7 @@ static void on_action_button(lv_event_t *e)
         lv_label_set_text(lv_obj_get_child(btn, 0), "再点一次确认");
         return;
     }
-    if (dangerous) close_settings();
+    if (dangerous) show_main(true);
     action(name);
 }
 
@@ -431,7 +492,7 @@ static lv_obj_t *add_button_row(lv_obj_t *page)
     return row;
 }
 
-/* ---------- 设置页 ---------- */
+/* ---------- 设置页（顶部下拉） ---------- */
 
 static lv_obj_t *add_page(lv_obj_t *tabview, const char *name)
 {
@@ -440,21 +501,20 @@ static lv_obj_t *add_page(lv_obj_t *tabview, const char *name)
     lv_obj_set_flex_flow(page, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_style_pad_all(page, 16, 0);
     lv_obj_set_style_pad_right(page, 20, 0);
+    lv_obj_set_style_pad_bottom(page, 28, 0);  // 给底部的收起提示留位置
     lv_obj_set_scrollbar_mode(page, LV_SCROLLBAR_MODE_ACTIVE);
     return page;
 }
 
 static void build_chat_page(lv_obj_t *page)
 {
-    static const char *const modes[] = {"点一下开始", "按住说话", ""};
-    add_choice(page, "对话方式", "主界面右滑或点左上角齿轮进设置，左滑进相机", NOMI_KEY_CHAT_MODE,
-               modes, 1);
+    static const char *const talk[] = {"按住说话", "点一下开始", ""};
+    add_choice(page, "BOOT 键", "也可以直接喊「你好小智」", NOMI_KEY_TALK_KEY, talk, 1);
     bool aec_ok = get_int(NOMI_KEY_AEC_SUPPORTED, 0);
     add_switch(page, "随时插话打断",
                aec_ok ? "它说话时直接开口就能打断" : "这块板没有喇叭回采，不支持", NOMI_KEY_AEC,
                aec_ok);
     add_switch(page, "显示字幕", NULL, NOMI_KEY_SUBTITLES, true);
-    add_info(page, "唤醒词", "你好小智");
 }
 
 static void build_role_page(lv_obj_t *page)
@@ -468,7 +528,7 @@ static void build_role_page(lv_obj_t *page)
         add_choice(page, "音色", "OpenAI 的音色名，别家的音色请在网页设置页里填", NOMI_KEY_VOICE,
                    voice_map, rows);
     }
-    add_info(page, "自定义", "人设提示词、API 地址和 Key 在网页设置页里改，地址见「网络」");
+    add_info(page, "自定义", "人设提示词、API 地址和 Key、视觉模式用的模型，都在网页设置页里改");
 }
 
 static void build_display_page(lv_obj_t *page)
@@ -498,51 +558,35 @@ static void build_network_page(lv_obj_t *page)
 static void build_system_page(lv_obj_t *page)
 {
     add_info(page, "版本", get_text("version"));
-    lv_obj_t *row = add_button_row(page);
-    add_action(row, "测试 API", "test_api", false);
+    add_action(add_button_row(page), "测试 API", "test_api", false);
     add_action(add_button_row(page), "恢复出厂设置", "factory_reset", true);
 }
 
-static void on_close(lv_event_t *e)
+static void on_grip_clicked(lv_event_t *e)
 {
     (void)e;
-    close_settings();
+    show_main(true);
 }
 
-static void close_settings(void)
+// 设置页每次从主界面拉下来时重建，保证显示的是最新的值
+static void build_settings(void)
 {
-    if (!s_settings) return;
-    lv_obj_delete_async(s_settings);  // 可能正处在设置页自己的事件回调里
-    s_settings = NULL;
-    lv_obj_invalidate(s_canvas);
-}
+    lv_obj_clean(s_settings_tile);
 
-// 每次打开都重建，保证显示的是最新的值
-static void open_settings(void)
-{
-    if (s_settings) return;
-    close_camera();
-    s_settings = lv_obj_create(s_screen);
-    lv_obj_remove_style_all(s_settings);
-    lv_obj_set_size(s_settings, LV_PCT(100), LV_PCT(100));
-    lv_obj_set_style_bg_color(s_settings, lv_color_hex(0x111318), 0);
-    lv_obj_set_style_bg_opa(s_settings, LV_OPA_COVER, 0);
-    lv_obj_set_style_text_font(s_settings, s_font, 0);
-    set_color(s_settings, C_TEXT);
-    lv_obj_add_flag(s_settings, LV_OBJ_FLAG_CLICKABLE);  // 挡住下面的脸
-
-    lv_obj_t *tv = lv_tabview_create(s_settings);
+    lv_obj_t *tv = lv_tabview_create(s_settings_tile);
     lv_obj_set_size(tv, LV_PCT(100), LV_PCT(100));
     lv_tabview_set_tab_bar_position(tv, LV_DIR_LEFT);
     lv_tabview_set_tab_bar_size(tv, 92);
     lv_obj_set_style_bg_opa(tv, LV_OPA_TRANSP, 0);
     lv_obj_t *bar = lv_tabview_get_tab_bar(tv);
+    lv_obj_t *content = lv_tabview_get_content(tv);
     // 默认主题会给标签页各层设自带字体，挡住从外面继承的中文字体
     lv_obj_set_style_text_font(tv, s_font, 0);
     lv_obj_set_style_text_font(bar, s_font, 0);
-    lv_obj_set_style_text_font(lv_tabview_get_content(tv), s_font, 0);
+    lv_obj_set_style_text_font(content, s_font, 0);
     lv_obj_set_style_bg_color(bar, lv_color_hex(C_PANEL), 0);
-    lv_obj_set_style_pad_top(bar, 52, 0);  // 给左上角的关闭按钮留位置
+    // 分类只靠左边标签切换；内容区不横滑，免得和翻页抢手势
+    lv_obj_remove_flag(content, LV_OBJ_FLAG_SCROLLABLE);
 
     build_chat_page(add_page(tv, "对话"));
     build_role_page(add_page(tv, "角色"));
@@ -566,193 +610,178 @@ static void open_settings(void)
         lv_obj_set_style_border_width(btn, 3, LV_STATE_CHECKED);
     }
 
-    lv_obj_t *close = lv_button_create(s_settings);
-    lv_obj_set_size(close, 76, 40);
-    lv_obj_align(close, LV_ALIGN_TOP_LEFT, 8, 6);
-    lv_obj_set_style_bg_color(close, lv_color_hex(C_CONTROL), 0);
-    lv_obj_set_style_radius(close, 10, 0);
-    lv_obj_set_style_shadow_width(close, 0, 0);
-    lv_obj_add_event_cb(close, on_close, LV_EVENT_CLICKED, NULL);
-    lv_obj_t *label = lv_label_create(close);
-    lv_label_set_text(label, "返回");
-    lv_obj_center(label);
+    // 底部一条把手区：在这里往上推或点一下收起设置。内容区本身能上下滚动，推它是翻内容
+    lv_obj_t *grip_zone = lv_obj_create(s_settings_tile);
+    lv_obj_remove_style_all(grip_zone);
+    lv_obj_set_size(grip_zone, LV_PCT(100), 28);
+    lv_obj_align(grip_zone, LV_ALIGN_BOTTOM_RIGHT, 0, 0);
+    lv_obj_set_style_pad_left(grip_zone, 92, 0);  // 横条居中在内容区，避开左边的标签栏
+    lv_obj_add_flag(grip_zone, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(grip_zone, on_grip_clicked, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *grip = lv_obj_create(grip_zone);
+    lv_obj_remove_style_all(grip);
+    lv_obj_set_size(grip, 44, 4);
+    lv_obj_set_style_radius(grip, 2, 0);
+    lv_obj_set_style_bg_color(grip, lv_color_hex(C_MUTED), 0);
+    lv_obj_set_style_bg_opa(grip, LV_OPA_60, 0);
+    lv_obj_align(grip, LV_ALIGN_CENTER, 0, 0);
 }
 
-/* ---------- 相机页（主界面左滑）：拍照给大模型看 ---------- */
+/* ---------- 翻页 ---------- */
 
-static void close_camera(void)
+static void show_main(bool anim)
 {
-    if (!s_camera) return;
-    lv_obj_delete_async(s_camera);
-    s_camera = NULL;
-    lv_obj_invalidate(s_canvas);
+    lv_tileview_set_tile(s_outer, s_main_tile, anim ? LV_ANIM_ON : LV_ANIM_OFF);
 }
 
-static void on_camera_close(lv_event_t *e)
+static void show_mode(int mode, bool anim)
 {
-    (void)e;
-    close_camera();
+    s_mode_by_code = true;
+    lv_tileview_set_tile(s_modes, mode == NOMI_MODE_VISION ? s_vision_tile : s_chat_tile,
+                         anim ? LV_ANIM_ON : LV_ANIM_OFF);
+    s_mode_by_code = false;
 }
 
-// 拍完回到主界面：屏幕先预览拍到的画面，接着开始聆听，问题和照片一起发给大模型
-static void on_shutter(lv_event_t *e)
+static void update_mode_label(void)
 {
-    (void)e;
-    close_camera();
-    action("take_photo");
+    lv_label_set_text(s_mode_label, s_mode == NOMI_MODE_VISION ? "视觉模式" : "");
 }
 
-static void open_camera(void)
-{
-    if (s_camera || s_settings) return;
-    s_camera = lv_obj_create(s_screen);
-    lv_obj_remove_style_all(s_camera);
-    lv_obj_set_size(s_camera, LV_PCT(100), LV_PCT(100));
-    lv_obj_set_style_bg_color(s_camera, lv_color_hex(0x111318), 0);
-    lv_obj_set_style_bg_opa(s_camera, LV_OPA_COVER, 0);
-    lv_obj_set_style_text_font(s_camera, s_font, 0);
-    set_color(s_camera, C_TEXT);
-    lv_obj_add_flag(s_camera, LV_OBJ_FLAG_CLICKABLE);
-
-    lv_obj_t *hint = lv_label_create(s_camera);
-    lv_label_set_text(hint, "拍一张，然后说出你的问题\n它会看着照片回答");
-    lv_obj_set_style_text_align(hint, LV_TEXT_ALIGN_CENTER, 0);
-    set_color(hint, C_MUTED);
-    lv_obj_align(hint, LV_ALIGN_TOP_MID, 0, 64);
-
-    // 快门：白色实心圆，外面一圈白环
-    lv_obj_t *shutter = lv_button_create(s_camera);
-    lv_obj_set_size(shutter, 96, 96);
-    lv_obj_align(shutter, LV_ALIGN_CENTER, 0, 24);
-    lv_obj_set_style_radius(shutter, LV_RADIUS_CIRCLE, 0);
-    lv_obj_set_style_bg_color(shutter, lv_color_white(), 0);
-    lv_obj_set_style_bg_color(shutter, lv_color_hex(0xc8ccd6), LV_STATE_PRESSED);
-    lv_obj_set_style_border_color(shutter, lv_color_hex(0x111318), 0);
-    lv_obj_set_style_border_width(shutter, 6, 0);
-    lv_obj_set_style_outline_color(shutter, lv_color_white(), 0);
-    lv_obj_set_style_outline_width(shutter, 4, 0);
-    lv_obj_set_style_shadow_width(shutter, 0, 0);
-    lv_obj_add_event_cb(shutter, on_shutter, LV_EVENT_CLICKED, NULL);
-
-    lv_obj_t *close = lv_button_create(s_camera);
-    lv_obj_set_size(close, 76, 40);
-    lv_obj_align(close, LV_ALIGN_TOP_LEFT, 8, 6);
-    lv_obj_set_style_bg_color(close, lv_color_hex(C_CONTROL), 0);
-    lv_obj_set_style_radius(close, 10, 0);
-    lv_obj_set_style_shadow_width(close, 0, 0);
-    lv_obj_add_event_cb(close, on_camera_close, LV_EVENT_CLICKED, NULL);
-    lv_obj_t *label = lv_label_create(close);
-    lv_label_set_text(label, "返回");
-    lv_obj_center(label);
-}
-
-/* ---------- 入口 ---------- */
-
-static void on_face(lv_event_t *e)
-{
-    lv_event_code_t code = lv_event_get_code(e);
-    static bool press_woke;  // 这一下是不是用来叫醒它的
-    bool hold_mode = get_int(NOMI_KEY_CHAT_MODE, 0) == 1;
-
-    if (code == LV_EVENT_PRESSED) {
-        press_woke = s_sleeping;
-        if (s_cb.user_activity) s_cb.user_activity();  // 设备上会同步退出休眠
-        if (!press_woke && hold_mode && s_cb.start_listening) {
-            s_holding = true;
-            s_cb.start_listening();
-        }
-        return;
-    }
-    if (code == LV_EVENT_RELEASED) {
-        if (s_holding && s_cb.stop_listening) s_cb.stop_listening();
-        s_holding = false;
-        return;
-    }
-    if (press_woke) return;
-    if (code == LV_EVENT_GESTURE) {
-        lv_dir_t dir = lv_indev_get_gesture_dir(lv_indev_active());
-        lv_indev_wait_release(lv_indev_active());  // 这次抬手不再算点击
-        if (s_holding && s_cb.stop_listening) s_cb.stop_listening();  // 按住说话时滑走就算了
-        s_holding = false;
-        if (dir == LV_DIR_LEFT) open_camera();
-        else if (dir == LV_DIR_RIGHT) open_settings();
-        return;
-    }
-    if (hold_mode) return;
-    if (code == LV_EVENT_SHORT_CLICKED) {
-        if (s_cb.toggle_chat) s_cb.toggle_chat();
-    } else if (code == LV_EVENT_LONG_PRESSED) {
-        open_settings();
-    }
-}
-
-static void on_gear(lv_event_t *e)
+// 外层开始上下翻：从主界面往下拉时先把设置页刷新成最新的值
+static void on_outer_scroll(lv_event_t *e)
 {
     (void)e;
-    if (s_cb.user_activity) s_cb.user_activity();
-    if (!s_sleeping) open_settings();
+    user_activity();
+    if (lv_tileview_get_tile_active(s_outer) == s_main_tile) build_settings();
+}
+
+// 左右翻到另一个模式：记下来并告诉设备（开关取景、提问时要不要带照片）
+static void on_mode_changed(lv_event_t *e)
+{
+    (void)e;
+    if (s_mode_by_code) return;
+    int mode = lv_tileview_get_tile_active(s_modes) == s_vision_tile ? NOMI_MODE_VISION : NOMI_MODE_CHAT;
+    if (mode == s_mode) return;
+    s_mode = mode;
+    if (mode == NOMI_MODE_CHAT) lv_obj_remove_flag(s_preview_hint, LV_OBJ_FLAG_HIDDEN);
+    update_mode_label();
+    set_int(NOMI_KEY_MODE, mode, true);
+}
+
+static void on_modes_scroll(lv_event_t *e)
+{
+    (void)e;
+    user_activity();
+}
+
+// 触摸只用来叫醒它；说话交给 BOOT 键和唤醒词
+static void on_face_pressed(lv_event_t *e)
+{
+    (void)e;
+    user_activity();
+}
+
+static lv_obj_t *add_tile(lv_obj_t *tileview, uint8_t col, uint8_t row, lv_dir_t dir, uint32_t bg)
+{
+    lv_obj_t *tile = lv_tileview_add_tile(tileview, col, row, dir);
+    lv_obj_set_style_bg_color(tile, lv_color_hex(bg), 0);
+    lv_obj_set_style_bg_opa(tile, LV_OPA_COVER, 0);
+    set_color(tile, C_TEXT);
+    lv_obj_remove_flag(tile, LV_OBJ_FLAG_SCROLLABLE);
+    return tile;
+}
+
+static lv_obj_t *add_tileview(lv_obj_t *parent)
+{
+    lv_obj_t *tv = lv_tileview_create(parent);
+    lv_obj_set_size(tv, LV_PCT(100), LV_PCT(100));
+    lv_obj_set_style_bg_color(tv, lv_color_black(), 0);
+    lv_obj_set_scrollbar_mode(tv, LV_SCROLLBAR_MODE_OFF);
+    return tv;
 }
 
 void nomi_ui_create(lv_obj_t *screen, uint16_t *face_buf, const lv_font_t *font,
                     const nomi_ui_callbacks_t *callbacks)
 {
-    s_screen = screen;
     s_buf = face_buf;
     s_font = font;
     s_cb = *callbacks;
     s_subtitles_on = get_int(NOMI_KEY_SUBTITLES, 1);
+    s_mode = get_int(NOMI_KEY_MODE, NOMI_MODE_CHAT) == NOMI_MODE_VISION ? NOMI_MODE_VISION : NOMI_MODE_CHAT;
 
     lv_obj_set_style_bg_color(screen, lv_color_black(), 0);
     lv_obj_remove_flag(screen, LV_OBJ_FLAG_SCROLLABLE);
 
+    // 外层：设置在上，主界面在下
+    s_outer = add_tileview(screen);
+    s_settings_tile = add_tile(s_outer, 0, 0, LV_DIR_BOTTOM, C_PAGE);
+    s_main_tile = add_tile(s_outer, 0, 1, LV_DIR_TOP, 0x000000);
+    lv_obj_add_event_cb(s_outer, on_outer_scroll, LV_EVENT_SCROLL_BEGIN, NULL);
+
+    // 主界面里：Nomi 在左，视觉在右
+    s_modes = add_tileview(s_main_tile);
+    s_chat_tile = add_tile(s_modes, 0, 0, LV_DIR_RIGHT, 0x000000);
+    s_vision_tile = add_tile(s_modes, 1, 0, LV_DIR_LEFT, 0x000000);
+    lv_obj_add_event_cb(s_modes, on_mode_changed, LV_EVENT_VALUE_CHANGED, NULL);
+    lv_obj_add_event_cb(s_modes, on_modes_scroll, LV_EVENT_SCROLL_BEGIN, NULL);
+
     face_init(lv_tick_get() * 2654435761u + 1);
     face_render(s_buf);  // 第一帧整屏画好
-    s_canvas = lv_canvas_create(screen);
+    s_canvas = lv_canvas_create(s_chat_tile);
     lv_canvas_set_buffer(s_canvas, s_buf, FACE_W, FACE_H, LV_COLOR_FORMAT_RGB565);
     lv_obj_set_pos(s_canvas, 0, 0);
     lv_obj_add_flag(s_canvas, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_add_event_cb(s_canvas, on_face, LV_EVENT_PRESSED, NULL);
-    lv_obj_add_event_cb(s_canvas, on_face, LV_EVENT_RELEASED, NULL);
-    lv_obj_add_event_cb(s_canvas, on_face, LV_EVENT_SHORT_CLICKED, NULL);
-    lv_obj_add_event_cb(s_canvas, on_face, LV_EVENT_LONG_PRESSED, NULL);
-    lv_obj_add_event_cb(s_canvas, on_face, LV_EVENT_GESTURE, NULL);
-    lv_obj_remove_flag(s_canvas, LV_OBJ_FLAG_GESTURE_BUBBLE);  // 默认手势交给父对象，这里自己接
-
-    s_status = lv_label_create(screen);
-    set_color(s_status, C_MUTED);
-    lv_obj_align(s_status, LV_ALIGN_TOP_MID, 0, 8);
-    lv_label_set_text(s_status, "");
-
-    // 左上角齿轮：任何模式下都能进设置
-    s_gear = lv_label_create(screen);
-    lv_obj_set_style_text_font(s_gear, &lv_font_montserrat_14, 0);
-    set_color(s_gear, C_MUTED);
-    lv_label_set_text(s_gear, LV_SYMBOL_SETTINGS);
-    lv_obj_set_style_pad_all(s_gear, 12, 0);
-    lv_obj_align(s_gear, LV_ALIGN_TOP_LEFT, 0, 0);
-    lv_obj_add_flag(s_gear, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_add_event_cb(s_gear, on_gear, LV_EVENT_CLICKED, NULL);
+    lv_obj_add_event_cb(s_canvas, on_face_pressed, LV_EVENT_PRESSED, NULL);
 
     for (int i = 0; i < ZZZ_COUNT; i++) {
-        s_zzz[i] = lv_label_create(screen);
+        s_zzz[i] = lv_label_create(s_chat_tile);
         lv_label_set_text(s_zzz[i], "z");
         set_color(s_zzz[i], C_TEXT);
         lv_obj_add_flag(s_zzz[i], LV_OBJ_FLAG_HIDDEN);
     }
 
-    s_battery = lv_label_create(screen);
+    build_vision();
+
+    // 以下浮在主界面上，左右切模式时不动
+    lv_obj_t *grip = lv_obj_create(s_main_tile);  // 顶部小横条：提示往下拉打开设置
+    lv_obj_remove_style_all(grip);
+    lv_obj_set_size(grip, 44, 4);
+    lv_obj_set_style_radius(grip, 2, 0);
+    lv_obj_set_style_bg_color(grip, lv_color_hex(C_MUTED), 0);
+    lv_obj_set_style_bg_opa(grip, LV_OPA_50, 0);
+    lv_obj_align(grip, LV_ALIGN_TOP_MID, 0, 6);
+
+    s_status = lv_label_create(s_main_tile);
+    set_color(s_status, C_MUTED);
+    lv_obj_align(s_status, LV_ALIGN_TOP_MID, 0, 16);
+    lv_label_set_text(s_status, "");
+
+    s_mode_label = lv_label_create(s_main_tile);
+    set_color(s_mode_label, C_MUTED);
+    lv_obj_align(s_mode_label, LV_ALIGN_TOP_LEFT, 12, 10);
+
+    s_battery = lv_label_create(s_main_tile);
     lv_obj_set_style_text_font(s_battery, &lv_font_montserrat_14, 0);
     lv_obj_align(s_battery, LV_ALIGN_TOP_RIGHT, -12, 10);
     lv_obj_add_flag(s_battery, LV_OBJ_FLAG_HIDDEN);
 
-    s_subtitle = lv_label_create(screen);
+    s_subtitle = lv_label_create(s_main_tile);
     set_color(s_subtitle, C_TEXT);
     lv_obj_set_width(s_subtitle, FACE_W - 40);
     lv_label_set_long_mode(s_subtitle, LV_LABEL_LONG_MODE_DOTS);
     lv_obj_set_style_text_align(s_subtitle, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_bg_color(s_subtitle, lv_color_black(), 0);  // 视觉模式下压在画面上也看得清
+    lv_obj_set_style_bg_opa(s_subtitle, LV_OPA_50, 0);
+    lv_obj_set_style_radius(s_subtitle, 8, 0);
     lv_obj_align(s_subtitle, LV_ALIGN_BOTTOM_MID, 0, -10);
     lv_obj_add_flag(s_subtitle, LV_OBJ_FLAG_HIDDEN);
 
+    build_settings();
+    show_main(false);
+    show_mode(s_mode, false);
+    update_mode_label();
+
+    // 通知条在最上层，翻到哪一页都看得到
     s_toast = lv_label_create(screen);
     set_color(s_toast, C_TEXT);
     lv_obj_set_style_bg_color(s_toast, lv_color_hex(C_PANEL), 0);

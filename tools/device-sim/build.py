@@ -19,7 +19,7 @@ BOARD = FIRMWARE / "main" / "boards" / "spotpear" / "spotpear-esp32s3-max35"
 EXPORTS = [
     "sim_init", "sim_frame", "sim_clear_dirty", "sim_lcd",
     "sim_dirty_x0", "sim_dirty_y0", "sim_dirty_x1", "sim_dirty_y1",
-    "sim_font_buffer", "sim_brightness", "sim_volume", "sim_boot_button", "sim_pointer", "sim_force_sleep",
+    "sim_font_buffer", "sim_brightness", "sim_volume", "sim_boot_down", "sim_boot_up", "sim_pointer", "sim_force_sleep",
 ]
 
 
@@ -37,7 +37,7 @@ def lvgl_dir():
 
 
 # 控件开关跟着固件的 sdkconfig 走：模拟器能用的控件，设备上一定也开着
-WIDGETS = ["ANIMIMAGE", "ARC", "BAR", "BUTTON", "BUTTONMATRIX", "CALENDAR", "CANVAS", "CHART",
+WIDGETS = ["ANIMIMG", "ARC", "BAR", "BUTTON", "BUTTONMATRIX", "CALENDAR", "CANVAS", "CHART",
            "CHECKBOX", "DROPDOWN", "IMAGE", "IMAGEBUTTON", "KEYBOARD", "LABEL", "LED", "LINE",
            "LIST", "MENU", "MSGBOX", "ROLLER", "SCALE", "SLIDER", "SPAN", "SPINBOX", "SPINNER",
            "SWITCH", "TABLE", "TABVIEW", "TEXTAREA", "TILEVIEW", "WIN"]

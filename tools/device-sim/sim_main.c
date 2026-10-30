@@ -1,8 +1,9 @@
 // 设备模拟器：LVGL + 固件的 nomi_ui / face 代码编成 WebAssembly，由 sim.html 驱动。
 //
-// LVGL 刷屏写进 s_lcd（相当于屏幕显存），鼠标当触摸。
-// 对话流程是假的：点一下开始聆听，再点一下（或 4 秒后）进入思考，然后念两句示例台词，
-// 用来看整套交互；真正的 API 调用只在设备上跑。
+// LVGL 刷屏写进 s_lcd（相当于屏幕显存），鼠标当触摸，空格当 BOOT 键。
+// 对话流程是假的：按住 BOOT 聆听，松开后思考，然后念两句示例台词，用来看整套交互；
+// 视觉模式的取景是程序生成的假画面。真正的摄像头和 API 调用只在设备上跑。
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -18,6 +19,7 @@
 
 static uint16_t s_lcd[LCD_W * LCD_H];
 static uint16_t s_face[FACE_W * FACE_H];
+static uint16_t s_preview[NOMI_PREVIEW_W * NOMI_PREVIEW_H];
 static uint8_t s_draw_buf[LCD_W * DRAW_LINES * 2] __attribute__((aligned(64)));
 static int s_dx0 = LCD_W, s_dy0 = LCD_H, s_dx1, s_dy1;
 static int s_px, s_py, s_pressed;
@@ -28,12 +30,12 @@ static uint32_t s_ms;
 typedef enum { PHASE_IDLE, PHASE_LISTEN, PHASE_THINK, PHASE_SAY1, PHASE_SAY2, PHASE_DONE } phase_t;
 
 static phase_t s_phase = PHASE_IDLE;
-static bool s_photo;  // 这一轮带了照片
 static uint32_t s_phase_at;
-static int s_volume = 70, s_brightness = 80;
+static bool s_holding;  // BOOT 键按住说话中
 
 // 设置项存在内存里，刷新页面就没了
-static int s_chat_mode, s_aec, s_subtitles = 1, s_persona, s_voice = 4, s_dim = 1, s_off = 1;
+static int s_mode, s_talk_key, s_aec, s_subtitles = 1, s_persona, s_voice = 4, s_dim = 1, s_off = 1;
+static int s_volume = 70, s_brightness = 80;
 
 // 休眠：时间按设置页的选项，默认 1 分钟闭眼调暗、5 分钟息屏
 #define DIM_BRIGHTNESS 5
@@ -57,6 +59,7 @@ static void sleep_now(void)
 
 static void enter(phase_t phase)
 {
+    bool vision = s_mode == NOMI_MODE_VISION;
     s_phase = phase;
     s_phase_at = s_ms;
     switch (phase) {
@@ -68,19 +71,19 @@ static void enter(phase_t phase)
         nomi_ui_set_subtitle(NULL, NULL);
         break;
     case PHASE_THINK:
-        nomi_ui_set_status("思考中…");
-        nomi_ui_set_subtitle("user", s_photo ? "这是什么植物？" : "今天适合出去走走吗？");
+        nomi_ui_set_status(vision ? "看一看…" : "思考中…");
+        nomi_ui_set_subtitle("user", vision ? "这是什么植物？" : "今天适合出去走走吗？");
         nomi_ui_set_emotion("thinking");
         break;
     case PHASE_SAY1:
         nomi_ui_set_status("说话中…");
         nomi_ui_set_emotion("happy");
-        nomi_ui_set_subtitle("assistant", s_photo ? "这是一盆绿萝，叶子很精神，看得出你照顾得不错。"
-                                                  : "当然适合！外面阳光正好，气温也舒服。");
+        nomi_ui_set_subtitle("assistant", vision ? "这是一盆绿萝，叶子很精神，看得出你照顾得不错。"
+                                                : "当然适合！外面阳光正好，气温也舒服。");
         break;
     case PHASE_SAY2:
-        nomi_ui_set_subtitle("assistant", s_photo ? "它喜欢散射光，一周浇一次水就够了。"
-                                                  : "记得带瓶水，傍晚可能会起风哦。");
+        nomi_ui_set_subtitle("assistant", vision ? "它喜欢散射光，一周浇一次水就够了。"
+                                                : "记得带瓶水，傍晚可能会起风哦。");
         break;
     case PHASE_DONE:
         nomi_ui_set_status("待机");
@@ -100,15 +103,34 @@ static void advance(void)
         else if (s_sleep_level == 1 && off_s[s_off] > 0 && idle > (uint32_t)off_s[s_off] * 1000) s_sleep_level = 2;
     }
     uint32_t t = s_ms - s_phase_at;
-    if (s_phase == PHASE_LISTEN && t > 4000) enter(PHASE_THINK);
+    // 点一下模式说完自动结束；按住说话要等松开
+    if (s_phase == PHASE_LISTEN && !s_holding && t > 4000) enter(PHASE_THINK);
     else if (s_phase == PHASE_THINK && t > 1500) enter(PHASE_SAY1);
     else if (s_phase == PHASE_SAY1 && t > 2800) enter(PHASE_SAY2);
     else if (s_phase == PHASE_SAY2 && t > 2800) enter(PHASE_DONE);
     else if (s_phase == PHASE_DONE && t > 3000) {
         nomi_ui_set_subtitle(NULL, NULL);
         s_phase = PHASE_IDLE;
-        s_photo = false;
     }
+}
+
+// 假取景：缓慢移动的彩色渐变加一个圆，看得出画面在动
+static void update_preview(void)
+{
+    static uint32_t last;
+    if (s_mode != NOMI_MODE_VISION || s_sleep_level || s_ms - last < 150) return;
+    last = s_ms;
+    float t = s_ms / 1000.0f;
+    int cx = (int)(160 + 60 * sinf(t * 0.7f)), cy = (int)(120 + 30 * cosf(t * 0.9f));
+    for (int y = 0; y < NOMI_PREVIEW_H; y++) {
+        for (int x = 0; x < NOMI_PREVIEW_W; x++) {
+            int r = 40 + x / 4, g = 60 + y / 3, b = 90 + (int)(40 * sinf(t + x * 0.02f));
+            int dx = x - cx, dy = y - cy;
+            if (dx * dx + dy * dy < 40 * 40) r = 120, g = 200, b = 110;  // 一盆"绿萝"
+            s_preview[y * NOMI_PREVIEW_W + x] = (uint16_t)(((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3));
+        }
+    }
+    nomi_ui_set_preview(s_preview);
 }
 
 static nomi_state_t get_state(void)
@@ -120,20 +142,12 @@ static nomi_state_t get_state(void)
     }
 }
 
-// 和小智的 ToggleChatState 对应：待机→聆听，聆听→结束说话，说话中→打断
-static void toggle_chat(void)
-{
-    wake();
-    if (s_phase == PHASE_IDLE || s_phase == PHASE_DONE) enter(PHASE_LISTEN);
-    else if (s_phase == PHASE_LISTEN) enter(PHASE_THINK);
-    else enter(PHASE_IDLE);
-}
-
 static int get_int(const char *key, int def)
 {
+    if (!strcmp(key, NOMI_KEY_MODE)) return s_mode;
+    if (!strcmp(key, NOMI_KEY_TALK_KEY)) return s_talk_key;
     if (!strcmp(key, NOMI_KEY_VOLUME)) return s_volume;
     if (!strcmp(key, NOMI_KEY_BRIGHTNESS)) return s_brightness;
-    if (!strcmp(key, NOMI_KEY_CHAT_MODE)) return s_chat_mode;
     if (!strcmp(key, NOMI_KEY_AEC)) return s_aec;
     if (!strcmp(key, NOMI_KEY_AEC_SUPPORTED)) return 1;
     if (!strcmp(key, NOMI_KEY_SUBTITLES)) return s_subtitles;
@@ -147,9 +161,10 @@ static int get_int(const char *key, int def)
 static void set_int(const char *key, int value, bool final)
 {
     (void)final;
-    if (!strcmp(key, NOMI_KEY_VOLUME)) s_volume = value;
+    if (!strcmp(key, NOMI_KEY_MODE)) s_mode = value;
+    else if (!strcmp(key, NOMI_KEY_TALK_KEY)) s_talk_key = value;
+    else if (!strcmp(key, NOMI_KEY_VOLUME)) s_volume = value;
     else if (!strcmp(key, NOMI_KEY_BRIGHTNESS)) s_brightness = value;
-    else if (!strcmp(key, NOMI_KEY_CHAT_MODE)) s_chat_mode = value;
     else if (!strcmp(key, NOMI_KEY_AEC)) s_aec = value;
     else if (!strcmp(key, NOMI_KEY_SUBTITLES)) s_subtitles = value;
     else if (!strcmp(key, NOMI_KEY_PERSONA)) s_persona = value;
@@ -171,23 +186,9 @@ static const char *get_text(const char *key)
 
 static void action(const char *name)
 {
-    if (!strcmp(name, "take_photo")) {
-        // 真机上会先在屏幕上预览拍到的画面，再开始聆听；问题和照片一起发给大模型
-        s_photo = true;
-        nomi_ui_notify("（模拟）拍好了，说出你的问题", 3000);
-        wake();
-        enter(PHASE_LISTEN);
-    }
-    else if (!strcmp(name, "test_api")) nomi_ui_notify("（模拟）大模型正常 · 语音合成支持 opus", 4000);
+    if (!strcmp(name, "test_api")) nomi_ui_notify("（模拟）大模型正常 · 语音合成支持 opus", 4000);
     else if (!strcmp(name, "reconfigure_wifi")) nomi_ui_notify("（模拟）设备重启进入配网模式", 4000);
     else if (!strcmp(name, "factory_reset")) nomi_ui_notify("（模拟）已恢复出厂设置，设备重启", 4000);
-}
-
-// 按住说话：按下开始聆听，松开进入思考
-static void start_listening(void) { wake(); enter(PHASE_LISTEN); }
-static void stop_listening(void)
-{
-    if (s_phase == PHASE_LISTEN) enter(PHASE_THINK);
 }
 
 /* ---------- LVGL 驱动 ---------- */
@@ -243,9 +244,6 @@ void sim_init(uint32_t ms)
 
     static const nomi_ui_callbacks_t callbacks = {
         .get_state = get_state,
-        .toggle_chat = toggle_chat,
-        .start_listening = start_listening,
-        .stop_listening = stop_listening,
         .user_activity = wake,
         .get_int = get_int,
         .set_int = set_int,
@@ -266,6 +264,7 @@ int sim_frame(uint32_t ms)
 {
     s_ms = ms;
     advance();
+    update_preview();
     lv_timer_handler();
     return s_dx1 > s_dx0 ? (s_dx1 - s_dx0) * (s_dy1 - s_dy0) : 0;
 }
@@ -288,7 +287,29 @@ int sim_brightness(void)
 }
 void sim_force_sleep(void) { sleep_now(); }
 int sim_volume(void) { return s_volume; }
-void sim_boot_button(void) { toggle_chat(); }
+
+// BOOT 键：按住说话模式按下开始、松开结束；点一下模式按下时切换（和设备一致）
+void sim_boot_down(void)
+{
+    wake();
+    if (s_talk_key == 0) {
+        s_holding = true;
+        enter(PHASE_LISTEN);
+    } else if (s_phase == PHASE_IDLE || s_phase == PHASE_DONE) {
+        enter(PHASE_LISTEN);
+    } else if (s_phase == PHASE_LISTEN) {
+        enter(PHASE_THINK);
+    } else {
+        enter(PHASE_IDLE);
+    }
+}
+
+void sim_boot_up(void)
+{
+    if (!s_holding) return;
+    s_holding = false;
+    if (s_phase == PHASE_LISTEN) enter(PHASE_THINK);
+}
 
 void sim_pointer(int x, int y, int pressed)
 {

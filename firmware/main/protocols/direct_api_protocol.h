@@ -15,6 +15,7 @@
 #include <freertos/task.h>
 
 #include <atomic>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -29,6 +30,7 @@ struct DirectApiEndpoint {
 
 struct DirectApiConfig {
     DirectApiEndpoint asr, llm, tts;
+    DirectApiEndpoint vision;  // 带图的请求用它；没单独填就和 llm 一样
     std::string tts_voice;
     std::string asr_language;
     std::string system_prompt;
@@ -58,6 +60,9 @@ public:
 
     // 附上一张 JPEG，下一轮提问时和问题一起发给大模型（多模态）；没说话就默认问看到了什么
     static void AttachImage(std::string jpeg);
+
+    // 视觉模式：设了它，每轮提问时调用它拍一张（返回 JPEG，空串表示这轮不带图）
+    static std::function<std::string()> image_provider;
 
 protected:
     bool SendText(const std::string& text) override;
