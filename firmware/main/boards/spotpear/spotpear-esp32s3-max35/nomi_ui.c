@@ -87,6 +87,27 @@ static face_mode_t pick_mode(uint32_t now)
     }
 }
 
+// 睡着时脸的右上方飘起三个 z：从下往上、由小到大，淡入淡出，错开循环
+#define ZZZ_COUNT 3
+#define ZZZ_PERIOD_MS 2400
+static lv_obj_t *s_zzz[ZZZ_COUNT];
+
+static void update_zzz(uint32_t now)
+{
+    for (int i = 0; i < ZZZ_COUNT; i++) {
+        if (!s_sleeping || s_settings || s_camera) {
+            lv_obj_add_flag(s_zzz[i], LV_OBJ_FLAG_HIDDEN);
+            continue;
+        }
+        float phase = (float)((now + i * ZZZ_PERIOD_MS / ZZZ_COUNT) % ZZZ_PERIOD_MS) / ZZZ_PERIOD_MS;
+        float fade = phase < 0.2f ? phase / 0.2f : (phase > 0.7f ? (1 - phase) / 0.3f : 1);
+        lv_obj_set_pos(s_zzz[i], 318 + (int)(phase * 34), 112 - (int)(phase * 64));
+        lv_obj_set_style_text_opa(s_zzz[i], (lv_opa_t)(fade * 200), 0);
+        lv_obj_set_style_transform_scale(s_zzz[i], (int32_t)(256 + phase * 256), 0);  // 256 为原大小
+        lv_obj_remove_flag(s_zzz[i], LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
 static void face_tick(lv_timer_t *timer)
 {
     (void)timer;
@@ -98,6 +119,11 @@ static void face_tick(lv_timer_t *timer)
     face_mode_t mode = pick_mode(now);
     if (mode != face_get_mode()) face_set_mode(mode);
     for (; s_acc >= STEP_S; s_acc -= STEP_S) face_step(STEP_S);
+
+    // 待机和睡着时不显示状态文字，脸本身就说明了
+    nomi_state_t state = s_cb.get_state ? s_cb.get_state() : NOMI_STATE_IDLE;
+    lv_obj_set_flag(s_status, LV_OBJ_FLAG_HIDDEN, state == NOMI_STATE_IDLE || s_sleeping);
+    update_zzz(now);
 
     // 设置页、相机页盖住整屏时不用重画脸
     if (s_settings || s_camera) return;
@@ -132,6 +158,7 @@ void nomi_ui_set_font(const lv_font_t *font)
     for (size_t i = 0; i < sizeof(roots) / sizeof(roots[0]); i++) {
         if (roots[i]) lv_obj_set_style_text_font(roots[i], font, 0);
     }
+    for (int i = 0; i < ZZZ_COUNT; i++) lv_obj_set_style_text_font(s_zzz[i], font, 0);
     lv_obj_set_height(s_subtitle, lv_font_get_line_height(font) * 2);  // 最多两行
 }
 
@@ -705,6 +732,13 @@ void nomi_ui_create(lv_obj_t *screen, uint16_t *face_buf, const lv_font_t *font,
     lv_obj_align(s_gear, LV_ALIGN_TOP_LEFT, 0, 0);
     lv_obj_add_flag(s_gear, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_add_event_cb(s_gear, on_gear, LV_EVENT_CLICKED, NULL);
+
+    for (int i = 0; i < ZZZ_COUNT; i++) {
+        s_zzz[i] = lv_label_create(screen);
+        lv_label_set_text(s_zzz[i], "z");
+        set_color(s_zzz[i], C_TEXT);
+        lv_obj_add_flag(s_zzz[i], LV_OBJ_FLAG_HIDDEN);
+    }
 
     s_battery = lv_label_create(screen);
     lv_obj_set_style_text_font(s_battery, &lv_font_montserrat_14, 0);
