@@ -27,6 +27,9 @@ static uint32_t s_rng;
 static rrect_t s_prev;
 static int s_first = 1;
 static int s_sleep;
+static float s_wake_t = -1;  // 醒来动画进行了多久，<0 表示没在播
+static float s_fall_t = -1;  // 入睡动画进行了多久，<0 表示没在播（已经睡熟或醒着）
+#define FALL_ASLEEP_S 2.2f   // 入睡动画时长，播完 Z 才开始冒
 
 static spring_t spring(float x, float k, float d) { return (spring_t){x, 0, x, k, d}; }
 
@@ -82,7 +85,14 @@ const char *face_mode_name(face_mode_t mode)
 
 void face_set_level(float level) { s_level = level; }
 
-void face_set_sleep(int sleeping) { s_sleep = sleeping; }
+void face_set_sleep(int sleeping)
+{
+    if (s_sleep && !sleeping) s_wake_t = 0;  // 从睡着到醒来，播一遍伸懒腰
+    if (!s_sleep && sleeping) s_fall_t = 0;  // 从醒着到睡着，先犯困再闭眼
+    if (sleeping) s_wake_t = -1;
+    else s_fall_t = -1;
+    s_sleep = sleeping;
+}
 
 static float speech_level(void)
 {
@@ -150,6 +160,46 @@ void face_step(float dt)
         P.hl.t = P.hr.t = P.smile.t = P.happy.t = P.blush.t = 0;
         P.wide.t = 1;
         s_bob = sinf(s_time * 0.8f) * 2.5f + 3;  // 慢呼吸，整张脸略微下沉
+        if (s_fall_t >= 0) {
+            // 入睡：眼皮耷拉、视线下垂 → 闭一下又撑开一条缝 → 彻底合上
+            s_fall_t += dt;
+            float t = s_fall_t;
+            if (t < 0.9f) {
+                P.open.t = 0.45f;
+                P.gy.t = 0.35f;
+            } else if (t < 1.15f) {
+                P.open.t = 0.02f;
+            } else if (t < 1.6f) {
+                P.open.t = 0.25f;
+                P.gy.t = 0.35f;
+            } else if (t >= FALL_ASLEEP_S) {
+                s_fall_t = -1;
+            }
+            s_bob = 3 * (t < FALL_ASLEEP_S ? t / FALL_ASLEEP_S : 1);  // 脸慢慢沉下去
+        }
+    } else if (s_wake_t >= 0) {
+        // 醒来伸懒腰：眯开一条缝 → 用力眨一下 → 睁大眼、举起小手、抬脸晃一下 → 放下回到待机
+        s_wake_t += dt;
+        float t = s_wake_t;
+        if (t < 0.35f) {
+            P.open.t = 0.18f;
+            s_bob = 3;
+        } else if (t < 0.55f) {
+            P.open.t = 0.02f;
+        } else if (t < 1.4f) {
+            P.open.t = 1;
+            P.wide.t = 1.18f;
+            P.hl.t = P.hr.t = 0.85f;
+            P.tilt.t = 0.25f * sinf((t - 0.55f) * 7);
+            P.gx.t = P.gy.t = 0;
+            s_bob = -4 * sinf((t - 0.55f) / 0.85f * PI_F);
+        } else if (t < 1.8f) {
+            P.hl.t = P.hr.t = 0;
+            P.wide.t = 1;
+            P.tilt.t = 0;
+        } else {
+            s_wake_t = -1;
+        }
     }
 
     spring_t *all[] = {&P.open, &P.gx, &P.gy, &P.mouth, &P.wide, &P.tilt,
@@ -226,7 +276,7 @@ static void draw_face(raster_t *r)
         }
     }
 
-    if (s_sleep) draw_zzz(r, base, cx, cy);
+    if (s_sleep && s_fall_t < 0) draw_zzz(r, base, cx, cy);  // 睡熟了才冒 Z
 
     // 小手：从屏幕下沿滑进来
     for (int s = -1; s <= 1; s += 2) {
