@@ -1,0 +1,87 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>设备模拟器</title>
+<style>
+:root{color-scheme:dark;--bg:#111318;--fg:#e8eaf0;--muted:#8b90a0;--card:#1b1e26;--accent:#6aa6ff}
+*{box-sizing:border-box}
+body{margin:0;padding:16px;background:var(--bg);color:var(--fg);font:14px/1.5 system-ui,"PingFang SC","Microsoft YaHei",sans-serif}
+h1{font-size:18px;margin:0 0 4px}
+p{margin:0 0 12px;color:var(--muted)}
+.bar{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin-bottom:12px}
+button{background:var(--card);color:var(--fg);border:1px solid #2c3040;border-radius:8px;padding:6px 12px;cursor:pointer;font:inherit}
+button.on{border-color:var(--accent);color:var(--accent)}
+label{color:var(--muted);display:flex;gap:6px;align-items:center}
+.device{display:inline-block;padding:18px;border-radius:22px;background:#2a2d36;max-width:100%}
+canvas{display:block;width:min(720px,calc(100vw - 68px));aspect-ratio:3/2;image-rendering:pixelated;background:#000}
+#stats{margin-top:10px;color:var(--muted);font-variant-numeric:tabular-nums}
+</style>
+</head>
+<body>
+<h1>设备模拟器 · 480×320</h1>
+<p>运行的是固件里的 face.c 和 raster.c（firmware/main/boards/spotpear/spotpear-esp32s3-max35/） 编译出的 WebAssembly，和板子上同一份代码。按键 1–6 或空格（等同 BOOT 键）切换。</p>
+<div class="bar" id="bar"></div>
+<div class="device"><canvas id="lcd" width="480" height="320"></canvas></div>
+<div id="stats"></div>
+<script>
+const MODES=['待机','聆听','思考','说话','开心','疑惑'];
+const STEP=1/60, FRAME_MS=33, AUTO_MS=3500;
+
+(async()=>{
+  // 表情代码只用到数学函数，WASI 接口给空实现即可
+  const wasi=new Proxy({},{get:()=>()=>0});
+  const {instance}=await WebAssembly.instantiateStreaming(fetch('face.wasm'),{wasi_snapshot_preview1:wasi});
+  const e=instance.exports;
+  e._initialize&&e._initialize();
+  e.sim_init(Date.now()>>>0);
+  const W=e.sim_w(),H=e.sim_h();
+  const ctx=document.getElementById('lcd').getContext('2d');
+  const img=ctx.createImageData(W,H);
+  const px=new Uint32Array(img.data.buffer);
+
+  let auto=true,autoAt=performance.now()+AUTO_MS,shownMode=-1,dirtySum=0,frames=0;
+  const bar=document.getElementById('bar');
+  const setMode=m=>{e.sim_set_mode(m);autoAt=performance.now()+AUTO_MS};
+  MODES.forEach((name,i)=>{
+    const b=document.createElement('button');b.textContent=`${i+1} ${name}`;
+    b.onclick=()=>{auto=false;cb.checked=false;setMode(i)};bar.appendChild(b);
+  });
+  const lab=document.createElement('label');lab.innerHTML='<input type="checkbox" checked> 自动轮播';bar.appendChild(lab);
+  const cb=lab.querySelector('input');cb.onchange=()=>{auto=cb.checked;autoAt=performance.now()+AUTO_MS};
+  addEventListener('keydown',ev=>{
+    const i=+ev.key-1;
+    if(i>=0&&i<MODES.length){auto=false;cb.checked=false;setMode(i)}
+    if(ev.code==='Space'){ev.preventDefault();auto=false;cb.checked=false;setMode((e.sim_get_mode()+1)%MODES.length)}
+  });
+
+  let last=performance.now(),acc=0;
+  setInterval(()=>{
+    const now=performance.now();
+    acc+=Math.min(100,now-last)/1000;last=now;
+    while(acc>=STEP){e.sim_step(STEP);acc-=STEP}
+    if(auto&&now>=autoAt){autoAt=now+AUTO_MS;e.sim_set_mode((e.sim_get_mode()+1)%MODES.length)}
+
+    dirtySum+=e.sim_render()/(W*H);frames++;
+    // 和设备一样只刷脏区：把 RGB565 转成 RGBA 后贴上去
+    const x0=e.sim_dirty_x0(),y0=e.sim_dirty_y0(),x1=e.sim_dirty_x1(),y1=e.sim_dirty_y1();
+    if(x1>x0&&y1>y0){
+      const fb=new Uint16Array(e.memory.buffer,e.sim_fb(),W*H);
+      for(let y=y0;y<y1;y++)for(let x=x0;x<x1;x++){
+        const c=fb[y*W+x],r=(c>>11)<<3,g=((c>>5)&63)<<2,b=(c&31)<<3;
+        px[y*W+x]=0xff000000|(b<<16)|(g<<8)|r;
+      }
+      ctx.putImageData(img,0,0,x0,y0,x1-x0,y1-y0);
+    }
+
+    const m=e.sim_get_mode();
+    if(m!==shownMode){shownMode=m;bar.querySelectorAll('button').forEach((b,i)=>b.classList.toggle('on',i===m))}
+    if(frames%30===0){
+      document.getElementById('stats').textContent=`当前：${MODES[m]}　平均每帧刷新 ${(dirtySum/frames*100).toFixed(1)}% 屏幕`;
+    }
+  },FRAME_MS);
+})().catch(err=>{document.getElementById('stats').textContent='加载失败：'+err+'（需要通过本地服务器打开，见 README）'});
+</script>
+</body>
+</html>

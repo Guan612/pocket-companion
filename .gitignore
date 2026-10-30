@@ -1,0 +1,7 @@
+# 表情模拟器的构建产物（firmware/ 有小智自带的 .gitignore）
+tools/face-sim/face.wasm
+tools/face-sim/out/
+tools/device-sim/device.wasm
+tools/device-sim/font_*.bin
+tools/device-sim/third_party/
+tools/device-sim/lv_conf_device.h
