@@ -274,13 +274,13 @@ static void build_vision(void)
     // 角落里的小号 Nomi：直接缩放显示大脸那块缓冲，状态和大脸完全同步
     s_mini_face = lv_image_create(s_vision_tile);
     lv_image_set_src(s_mini_face, lv_canvas_get_draw_buf(s_canvas));
-    lv_image_set_scale(s_mini_face, 120);  // 约 225×150，没有黑底所以可以大一点
+    lv_image_set_scale(s_mini_face, 192);  // 360×240，叠在取景画面正中间
     lv_image_set_inner_align(s_mini_face, LV_IMAGE_ALIGN_CENTER);
-    lv_obj_set_size(s_mini_face, 226, 150);
+    lv_obj_set_size(s_mini_face, 360, 240);
     // 叠加混合：脸的黑底加上去等于没有，只剩白色五官和小手浮在取景画面上
     lv_obj_set_style_blend_mode(s_mini_face, LV_BLEND_MODE_ADDITIVE, 0);
     lv_obj_set_style_image_opa(s_mini_face, LV_OPA_90, 0);
-    lv_obj_align(s_mini_face, LV_ALIGN_TOP_RIGHT, 0, 18);  // 右上角，下面留给字幕
+    lv_obj_center(s_mini_face);
 
     lv_obj_add_flag(s_vision_tile, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_add_event_cb(s_vision_tile, on_face_pressed, LV_EVENT_PRESSED, NULL);
