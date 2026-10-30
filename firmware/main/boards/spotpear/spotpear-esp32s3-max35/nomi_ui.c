@@ -274,14 +274,13 @@ static void build_vision(void)
     // 角落里的小号 Nomi：直接缩放显示大脸那块缓冲，状态和大脸完全同步
     s_mini_face = lv_image_create(s_vision_tile);
     lv_image_set_src(s_mini_face, lv_canvas_get_draw_buf(s_canvas));
-    lv_image_set_scale(s_mini_face, 72);  // 约 135×90
+    lv_image_set_scale(s_mini_face, 120);  // 约 225×150，没有黑底所以可以大一点
     lv_image_set_inner_align(s_mini_face, LV_IMAGE_ALIGN_CENTER);
-    lv_obj_set_size(s_mini_face, 136, 90);
-    lv_obj_set_style_radius(s_mini_face, 14, 0);
-    lv_obj_set_style_clip_corner(s_mini_face, true, 0);
-    lv_obj_set_style_border_color(s_mini_face, lv_color_hex(C_CONTROL), 0);
-    lv_obj_set_style_border_width(s_mini_face, 2, 0);
-    lv_obj_align(s_mini_face, LV_ALIGN_BOTTOM_RIGHT, -10, -10);
+    lv_obj_set_size(s_mini_face, 226, 150);
+    // 叠加混合：脸的黑底加上去等于没有，只剩白色五官和小手浮在取景画面上
+    lv_obj_set_style_blend_mode(s_mini_face, LV_BLEND_MODE_ADDITIVE, 0);
+    lv_obj_set_style_image_opa(s_mini_face, LV_OPA_90, 0);
+    lv_obj_align(s_mini_face, LV_ALIGN_TOP_RIGHT, 0, 18);  // 右上角，下面留给字幕
 
     lv_obj_add_flag(s_vision_tile, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_add_event_cb(s_vision_tile, on_face_pressed, LV_EVENT_PRESSED, NULL);
@@ -562,10 +561,29 @@ static void build_system_page(lv_obj_t *page)
     add_action(add_button_row(page), "恢复出厂设置", "factory_reset", true);
 }
 
-static void on_grip_clicked(lv_event_t *e)
+// 设置页里外层翻页是锁住的，只有按在底部小白条上时才放开，往上推才能回主界面
+static void lock_outer_if_settings(void)
+{
+    if (lv_tileview_get_tile_active(s_outer) == s_settings_tile) {
+        lv_obj_set_scroll_dir(s_outer, LV_DIR_NONE);
+    }
+}
+
+static void on_grip(lv_event_t *e)
+{
+    if (lv_event_get_code(e) == LV_EVENT_PRESSED) {
+        lv_obj_set_scroll_dir(s_outer, LV_DIR_VER);
+    } else {
+        lock_outer_if_settings();
+    }
+}
+
+// tileview 在滚动结束时会按 tile 方向重新放开滚动（在发 VALUE_CHANGED 之后），
+// 所以挂在 SCROLL_END 上、排在它自己的处理之后再锁住
+static void on_outer_scroll_end(lv_event_t *e)
 {
     (void)e;
-    show_main(true);
+    lock_outer_if_settings();
 }
 
 // 设置页每次从主界面拉下来时重建，保证显示的是最新的值
@@ -610,14 +628,16 @@ static void build_settings(void)
         lv_obj_set_style_border_width(btn, 3, LV_STATE_CHECKED);
     }
 
-    // 底部一条把手区：在这里往上推或点一下收起设置。内容区本身能上下滚动，推它是翻内容
+    // 底部一条把手区：只有按住这里往上推才收起设置，其他地方上下推都是翻内容
     lv_obj_t *grip_zone = lv_obj_create(s_settings_tile);
     lv_obj_remove_style_all(grip_zone);
     lv_obj_set_size(grip_zone, LV_PCT(100), 28);
     lv_obj_align(grip_zone, LV_ALIGN_BOTTOM_RIGHT, 0, 0);
     lv_obj_set_style_pad_left(grip_zone, 92, 0);  // 横条居中在内容区，避开左边的标签栏
     lv_obj_add_flag(grip_zone, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_add_event_cb(grip_zone, on_grip_clicked, LV_EVENT_CLICKED, NULL);
+    lv_obj_add_event_cb(grip_zone, on_grip, LV_EVENT_PRESSED, NULL);
+    lv_obj_add_event_cb(grip_zone, on_grip, LV_EVENT_RELEASED, NULL);
+    lv_obj_add_event_cb(grip_zone, on_grip, LV_EVENT_PRESS_LOST, NULL);
     lv_obj_t *grip = lv_obj_create(grip_zone);
     lv_obj_remove_style_all(grip);
     lv_obj_set_size(grip, 44, 4);
@@ -717,6 +737,7 @@ void nomi_ui_create(lv_obj_t *screen, uint16_t *face_buf, const lv_font_t *font,
     s_settings_tile = add_tile(s_outer, 0, 0, LV_DIR_BOTTOM, C_PAGE);
     s_main_tile = add_tile(s_outer, 0, 1, LV_DIR_TOP, 0x000000);
     lv_obj_add_event_cb(s_outer, on_outer_scroll, LV_EVENT_SCROLL_BEGIN, NULL);
+    lv_obj_add_event_cb(s_outer, on_outer_scroll_end, LV_EVENT_SCROLL_END, NULL);
 
     // 主界面里：Nomi 在左，视觉在右
     s_modes = add_tileview(s_main_tile);

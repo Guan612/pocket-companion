@@ -7,11 +7,11 @@
 <style>
 :root{color-scheme:dark;--bg:#111318;--fg:#e8eaf0;--muted:#8b90a0;--card:#1b1e26;--accent:#6aa6ff}
 *{box-sizing:border-box}
-body{margin:0;padding:16px;background:var(--bg);color:var(--fg);font:14px/1.6 system-ui,"PingFang SC","Microsoft YaHei",sans-serif}
+body{margin:0;user-select:none;-webkit-user-select:none;padding:16px;background:var(--bg);color:var(--fg);font:14px/1.6 system-ui,"PingFang SC","Microsoft YaHei",sans-serif}
 h1{font-size:18px;margin:0 0 4px}
 p{margin:0 0 12px;color:var(--muted);max-width:760px}
 .device{display:inline-flex;gap:14px;align-items:center;padding:18px 22px;border-radius:24px;background:#2a2d36;max-width:100%}
-canvas{display:block;width:min(720px,calc(100vw - 150px));aspect-ratio:3/2;background:#000;border-radius:4px;cursor:pointer;touch-action:none}
+canvas{display:block;user-select:none;-webkit-user-select:none;width:min(720px,calc(100vw - 150px));aspect-ratio:3/2;background:#000;border-radius:4px;cursor:pointer;touch-action:none}
 .boot{width:44px;height:44px;border-radius:50%;border:0;background:#3a3e4a;color:var(--fg);font:12px system-ui;cursor:pointer;flex:none}
 .boot:active{background:#4a5060}
 kbd{background:var(--card);border:1px solid #2c3040;border-radius:4px;padding:0 5px}
@@ -59,7 +59,11 @@ kbd{background:var(--card);border:1px solid #2c3040;border-radius:4px;padding:0 
     let down=false;
     cv.addEventListener('pointerdown',ev=>{down=true;cv.setPointerCapture(ev.pointerId);point(ev,1)});
     cv.addEventListener('pointermove',ev=>point(ev,down?1:0));
-    cv.addEventListener('pointerup',ev=>{down=false;point(ev,0)});
+    // 浏览器有时不给 pointerup（拖出窗口、被当成手势取消等），一律当作松手，否则页面会停在半路
+    const release=ev=>{if(!down)return;down=false;point(ev,0)};
+    cv.addEventListener('pointerup',release);
+    cv.addEventListener('pointercancel',release);
+    cv.addEventListener('lostpointercapture',release);
     cv.addEventListener('contextmenu',ev=>ev.preventDefault());
     // BOOT 键：按下 / 松开分开传，支持按住说话
     const boot=document.getElementById('boot');
