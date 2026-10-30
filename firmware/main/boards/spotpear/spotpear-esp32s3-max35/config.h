@@ -68,8 +68,9 @@
 #define BATTERY_LOWER_RESISTOR  100000
 #define BATTERY_USB_DETECT_PIN  GPIO_NUM_7
 
-// 休眠：调暗时的亮度。多久后调暗 / 息屏在设置页里选（默认 1 分钟 / 5 分钟）
+// 休眠：多久后睡着 / 息屏在设置页里选（默认 1 分钟 / 5 分钟），睡着后再过一会儿调暗
 #define DIM_BRIGHTNESS          5
+#define DIM_AFTER_SLEEP_SECONDS 30  // 睡着（正常亮度显示睡觉动画）多久后再调暗
 
 // 摄像头（OV2640 / GC0308，DVP 8 位）。SCCB 复用上面的 I2C 总线；PWDN、RESET 板上已固定
 #define CAMERA_PIN_D0     GPIO_NUM_12

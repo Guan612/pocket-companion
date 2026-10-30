@@ -37,10 +37,11 @@ static bool s_holding;  // BOOT 键按住说话中
 static int s_mode, s_talk_key, s_aec, s_subtitles = 1, s_persona, s_voice = 4, s_dim = 1, s_off = 1;
 static int s_volume = 70, s_brightness = 80;
 
-// 休眠：时间按设置页的选项，默认 1 分钟闭眼调暗、5 分钟息屏
+// 休眠和设备一样分三段：先正常亮度睡着，睡着 30 秒后调暗，到息屏时间关屏
 #define DIM_BRIGHTNESS 5
-static uint32_t s_last_activity;
-static int s_sleep_level;  // 0 醒着，1 调暗，2 息屏
+#define DIM_AFTER_SLEEP_MS 30000
+static uint32_t s_last_activity, s_slept_at;
+static int s_sleep_level;  // 0 醒着，1 睡着（正常亮度），2 调暗，3 息屏
 
 static void wake(void)
 {
@@ -54,6 +55,7 @@ static void wake(void)
 static void sleep_now(void)
 {
     s_sleep_level = 1;
+    s_slept_at = s_ms;
     nomi_ui_set_sleep(true);
 }
 
@@ -100,7 +102,9 @@ static void advance(void)
         static const int dim_s[] = NOMI_DIM_SECONDS, off_s[] = NOMI_OFF_SECONDS;
         uint32_t idle = s_ms - s_last_activity;
         if (s_sleep_level == 0 && dim_s[s_dim] > 0 && idle > (uint32_t)dim_s[s_dim] * 1000) sleep_now();
-        else if (s_sleep_level == 1 && off_s[s_off] > 0 && idle > (uint32_t)off_s[s_off] * 1000) s_sleep_level = 2;
+        else if (s_sleep_level == 1 && s_ms - s_slept_at > DIM_AFTER_SLEEP_MS) s_sleep_level = 2;
+        // 息屏不早于"睡着再调暗"之后
+        else if (s_sleep_level == 2 && off_s[s_off] > 0 && idle > (uint32_t)off_s[s_off] * 1000) s_sleep_level = 3;
     }
     uint32_t t = s_ms - s_phase_at;
     // 点一下模式说完自动结束；按住说话要等松开
@@ -283,7 +287,7 @@ int sim_dirty_x1(void) { return s_dx1; }
 int sim_dirty_y1(void) { return s_dy1; }
 int sim_brightness(void)
 {
-    return s_sleep_level == 2 ? 0 : s_sleep_level == 1 ? DIM_BRIGHTNESS : s_brightness;
+    return s_sleep_level == 3 ? 0 : s_sleep_level == 2 ? DIM_BRIGHTNESS : s_brightness;
 }
 void sim_force_sleep(void) { sleep_now(); }
 int sim_volume(void) { return s_volume; }

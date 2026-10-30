@@ -24,6 +24,7 @@
 #include <esp_heap_caps.h>
 #include <esp_lcd_touch_gt911.h>
 #include <esp_log.h>
+#include <esp_timer.h>
 #include <esp_lvgl_port.h>
 
 #include <atomic>
@@ -43,6 +44,7 @@ private:
     std::atomic<bool> vision_on_{false};
     std::atomic<bool> sleeping_{false};
     bool holding_ = false;           // BOOT 键按住说话中
+    esp_timer_handle_t dim_timer_ = nullptr;  // 睡着一会儿后调暗屏幕
 
     // ES8311、GT911、摄像头 SCCB 共用这条总线
     void InitializeI2c() {
@@ -158,17 +160,24 @@ private:
     }
 
     // cpu_max_freq 传 -1：休眠时不降频，唤醒词保持监听。时间按设置页的选项，-1 表示从不
+    // 空闲三段：先正常亮度显示睡着动画，睡着一会儿后调暗，到息屏时间再关屏。
+    // 小智的 PowerSaveTimer 只有"睡眠 / 关机"两档，中间的调暗用 dim_timer_ 补
     void CreatePowerSaveTimer() {
-        int dim_seconds, off_seconds;
-        NomiDisplay::GetIdleSeconds(dim_seconds, off_seconds);
-        power_save_timer_ = new PowerSaveTimer(-1, dim_seconds, off_seconds);
+        int sleep_seconds, off_seconds;
+        NomiDisplay::GetIdleSeconds(sleep_seconds, off_seconds);
+        // 息屏不能早于"睡着再调暗"之后，保证顺序是先睡、再暗、再关
+        if (sleep_seconds > 0 && off_seconds > 0 && off_seconds < sleep_seconds + DIM_AFTER_SLEEP_SECONDS) {
+            off_seconds = sleep_seconds + DIM_AFTER_SLEEP_SECONDS;
+        }
+        power_save_timer_ = new PowerSaveTimer(-1, sleep_seconds, off_seconds);
         power_save_timer_->OnEnterSleepMode([this]() {
             sleeping_ = true;  // 取景也停掉
             display_->SetSleep(true);
-            GetBacklight()->SetBrightness(DIM_BRIGHTNESS);
+            esp_timer_start_once(dim_timer_, DIM_AFTER_SLEEP_SECONDS * 1000000LL);
         });
         power_save_timer_->OnExitSleepMode([this]() {
             sleeping_ = false;
+            esp_timer_stop(dim_timer_);
             display_->SetSleep(false);
             GetBacklight()->RestoreBrightness();
         });
@@ -178,6 +187,17 @@ private:
     }
 
     void InitializePowerSave() {
+        const esp_timer_create_args_t dim_args = {
+            .callback = [](void* arg) {
+                auto* self = static_cast<SpotpearMax35Board*>(arg);
+                if (self->sleeping_) self->GetBacklight()->SetBrightness(DIM_BRIGHTNESS);
+            },
+            .arg = this,
+            .dispatch_method = ESP_TIMER_TASK,
+            .name = "dim_backlight",
+            .skip_unhandled_events = true,
+        };
+        ESP_ERROR_CHECK(esp_timer_create(&dim_args, &dim_timer_));
         CreatePowerSaveTimer();
         NomiDisplay::on_user_activity = [this]() { power_save_timer_->WakeUp(); };
         // 设置页改了时间就换一个计时器；在主循环里换，避免和其他调用撞上

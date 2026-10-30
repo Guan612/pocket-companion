@@ -99,27 +99,6 @@ static face_mode_t pick_mode(uint32_t now)
     }
 }
 
-// 睡着时脸的右上方飘起三个 z：从下往上、由小到大，淡入淡出，错开循环
-#define ZZZ_COUNT 3
-#define ZZZ_PERIOD_MS 2400
-static lv_obj_t *s_zzz[ZZZ_COUNT];
-
-static void update_zzz(uint32_t now)
-{
-    for (int i = 0; i < ZZZ_COUNT; i++) {
-        if (!s_sleeping) {
-            lv_obj_add_flag(s_zzz[i], LV_OBJ_FLAG_HIDDEN);
-            continue;
-        }
-        float phase = (float)((now + i * ZZZ_PERIOD_MS / ZZZ_COUNT) % ZZZ_PERIOD_MS) / ZZZ_PERIOD_MS;
-        float fade = phase < 0.2f ? phase / 0.2f : (phase > 0.7f ? (1 - phase) / 0.3f : 1);
-        lv_obj_set_pos(s_zzz[i], 318 + (int)(phase * 34), 112 - (int)(phase * 64));
-        lv_obj_set_style_text_opa(s_zzz[i], (lv_opa_t)(fade * 200), 0);
-        lv_obj_set_style_transform_scale(s_zzz[i], (int32_t)(256 + phase * 256), 0);  // 256 为原大小
-        lv_obj_remove_flag(s_zzz[i], LV_OBJ_FLAG_HIDDEN);
-    }
-}
-
 static void face_tick(lv_timer_t *timer)
 {
     (void)timer;
@@ -135,7 +114,6 @@ static void face_tick(lv_timer_t *timer)
     // 待机和睡着时不显示状态文字，脸本身就说明了
     nomi_state_t state = s_cb.get_state ? s_cb.get_state() : NOMI_STATE_IDLE;
     lv_obj_set_flag(s_status, LV_OBJ_FLAG_HIDDEN, state == NOMI_STATE_IDLE || s_sleeping);
-    update_zzz(now);
 
     // 表情直接画进画布缓冲，只通知 LVGL 重画变化的那块；视觉模式角落的小脸用的是同一块缓冲
     rrect_t d = face_render(s_buf);
@@ -169,7 +147,6 @@ void nomi_ui_set_font(const lv_font_t *font)
     for (size_t i = 0; i < sizeof(roots) / sizeof(roots[0]); i++) {
         if (roots[i]) lv_obj_set_style_text_font(roots[i], font, 0);
     }
-    for (int i = 0; i < ZZZ_COUNT; i++) lv_obj_set_style_text_font(s_zzz[i], font, 0);
     lv_obj_set_height(s_subtitle, lv_font_get_line_height(font) * 2);  // 最多两行
 }
 
@@ -535,7 +512,7 @@ static void build_display_page(lv_obj_t *page)
     static const char *const dim[] = {"30 秒", "1 分", "2 分", "5 分", "从不", ""};
     static const char *const off[] = {"2 分", "5 分", "10 分", "30 分", "从不", ""};
     add_slider(page, "亮度", NOMI_KEY_BRIGHTNESS, MIN_BRIGHTNESS, 80);
-    add_choice(page, "多久后闭眼调暗", NULL, NOMI_KEY_DIM, dim, 1);
+    add_choice(page, "多久后睡着", "睡着后过 30 秒屏幕再调暗", NOMI_KEY_DIM, dim, 1);
     add_choice(page, "多久后息屏", NULL, NOMI_KEY_OFF, off, 1);
 }
 
@@ -754,12 +731,6 @@ void nomi_ui_create(lv_obj_t *screen, uint16_t *face_buf, const lv_font_t *font,
     lv_obj_add_flag(s_canvas, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_add_event_cb(s_canvas, on_face_pressed, LV_EVENT_PRESSED, NULL);
 
-    for (int i = 0; i < ZZZ_COUNT; i++) {
-        s_zzz[i] = lv_label_create(s_chat_tile);
-        lv_label_set_text(s_zzz[i], "z");
-        set_color(s_zzz[i], C_TEXT);
-        lv_obj_add_flag(s_zzz[i], LV_OBJ_FLAG_HIDDEN);
-    }
 
     build_vision();
 

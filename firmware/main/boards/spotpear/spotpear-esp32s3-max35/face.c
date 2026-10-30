@@ -165,6 +165,31 @@ static void draw_hand(raster_t *r, rxf_t base, float x, float y, float rot, floa
     for (int i = 0; i < 3; i++) raster_ellipse(r, m, 8, -5 + i * 5, 4.5f, 2.6f, 0, WHITE, 1);
 }
 
+// 一个 Z：上横、斜线、下横三笔，和五官一样的白色圆头粗线
+static void draw_z(raster_t *r, rxf_t base, float x, float y, float half, float alpha)
+{
+    const float w = half * 0.42f + 1.2f;  // 越大的 Z 笔画越粗
+    raster_line(r, base, x - half, y - half, x + half, y - half, w, WHITE, alpha);
+    raster_line(r, base, x + half, y - half, x - half, y + half, w, WHITE, alpha);
+    raster_line(r, base, x - half, y + half, x + half, y + half, w, WHITE, alpha);
+}
+
+// 睡着时脸的右上方斜着排出 z z Z：由小到大依次冒出来，停一会儿一起淡出，循环
+static void draw_zzz(raster_t *r, rxf_t base, float cx, float cy)
+{
+    static const float pos[3][3] = {{38, -14, 3.5f}, {54, -30, 5}, {75, -52, 7}};  // x, y, 半宽
+    const float period = 2.6f, t = fmodf(s_time, period);
+    const float fade_out = t < 1.9f ? 1 : (period - t) / (period - 1.9f);
+    for (int i = 0; i < 3; i++) {
+        float since = t - i * 0.35f;
+        float fade_in = since <= 0 ? 0 : (since >= 0.3f ? 1 : since / 0.3f);
+        float alpha = fade_in * fade_out;
+        if (alpha < 0.02f) continue;
+        float bob = 1.5f * sinf(s_time * 2.5f + i);  // 轻轻上下浮动
+        draw_z(r, base, cx + pos[i][0], cy + pos[i][1] + bob, pos[i][2], alpha);
+    }
+}
+
 static void draw_face(raster_t *r)
 {
     const float cx = LW / 2, cy = LH / 2;
@@ -200,6 +225,8 @@ static void draw_face(raster_t *r)
             raster_star(r, base, cx + stars[i][0], cy + stars[i][1] + bob, stars[i][2], WHITE, a);
         }
     }
+
+    if (s_sleep) draw_zzz(r, base, cx, cy);
 
     // 小手：从屏幕下沿滑进来
     for (int s = -1; s <= 1; s += 2) {
