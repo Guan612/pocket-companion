@@ -106,6 +106,5 @@ git subtree pull --prefix=firmware https://github.com/78/xiaozhi-esp32.git <tag>
 ## 致谢
 
 - 固件底座：[78/xiaozhi-esp32](https://github.com/78/xiaozhi-esp32)（MIT）
-- 本仓库最初由 [FoloToy/ai-passport](https://github.com/FoloToy/ai-passport) 复制而来，原有代码已全部替换。
 
 许可证见 [LICENSE](LICENSE)。
