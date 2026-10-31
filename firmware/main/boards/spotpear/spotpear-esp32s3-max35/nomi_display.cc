@@ -4,6 +4,7 @@
 #include "board.h"
 #include "display/lvgl_display/lvgl_font.h"
 #include "display/lvgl_display/lvgl_theme.h"
+#include "face_script.h"
 #include "nomi_ui.h"
 #include "settings.h"
 #include "wifi_board.h"
@@ -52,6 +53,28 @@ const char* const kVoices[] = {"alloy", "echo", "fable", "onyx", "nova", "shimme
 
 std::string PersonaPrompt(int index) { return std::string(kPersonas[index].prompt) + kEmotionRule; }
 
+// 音色跟着语音合成选的供应商走：网页设置页保存时把那家的音色列表写进 tts_voices（一行一个），
+// 没有就用 OpenAI 的六个
+std::vector<std::string> VoiceList() {
+    std::string text = Settings(kDirectApiNs).GetString("tts_voices");
+    std::vector<std::string> list;
+    size_t pos = 0;
+    while (pos < text.size()) {
+        size_t nl = text.find('\n', pos);
+        std::string v = text.substr(pos, nl == std::string::npos ? std::string::npos : nl - pos);
+        if (!v.empty()) list.push_back(v);
+        pos = nl == std::string::npos ? text.size() : nl + 1;
+    }
+    if (list.empty()) list.assign(std::begin(kVoices), std::end(kVoices));
+    return list;
+}
+
+// 屏幕上只显示短名：FunAudioLLM/CosyVoice2-0.5B:anna → anna
+std::string VoiceLabel(const std::string& voice) {
+    size_t cut = voice.find_last_of(":/");
+    return cut == std::string::npos ? voice : voice.substr(cut + 1);
+}
+
 void ApplyAec(bool on) {
     Application::GetInstance().SetAecMode(on && NomiDisplay::aec_supported ? kAecOnDeviceSide : kAecOff);
 }
@@ -90,8 +113,9 @@ int GetInt(const char* key, int def) {
     }
     if (!strcmp(key, NOMI_KEY_VOICE)) {
         std::string voice = Settings(kDirectApiNs).GetString("tts_voice", "alloy");
-        for (int i = 0; i < static_cast<int>(std::size(kVoices)); i++) {
-            if (voice == kVoices[i]) return i;
+        auto list = VoiceList();
+        for (int i = 0; i < static_cast<int>(list.size()); i++) {
+            if (voice == list[i]) return i;
         }
         return -1;
     }
@@ -123,8 +147,9 @@ void SetInt(const char* key, int value, bool final) {
         return;
     }
     if (!strcmp(key, NOMI_KEY_VOICE)) {
-        if (value >= 0 && value < static_cast<int>(std::size(kVoices))) {
-            Settings(kDirectApiNs, true).SetString("tts_voice", kVoices[value]);
+        auto list = VoiceList();
+        if (value >= 0 && value < static_cast<int>(list.size())) {
+            Settings(kDirectApiNs, true).SetString("tts_voice", list[value]);
         }
         return;
     }
@@ -156,7 +181,7 @@ const char* GetText(const char* key) {
     if (!strcmp(key, "personas")) {
         for (const auto& p : kPersonas) text += std::string(text.empty() ? "" : "\n") + p.name;
     } else if (!strcmp(key, "voices")) {
-        for (auto v : kVoices) text += std::string(text.empty() ? "" : "\n") + v;
+        for (const auto& v : VoiceList()) text += std::string(text.empty() ? "" : "\n") + VoiceLabel(v);
     } else if (!strcmp(key, "wifi")) {
         wifi_ap_record_t ap = {};
         if (esp_wifi_sta_get_ap_info(&ap) == ESP_OK) {
@@ -339,6 +364,37 @@ void NomiDisplay::SetPreview(const uint16_t* pixels) {
     if (!ui_ready_) return;
     DisplayLockGuard lock(this);
     nomi_ui_set_preview(pixels);
+}
+
+bool NomiDisplay::PlayFace(const std::string& json, std::string& error) {
+    if (!ui_ready_) {
+        error = "屏幕还没准备好";
+        return false;
+    }
+    DisplayLockGuard lock(this);
+    char err[160];
+    if (!nomi_ui_play_face(json.c_str(), err, sizeof(err))) {
+        error = err;
+        return false;
+    }
+    return true;
+}
+
+std::string NomiDisplay::FacePrompt() {
+    return std::string(
+               "你有一张会动的脸：黑底白色线条，两只眼睛加一双小手。可以在情绪标签后面紧跟一段表情脚本 "
+               "<face>JSON</face> 配合你说的话，不需要就不写，别每句都写。\n"
+               "JSON 是 1～6 步的数组，每步字段都可选：dur 秒（0.3-4）；eyes：capsule 平常｜arc 笑眯眯｜ring 睁大的空心眼｜"
+               "dash 平静｜dot 小眼｜closed 闭眼｜heart｜star｜x｜shades 墨镜｜spiral 转圈的晕；look [x,y] 视线（-1~1）；"
+               "tilt 歪头（-1~1）；brow：up 挑眉｜down 皱眉；sweat：true 汗滴；blush：0-1 腮红；"
+               "hands：none｜chin 托腮｜ear 手放耳边｜wave 挥手｜up 举双手｜cover 捂眼｜mic 拿麦克风｜cheeks 双手托腮；"
+               "motion：nod 点头｜bounce 蹦｜shake 摇头｜sway 摇摆；"
+               "prop 道具：{\"icon\":图标,\"anim\":\"bob|swing|spin|float|pop|orbit 绕着转\",\"at\":\"mouth|left|right|top\"}，图标有 ") +
+           face_script_icon_names() +
+           "；没有合适的图标就用 \"strokes\" 画白色线条：坐标 0-100，[x1,y1,x2,y2,…] 是折线，[x,y,r] 是圆，"
+           "r 为负是实心点，最多 12 笔。\n"
+           "例：[happy]<face>[{\"eyes\":\"ring\",\"brow\":\"up\",\"dur\":0.8},{\"eyes\":\"arc\",\"hands\":\"up\","
+           "\"motion\":\"bounce\",\"prop\":{\"icon\":\"star\",\"anim\":\"pop\",\"at\":\"top\"},\"dur\":2}]</face>太好啦！";
 }
 
 void NomiDisplay::SetSleep(bool sleeping) {

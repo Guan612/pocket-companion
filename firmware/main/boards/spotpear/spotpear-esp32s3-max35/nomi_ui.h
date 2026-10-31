@@ -78,6 +78,9 @@ void nomi_ui_set_battery(int level, bool charging);
 // 视觉模式的一帧取景画面，NOMI_PREVIEW_W×NOMI_PREVIEW_H，会拷贝一份
 void nomi_ui_set_preview(const uint16_t *pixels);
 
+// 播放一段表情脚本（JSON，格式见 face_script.h）；不合格返回 false，原因写进 err
+bool nomi_ui_play_face(const char *json, char *err, size_t err_size);
+
 #ifdef __cplusplus
 }
 #endif

@@ -5,10 +5,13 @@
 #include <string.h>
 
 #include "face.h"
+#include "face_script.h"
 
 #define FRAME_MS 33
 #define STEP_S (1.0f / 60)
 #define EMOTION_HOLD_MS 4000  // LLM 给的情绪保持多久
+#define THINK_HOLD_MS 30000   // "思考中"一直保持到识别 / 大模型有结果，最长和 HTTP 超时一样
+#define SUBTITLE_LINGER_MS 600  // 说完后字幕再留多久就收起
 #define MIN_BRIGHTNESS 10     // 亮度滑条下限，免得调成全黑找不回来
 
 #define C_TEXT 0xe8eaf0
@@ -36,6 +39,8 @@ static face_mode_t s_emotion_mode = FACE_IDLE;
 static bool s_sleeping, s_subtitles_on = true;
 static int s_mode = NOMI_MODE_CHAT;
 static bool s_mode_by_code;  // 代码切换模式时不当作用户选择保存
+static nomi_state_t s_last_state = NOMI_STATE_IDLE;
+static uint32_t s_subtitle_hide_at;  // 到这个时刻收起字幕，0 表示不收
 
 static int get_int(const char *key, int def) { return s_cb.get_int ? s_cb.get_int(key, def) : def; }
 static void set_int(const char *key, int value, bool final)
@@ -111,9 +116,18 @@ static void face_tick(lv_timer_t *timer)
     if (mode != face_get_mode()) face_set_mode(mode);
     for (; s_acc >= STEP_S; s_acc -= STEP_S) face_step(STEP_S);
 
-    // 待机和睡着时不显示状态文字，脸本身就说明了
+    // 待机、睡着、正在表演时不显示状态文字，脸本身就说明了（表演的道具也可能放在头顶那一格）
     nomi_state_t state = s_cb.get_state ? s_cb.get_state() : NOMI_STATE_IDLE;
-    lv_obj_set_flag(s_status, LV_OBJ_FLAG_HIDDEN, state == NOMI_STATE_IDLE || s_sleeping);
+    lv_obj_set_flag(s_status, LV_OBJ_FLAG_HIDDEN, state == NOMI_STATE_IDLE || s_sleeping || face_is_playing());
+
+    // 说完了就收起字幕（小智回到待机时会清聊天记录，但 Nomi 的字幕不在那套界面里，得自己收）
+    if (s_last_state == NOMI_STATE_SPEAKING && state != NOMI_STATE_SPEAKING) s_subtitle_hide_at = now + SUBTITLE_LINGER_MS;
+    if (state == NOMI_STATE_SPEAKING) s_subtitle_hide_at = 0;
+    if (s_subtitle_hide_at && (int32_t)(now - s_subtitle_hide_at) >= 0) {
+        lv_obj_add_flag(s_subtitle, LV_OBJ_FLAG_HIDDEN);
+        s_subtitle_hide_at = 0;
+    }
+    s_last_state = state;
 
     // 表情直接画进画布缓冲，只通知 LVGL 重画变化的那块；视觉模式角落的小脸用的是同一块缓冲
     rrect_t d = face_render(s_buf);
@@ -124,11 +138,20 @@ static void face_tick(lv_timer_t *timer)
     }
 }
 
+bool nomi_ui_play_face(const char *json, char *err, size_t err_size)
+{
+    static face_script_t script;  // 一千多字节，别放栈上
+    if (!face_script_parse(json, &script, err, err_size)) return false;
+    face_play(&script);
+    return true;
+}
+
 void nomi_ui_set_emotion(const char *emotion)
 {
     if (!emotion) return;
     s_emotion_mode = mode_for_emotion(emotion);
-    s_emotion_until = lv_tick_get() + EMOTION_HOLD_MS;
+    // 思考要等到下一个情绪 / 说话 / 出错把它换掉；其他情绪过几秒就回到跟着设备状态走
+    s_emotion_until = lv_tick_get() + (s_emotion_mode == FACE_THINK ? THINK_HOLD_MS : EMOTION_HOLD_MS);
 }
 
 /* ---------- 状态栏、字幕、通知 ---------- */
@@ -157,6 +180,7 @@ void nomi_ui_set_status(const char *status)
 
 void nomi_ui_set_subtitle(const char *role, const char *text)
 {
+    s_subtitle_hide_at = 0;  // 有新字幕就别收了
     if (!s_subtitles_on || !text || !*text) {
         lv_obj_add_flag(s_subtitle, LV_OBJ_FLAG_HIDDEN);
         return;

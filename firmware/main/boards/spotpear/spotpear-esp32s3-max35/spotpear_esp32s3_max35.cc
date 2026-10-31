@@ -343,6 +343,24 @@ private:
                                EnterWifiConfigMode();
                                return true;
                            });
+        // 表情脚本：主人明确要表演时大模型调这个工具；平时它在回复开头写 <face>…</face>（见 NomiDisplay::FacePrompt）
+        mcp_server.AddTool("self.face.play",
+                           "让你的脸表演一段动作。主人明确要你做表情、做鬼脸、跳舞、弹吉他之类时用；"
+                           "script 是表情脚本 JSON（步骤数组，格式和回复里的 <face> 一样）。",
+                           PropertyList({Property("script", kPropertyTypeString)}),
+                           [this](const PropertyList& properties) -> ToolResult {
+                               std::string error;
+                               if (!display_->PlayFace(properties["script"].value<std::string>(), error)) {
+                                   return std::unexpected(error);
+                               }
+                               return std::string("正在表演");
+                           });
+#if CONFIG_DIRECT_API
+        DirectApiProtocol::face_prompt = NomiDisplay::FacePrompt();
+        DirectApiProtocol::face_handler = [this](const std::string& json, std::string& error) {
+            return display_->PlayFace(json, error);
+        };
+#endif
     }
 
 public:

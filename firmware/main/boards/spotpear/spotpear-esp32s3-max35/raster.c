@@ -87,6 +87,13 @@ static void fill(raster_t *r, rxf_t m, float lcx, float lcy, float reach, sdf_fn
 {
     if (alpha <= 0.004f) return;
     const float s = r->scale;
+    // 屏幕 → 局部坐标用真正的逆矩阵（只有旋转 / 翻转时等于转置，带缩放时转置就错了）；
+    // SDF 算出的是局部坐标里的距离，乘上缩放系数换回屏幕距离，外接范围也按缩放放大
+    const float det = m.a * m.d - m.b * m.c;
+    if (fabsf(det) < 1e-9f) return;
+    const float k = sqrtf(fabsf(det));
+    reach *= fmaxf(sqrtf(m.a * m.a + m.b * m.b), sqrtf(m.c * m.c + m.d * m.d));
+    const float ia = m.d / det, ic = -m.c / det, ib = -m.b / det, id = m.a / det;
     float wcx = m.a * lcx + m.c * lcy + m.e;
     float wcy = m.b * lcx + m.d * lcy + m.f;
     int x0 = (int)floorf((wcx - reach) * s) - 1, x1 = (int)ceilf((wcx + reach) * s) + 1;
@@ -102,11 +109,11 @@ static void fill(raster_t *r, rxf_t m, float lcx, float lcy, float reach, sdf_fn
         float dy = (py + 0.5f) / s - m.f;
         for (int px = x0; px < x1; px++) {
             float dx = (px + 0.5f) / s - m.e;
-            float lx = m.a * dx + m.b * dy;
-            float ly = m.c * dx + m.d * dy;
+            float lx = ia * dx + ic * dy;
+            float ly = ib * dx + id * dy;
             float sd = fn(p, lx, ly);
             float cov = glow_radius > 0 ? clampf(-sd / glow_radius, 0, 1)
-                                        : clampf(0.5f - sd * s, 0, 1);
+                                        : clampf(0.5f - sd * k * s, 0, 1);
             if (cov > 0) row[px] = blend565(row[px], color, cov * alpha);
         }
     }

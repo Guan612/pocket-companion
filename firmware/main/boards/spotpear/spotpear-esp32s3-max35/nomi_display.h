@@ -26,6 +26,11 @@ public:
 
     // 由板子的休眠计时器调用
     void SetSleep(bool sleeping);
+
+    // 表情脚本（JSON，格式见 face_script.h）：大模型回复里的 <face> 和 self.face.play 工具都走这里
+    bool PlayFace(const std::string& json, std::string& error);
+    // 写进系统提示词的表情脚本说明
+    static std::string FacePrompt();
     // 视觉模式的一帧取景画面（NOMI_PREVIEW_W×NOMI_PREVIEW_H，RGB565 本机字节序）
     void SetPreview(const uint16_t* pixels);
     // 设置页里保存的模式、BOOT 键用法
