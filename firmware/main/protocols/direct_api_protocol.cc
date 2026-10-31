@@ -5,16 +5,24 @@
 #include "direct_api_config_server.h"
 #include "display.h"
 #include "http.h"
+#include "long_term_memory.h"
+#include "mcp_server.h"
 #include "ogg_demuxer.h"
+#include "direct_api_settings.h"
 #include "settings.h"
 
 #include <cJSON.h>
+#include <esp_audio_dec_default.h>
+#include <esp_audio_simple_dec.h>
+#include <esp_audio_simple_dec_default.h>
 #include <esp_log.h>
 #include <esp_opus_dec.h>
 #include <esp_timer.h>
 
 #include <array>
+#include <atomic>
 #include <cstring>
+#include <mutex>
 
 #define TAG "DirectApi"
 
@@ -27,7 +35,6 @@ constexpr int kBargeInMs = 300;            // 它说话时用户开口多久算�
 constexpr int kMaxRecordMs = 15000;
 constexpr size_t kHistoryLimit = 12;
 constexpr int kHttpTimeoutMs = 30000;
-constexpr const char* kSettingsNs = "directapi";
 constexpr const char* kDefaultImageQuestion = "你看到了什么？简单说说。";
 
 // 拍照后暂存的 JPEG，取用一次就清掉
@@ -69,11 +76,6 @@ constexpr const char* kDefaultPrompt =
     "你是一个放在桌面上的小伙伴，用口语化的中文回答，每次不超过三句话，不要用 markdown。"
     "回答开头必须带一个情绪标签，只能是 [happy]、[neutral]、[confused] 之一，"
     "例如：[happy]好呀，我来帮你看看。";
-
-std::string TrimSlash(std::string url) {
-    while (!url.empty() && url.back() == '/') url.pop_back();
-    return url;
-}
 
 std::unique_ptr<Http> NewHttp(const std::string& key) {
     auto http = Board::GetInstance().GetNetwork()->CreateHttp(0);
@@ -143,6 +145,38 @@ std::vector<int16_t> DecodeOpus(const std::vector<std::vector<uint8_t>>& packets
     return pcm;
 }
 
+// 从回复里取出 <face>…</face> 表情脚本并删掉；没写结束标签时按括号配对找 JSON 的结尾
+std::string ExtractFace(std::string& reply) {
+    const size_t open = reply.find("<face>");
+    if (open == std::string::npos) return "";
+    const size_t start = open + 6;
+    size_t end = reply.find("</face>", start), stop = end == std::string::npos ? end : end + 7;
+    if (end == std::string::npos) {
+        int depth = 0;
+        bool in_string = false;
+        for (size_t i = start; i < reply.size() && end == std::string::npos; i++) {
+            char c = reply[i];
+            if (in_string) {
+                if (c == '\\') i++;
+                else if (c == '"') in_string = false;
+            } else if (c == '"') {
+                in_string = true;
+            } else if (c == '[' || c == '{') {
+                depth++;
+            } else if ((c == ']' || c == '}') && --depth == 0) {
+                end = stop = i + 1;
+            }
+        }
+        if (end == std::string::npos) {  // 写了一半：整段丢掉，免得把 JSON 念出来
+            reply.erase(open);
+            return "";
+        }
+    }
+    std::string json = reply.substr(start, end - start);
+    reply.erase(open, stop - open);
+    return json;
+}
+
 // 去掉开头的 [happy] 这类情绪标签
 std::pair<std::string, std::string> SplitEmotion(const std::string& reply) {
     size_t start = reply.find_first_not_of(" \n");
@@ -188,32 +222,34 @@ std::vector<std::string> SplitSentences(const std::string& text) {
 
 }  // namespace
 
+// 各用途从网页设置页选的"供应商 + 模型"解析出地址 / Key / 模型（存储格式见 direct_api_settings.h）
 DirectApiConfig DirectApiConfig::Load() {
-    Settings s(kSettingsNs, false);
+    using namespace DirectApiSettings;
+    Settings s(kNs, false);
+    auto endpoint = [&s](const Role& role) {
+        Endpoint e = ResolveRole(s, role);
+        return DirectApiEndpoint{e.url, e.key, e.model};
+    };
     DirectApiConfig c;
-    c.llm = {TrimSlash(s.GetString("llm_url")), s.GetString("llm_key"), s.GetString("llm_model")};
-    // ASR / TTS 没单独填地址或 key 时沿用 LLM 的
-    c.asr = {TrimSlash(s.GetString("asr_url", c.llm.url)), s.GetString("asr_key", c.llm.key),
-             s.GetString("asr_model", "whisper-1")};
-    c.tts = {TrimSlash(s.GetString("tts_url", c.llm.url)), s.GetString("tts_key", c.llm.key),
-             s.GetString("tts_model", "tts-1")};
-    if (c.asr.url.empty()) c.asr.url = c.llm.url;
-    if (c.asr.key.empty()) c.asr.key = c.llm.key;
-    if (c.tts.url.empty()) c.tts.url = c.llm.url;
-    if (c.tts.key.empty()) c.tts.key = c.llm.key;
-    c.vision = {TrimSlash(s.GetString("vision_url", c.llm.url)), s.GetString("vision_key", c.llm.key),
-                s.GetString("vision_model", c.llm.model)};
-    if (c.vision.url.empty()) c.vision.url = c.llm.url;
-    if (c.vision.key.empty()) c.vision.key = c.llm.key;
-    if (c.vision.model.empty()) c.vision.model = c.llm.model;
-    c.tts_voice = s.GetString("tts_voice", "alloy");
-    c.asr_language = s.GetString("asr_lang", "zh");
-    c.system_prompt = s.GetString("prompt", kDefaultPrompt);
+    c.llm = endpoint(kChat);
+    c.asr = endpoint(kAsr);
+    c.tts = endpoint(kTts);
+    c.vision = endpoint(kVision);
+    if (c.vision.url.empty() || c.vision.model.empty()) c.vision = c.llm;  // 没单独选就用对话模型
+    // 留空的项按默认值处理（网页每次都提交所有字段，留空存的是空字符串）
+    c.tts_voice = s.GetString(kTtsVoice);
+    c.asr_language = s.GetString(kAsrLang);
+    c.system_prompt = s.GetString(kPrompt);
+    if (c.tts_voice.empty()) c.tts_voice = "alloy";
+    if (c.asr_language.empty()) c.asr_language = "zh";
+    if (c.system_prompt.empty()) c.system_prompt = kDefaultPrompt;
     return c;
 }
 
+// 对话、语音识别、语音合成都要选好模型才能说话
 bool DirectApiConfig::IsComplete() const {
-    return !llm.url.empty() && !llm.model.empty() && !asr.url.empty() && !tts.url.empty();
+    return !llm.url.empty() && !llm.model.empty() && !asr.url.empty() && !asr.model.empty() &&
+           !tts.url.empty() && !tts.model.empty();
 }
 
 DirectApiProtocol::DirectApiProtocol() {
@@ -230,6 +266,20 @@ DirectApiProtocol::~DirectApiProtocol() {
 }
 
 bool DirectApiProtocol::Start() {
+    // 直连模式自己的本地工具：长期记忆（设备端 MCP 工具的桥接见 Chat()）
+    McpServer::GetInstance().AddTool(
+        "self.memory.remember",
+        "把主人希望长期记住的事存进设备的长期记忆。适合：主人告诉你名字/称呼、喜好、固定安排，"
+        "或明确说\"记住\"。一次记一条简短的事实，闲聊内容不要记。",
+        PropertyList({Property("fact", kPropertyTypeString).SetMaxLength(200)}),
+        [](const PropertyList& properties) -> ToolResult {
+            auto fact = properties["fact"].value<std::string>();
+            if (!LongTermMemory::Append(fact)) {
+                return std::unexpected("长期记忆已满，请提示主人到网页设置页整理");
+            }
+            return std::string("已记住");
+        });
+
     // TLS 握手和 JSON 解析比较吃栈
     xTaskCreate(WorkerEntry, "direct_api", 12 * 1024, this, 4, &worker_);
     config_url_ = DirectApiConfigServer::Start();
@@ -397,6 +447,7 @@ void DirectApiProtocol::RunTurn(std::vector<std::vector<uint8_t>> packets) {
         text = kDefaultImageQuestion;  // 拍了照但没说话
     }
     if (text.empty()) {
+        EmitJson("llm", "emotion", "neutral");  // 没听清：结束"思考中"（它会一直保持到有结果）
         resume();
         return;
     }
@@ -404,12 +455,17 @@ void DirectApiProtocol::RunTurn(std::vector<std::vector<uint8_t>> packets) {
 
     std::string reply = Chat(cfg, text);
     if (cancel_) return;
-    if (reply.empty()) {
+    if (reply.empty() && pending_face_.empty()) {  // 只做了表情、没说话也算正常
         SetError("大模型没有返回内容");
         return;
     }
     auto [emotion, body] = SplitEmotion(reply);
     EmitJson("llm", "emotion", emotion.c_str());
+    if (!pending_face_.empty() && face_handler) {
+        std::string error;
+        if (!face_handler(pending_face_, error)) ESP_LOGW(TAG, "Face script rejected: %s", error.c_str());
+        pending_face_.clear();
+    }
 
     EmitJson("tts", "state", "start");
     // 等 Application 切到 Speaking，否则送进去的音频会被丢掉
@@ -462,7 +518,7 @@ std::string DirectApiProtocol::Transcribe(const DirectApiConfig& cfg,
     std::string resp = http->ReadAll();
     if (!status || *status >= 400) {
         ESP_LOGE(TAG, "ASR failed: %d %s", status ? *status : -1, resp.substr(0, 200).c_str());
-        SetError("语音识别失败");
+        SetError("语音识别失败（HTTP " + std::to_string(status ? *status : 0) + "）");
         return "";
     }
 
@@ -482,68 +538,150 @@ std::string DirectApiProtocol::Chat(const DirectApiConfig& cfg, const std::strin
     // 这一轮带图就用视觉模型（可在网页设置页单独配置，默认和对话模型一样）
     std::string image = TakePendingImage();
     const DirectApiEndpoint& ep = image.empty() ? cfg.llm : cfg.vision;
-    cJSON* req = cJSON_CreateObject();
-    cJSON_AddStringToObject(req, "model", ep.model.c_str());
-    cJSON* messages = cJSON_AddArrayToObject(req, "messages");
-    auto add = [messages](const std::string& role, const std::string& content) {
-        cJSON* m = cJSON_CreateObject();
-        cJSON_AddStringToObject(m, "role", role.c_str());
-        cJSON_AddStringToObject(m, "content", content.c_str());
-        cJSON_AddItemToArray(messages, m);
-    };
-    add("system", cfg.system_prompt);
-    // 历史只存文字；这一轮如果拍了照，用户消息改成"文字 + 图片"的多模态格式
-    for (size_t i = 0; i < history_.size(); i++) {
-        if (i + 1 < history_.size() || image.empty()) {
-            add(history_[i].first, history_[i].second);
-            continue;
+
+    // 长期记忆拼进系统提示词；带工具时补一句使用指引
+    auto build_system = [&cfg](bool with_tools) {
+        std::string sys = cfg.system_prompt;
+        std::string memory = LongTermMemory::Get();
+        if (!memory.empty()) {
+            sys += "\n\n[主人的长期记忆]（回答时自然运用，不要整段复述）\n" + memory;
         }
-        cJSON* m = cJSON_CreateObject();
-        cJSON_AddStringToObject(m, "role", "user");
-        cJSON* parts = cJSON_AddArrayToObject(m, "content");
-        cJSON* text_part = cJSON_CreateObject();
-        cJSON_AddStringToObject(text_part, "type", "text");
-        cJSON_AddStringToObject(text_part, "text", history_[i].second.c_str());
-        cJSON_AddItemToArray(parts, text_part);
-        cJSON* image_part = cJSON_CreateObject();
-        cJSON_AddStringToObject(image_part, "type", "image_url");
-        cJSON* url = cJSON_AddObjectToObject(image_part, "image_url");
-        cJSON_AddStringToObject(url, "url", ("data:image/jpeg;base64," + Base64(image)).c_str());
-        cJSON_AddItemToArray(parts, image_part);
-        cJSON_AddItemToArray(messages, m);
-        ESP_LOGI(TAG, "Sending image (%u bytes JPEG) with question", (unsigned)image.size());
-    }
-    char* json = cJSON_PrintUnformatted(req);
-    cJSON_Delete(req);
+        if (!face_prompt.empty()) sys += "\n\n" + face_prompt;
+        if (with_tools) {
+            sys +=
+                "\n\n你可以调用设备工具：调音量 / 亮度、查设备状态用对应工具；"
+                "主人说了值得长期记住的信息（称呼、喜好、安排，或明确说\"记住\"）时，"
+                "调用 self.memory.remember，一次一条简短事实。";
+        }
+        return sys;
+    };
 
-    auto http = NewHttp(ep.key);
-    http->SetHeader("Content-Type", "application/json");
-    http->SetContent(std::string(json));
-    cJSON_free(json);
-    if (!http->Open("POST", ep.url + "/chat/completions")) {
-        history_.pop_back();
-        SetError("大模型连接失败");
-        return "";
-    }
-    auto status = http->GetStatusCode();
-    std::string resp = http->ReadAll();
-    if (!status || *status >= 400) {
-        ESP_LOGE(TAG, "LLM failed: %d %s", status ? *status : -1, resp.substr(0, 200).c_str());
-        history_.pop_back();
-        SetError("大模型请求失败");
-        return "";
-    }
+    static bool tools_broken = false;  // 服务不支持 function calling 时，这次开机不再带 tools
+    auto build_request = [&](bool with_tools) {
+        cJSON* req = cJSON_CreateObject();
+        cJSON_AddStringToObject(req, "model", ep.model.c_str());
+        cJSON* messages = cJSON_AddArrayToObject(req, "messages");
+        auto add = [messages](const std::string& role, const std::string& content) {
+            cJSON* m = cJSON_CreateObject();
+            cJSON_AddStringToObject(m, "role", role.c_str());
+            cJSON_AddStringToObject(m, "content", content.c_str());
+            cJSON_AddItemToArray(messages, m);
+        };
+        add("system", build_system(with_tools));
+        // 历史只存文字；这一轮如果拍了照，用户消息改成"文字 + 图片"的多模态格式
+        for (size_t i = 0; i < history_.size(); i++) {
+            if (i + 1 < history_.size() || image.empty()) {
+                add(history_[i].first, history_[i].second);
+                continue;
+            }
+            cJSON* m = cJSON_CreateObject();
+            cJSON_AddStringToObject(m, "role", "user");
+            cJSON* parts = cJSON_AddArrayToObject(m, "content");
+            cJSON* text_part = cJSON_CreateObject();
+            cJSON_AddStringToObject(text_part, "type", "text");
+            cJSON_AddStringToObject(text_part, "text", history_[i].second.c_str());
+            cJSON_AddItemToArray(parts, text_part);
+            cJSON* image_part = cJSON_CreateObject();
+            cJSON_AddStringToObject(image_part, "type", "image_url");
+            cJSON* url = cJSON_AddObjectToObject(image_part, "image_url");
+            cJSON_AddStringToObject(url, "url", ("data:image/jpeg;base64," + Base64(image)).c_str());
+            cJSON_AddItemToArray(parts, image_part);
+            cJSON_AddItemToArray(messages, m);
+            ESP_LOGI(TAG, "Sending image (%u bytes JPEG) with question", (unsigned)image.size());
+        }
+        // 设备端 MCP 工具 → OpenAI function calling；带图的请求走视觉模型，不带 tools
+        if (with_tools) {
+            cJSON* tools = cJSON_Parse(McpServer::GetInstance()
+                                           .GetOpenAiToolsJson({"self.camera.take_photo"})
+                                           .c_str());
+            if (cJSON_IsArray(tools) && cJSON_GetArraySize(tools) > 0) {
+                cJSON_AddItemToObject(req, "tools", tools);
+            } else {
+                cJSON_Delete(tools);
+            }
+        }
+        return req;
+    };
 
+    bool with_tools = image.empty() && !tools_broken;
+    cJSON* req = build_request(with_tools);
     std::string reply;
-    if (cJSON* root = cJSON_Parse(resp.c_str())) {
-        cJSON* choices = cJSON_GetObjectItem(root, "choices");
+    for (int round = 0; round < 4 && reply.empty(); round++) {
+        char* json = cJSON_PrintUnformatted(req);
+        auto http = NewHttp(ep.key);
+        http->SetHeader("Content-Type", "application/json");
+        http->SetContent(std::string(json));
+        cJSON_free(json);
+        if (!http->Open("POST", ep.url + "/chat/completions")) {
+            cJSON_Delete(req);
+            history_.pop_back();
+            SetError("大模型连接失败");
+            return "";
+        }
+        auto status = http->GetStatusCode();
+        std::string resp = http->ReadAll();
+        if (!status || *status >= 400) {
+            if (with_tools && status && *status < 500) {
+                // 多半是不支持 function calling：去掉 tools 重试一次，这个开机内不再带
+                ESP_LOGW(TAG, "LLM rejected tools (HTTP %d), retrying without them", *status);
+                tools_broken = true;
+                cJSON_Delete(req);
+                req = build_request(false);
+                with_tools = false;
+                round--;  // 重试不占轮数
+                continue;
+            }
+            ESP_LOGE(TAG, "LLM failed: %d %s", status ? *status : -1, resp.substr(0, 200).c_str());
+            cJSON_Delete(req);
+            history_.pop_back();
+            SetError("大模型请求失败（HTTP " + std::to_string(status ? *status : 0) + "）");
+            return "";
+        }
+
+        cJSON* root = cJSON_Parse(resp.c_str());
+        cJSON* choices = root ? cJSON_GetObjectItem(root, "choices") : nullptr;
         cJSON* first = cJSON_IsArray(choices) ? cJSON_GetArrayItem(choices, 0) : nullptr;
         cJSON* message = first ? cJSON_GetObjectItem(first, "message") : nullptr;
         cJSON* content = message ? cJSON_GetObjectItem(message, "content") : nullptr;
-        if (cJSON_IsString(content)) reply = content->valuestring;
+        cJSON* tool_calls = message ? cJSON_GetObjectItem(message, "tool_calls") : nullptr;
+        if (!cJSON_IsArray(tool_calls) || cJSON_GetArraySize(tool_calls) == 0) {
+            if (cJSON_IsString(content)) reply = content->valuestring;
+            cJSON_Delete(root);
+            break;
+        }
+        if (message == nullptr) {
+            cJSON_Delete(root);
+            break;
+        }
+        // 模型要用工具：assistant 消息原样回填（tool_calls 的 id 不能变），再补 tool 结果
+        ESP_LOGI(TAG, "LLM wants %d tool call(s)", cJSON_GetArraySize(tool_calls));
+        cJSON* msgs = cJSON_GetObjectItem(req, "messages");
+        cJSON_AddItemToArray(msgs, cJSON_Duplicate(message, true));
+        cJSON* tc = nullptr;
+        cJSON_ArrayForEach(tc, tool_calls) {
+            auto id = cJSON_GetObjectItem(tc, "id");
+            auto fn = cJSON_GetObjectItem(tc, "function");
+            auto fname = fn ? cJSON_GetObjectItem(fn, "name") : nullptr;
+            auto fargs = fn ? cJSON_GetObjectItem(fn, "arguments") : nullptr;
+            if (!cJSON_IsString(id) || !cJSON_IsString(fname)) {
+                ESP_LOGW(TAG, "Malformed tool_call, skipping");
+                break;
+            }
+            std::string result = McpServer::GetInstance().CallToolLocal(
+                fname->valuestring, cJSON_IsString(fargs) ? fargs->valuestring : "{}");
+            ESP_LOGI(TAG, "Tool %s -> %s", fname->valuestring, result.substr(0, 120).c_str());
+            cJSON* tr = cJSON_CreateObject();
+            cJSON_AddStringToObject(tr, "role", "tool");
+            cJSON_AddStringToObject(tr, "tool_call_id", id->valuestring);
+            cJSON_AddStringToObject(tr, "content", result.c_str());
+            cJSON_AddItemToArray(msgs, tr);
+        }
         cJSON_Delete(root);
+        // 下一轮带着 tool 结果重新请求
     }
+    cJSON_Delete(req);
     ESP_LOGI(TAG, "LLM: %s", reply.c_str());
+    pending_face_ = ExtractFace(reply);  // 表情脚本不进历史，也不念出来
 
     if (reply.empty()) {
         history_.pop_back();
@@ -556,63 +694,220 @@ std::string DirectApiProtocol::Chat(const DirectApiConfig& cfg, const std::strin
     return reply;
 }
 
-// 请求 Ogg Opus，边下载边拆包送进解码队列
-bool DirectApiProtocol::Speak(const DirectApiConfig& cfg, const std::string& sentence) {
+namespace {
+
+// 语音合成先要 opus（设备原生，最省事）；服务回 4xx 说不支持，就改要 mp3，这次开机内记住
+std::atomic<bool> g_tts_mp3{false};
+std::once_flag g_audio_dec_once;
+
+enum class SpeechFormat { kOgg, kWav, kMp3, kUnknown };
+
+// 按开头几个字节认格式：不少服务不管 response_format，总是回 mp3
+SpeechFormat SniffSpeech(const uint8_t* p, size_t n) {
+    if (n >= 4 && memcmp(p, "OggS", 4) == 0) return SpeechFormat::kOgg;
+    if (n >= 4 && memcmp(p, "RIFF", 4) == 0) return SpeechFormat::kWav;
+    if (n >= 3 && memcmp(p, "ID3", 3) == 0) return SpeechFormat::kMp3;
+    if (n >= 2 && p[0] == 0xFF && (p[1] & 0xE0) == 0xE0) return SpeechFormat::kMp3;  // MPEG 帧同步字
+    return SpeechFormat::kUnknown;
+}
+
+// 发合成请求；连不上返回 nullptr，否则 status 是 HTTP 状态码
+std::unique_ptr<Http> RequestSpeech(const DirectApiConfig& cfg, const std::string& text, bool mp3, int& status) {
     cJSON* req = cJSON_CreateObject();
     cJSON_AddStringToObject(req, "model", cfg.tts.model.c_str());
-    cJSON_AddStringToObject(req, "input", sentence.c_str());
+    cJSON_AddStringToObject(req, "input", text.c_str());
     cJSON_AddStringToObject(req, "voice", cfg.tts_voice.c_str());
-    cJSON_AddStringToObject(req, "response_format", "opus");
+    cJSON_AddStringToObject(req, "response_format", mp3 ? "mp3" : "opus");
     char* json = cJSON_PrintUnformatted(req);
     cJSON_Delete(req);
-
     auto http = NewHttp(cfg.tts.key);
     http->SetHeader("Content-Type", "application/json");
     http->SetHeader("Accept-Encoding", "identity");
     http->SetContent(std::string(json));
     cJSON_free(json);
-    if (!http->Open("POST", cfg.tts.url + "/audio/speech")) {
+    status = 0;
+    if (!http->Open("POST", cfg.tts.url + "/audio/speech")) return nullptr;
+    auto s = http->GetStatusCode();
+    status = s ? *s : 0;
+    return http;
+}
+
+// 先要 opus，被 4xx 拒了就换 mp3 再要一次（并记住）
+std::unique_ptr<Http> RequestSpeechWithFallback(const DirectApiConfig& cfg, const std::string& text, int& status) {
+    auto http = RequestSpeech(cfg, text, g_tts_mp3, status);
+    if (http && !g_tts_mp3 && status >= 400 && status < 500) {
+        ESP_LOGW(TAG, "TTS rejected opus (HTTP %d: %s), switching to mp3", status,
+                 http->ReadAll().substr(0, 120).c_str());
+        g_tts_mp3 = true;
+        http = RequestSpeech(cfg, text, true, status);
+    }
+    return http;
+}
+
+}  // namespace
+
+// 语音合成，边下载边播：Ogg Opus 拆包进解码队列（和小智服务器下发的一样）；
+// mp3 / wav 在这里用乐鑫音频库解成 PCM，直接进播放队列
+bool DirectApiProtocol::Speak(const DirectApiConfig& cfg, const std::string& sentence) {
+    int status = 0;
+    auto http = RequestSpeechWithFallback(cfg, sentence, status);
+    if (!http) {
         SetError("语音合成连接失败");
         return false;
     }
-    auto status = http->GetStatusCode();
-    if (!status || *status >= 400) {
-        ESP_LOGE(TAG, "TTS failed: %d %s", status ? *status : -1,
-                 http->ReadAll().substr(0, 200).c_str());
-        SetError("语音合成失败");
+    if (status < 200 || status >= 300) {
+        ESP_LOGE(TAG, "TTS failed: %d %s", status, http->ReadAll().substr(0, 200).c_str());
+        SetError("语音合成失败（HTTP " + std::to_string(status) + "）");
         return false;
     }
 
-    auto& audio = Application::GetInstance().GetAudioService();
-    OggDemuxer demuxer;
-    bool stop = false;
-    demuxer.OnPacket([this, &audio, &stop](const uint8_t* data, int sample_rate,
-                                           int frame_duration_ms, size_t size) {
-        if (stop || cancel_) {
-            stop = true;
-            return;
-        }
-        auto packet = std::make_unique<AudioStreamPacket>();
-        packet->sample_rate = sample_rate;
-        packet->frame_duration = frame_duration_ms;
-        packet->payload.assign(data, data + size);
-        // 下载比实时快，用阻塞方式等解码队列腾出位置，避免丢包
-        if (!audio.PushPacketToDecodeQueue(std::move(packet), true)) stop = true;
-    });
-
+    // 先读到能认出格式的几个字节
     std::array<char, 2048> buffer;
-    while (!stop && !cancel_) {
+    std::string head;
+    while (head.size() < 4 && !cancel_) {
         auto n = http->Read(buffer.data(), buffer.size());
-        if (!n || *n == 0) break;
-        demuxer.Process(reinterpret_cast<const uint8_t*>(buffer.data()), *n);
-        if (demuxer.HasError()) {
-            ESP_LOGE(TAG, "TTS response is not Ogg Opus");
-            SetError("语音合成格式不支持，需要 opus");
+        if (!n || *n <= 0) break;
+        head.append(buffer.data(), *n);
+    }
+    if (cancel_) return false;
+    if (head.empty()) return true;  // 空响应：这句没声音，接着下一句
+    const auto* h = reinterpret_cast<const uint8_t*>(head.data());
+    const SpeechFormat format = SniffSpeech(h, head.size());
+    if (format == SpeechFormat::kUnknown) {
+        ESP_LOGE(TAG, "TTS response format unknown: %02x %02x %02x %02x", h[0], head.size() > 1 ? h[1] : 0,
+                 head.size() > 2 ? h[2] : 0, head.size() > 3 ? h[3] : 0);
+        SetError("语音合成返回的格式认不出（要 opus / mp3 / wav）");
+        return false;
+    }
+
+    // 把已经读到的开头和后面的数据依次交给 feed；feed 返回 false 就停
+    auto pump = [&](auto&& feed) {
+        if (!feed(h, head.size())) return false;
+        while (!cancel_) {
+            auto n = http->Read(buffer.data(), buffer.size());
+            if (!n || *n <= 0) break;
+            last_incoming_time_ = std::chrono::steady_clock::now();
+            if (!feed(reinterpret_cast<const uint8_t*>(buffer.data()), static_cast<size_t>(*n))) return false;
+        }
+        return true;
+    };
+    auto& audio = Application::GetInstance().GetAudioService();
+
+    if (format == SpeechFormat::kOgg) {
+        OggDemuxer demuxer;
+        bool stop = false;
+        demuxer.OnPacket([this, &audio, &stop](const uint8_t* data, int sample_rate, int frame_duration_ms,
+                                               size_t size) {
+            if (stop || cancel_) {
+                stop = true;
+                return;
+            }
+            auto packet = std::make_unique<AudioStreamPacket>();
+            packet->sample_rate = sample_rate;
+            packet->frame_duration = frame_duration_ms;
+            packet->payload.assign(data, data + size);
+            // 下载比实时快，用阻塞方式等解码队列腾出位置，避免丢包
+            if (!audio.PushPacketToDecodeQueue(std::move(packet), true)) stop = true;
+        });
+        bool bad = false;
+        pump([&](const uint8_t* p, size_t n) {
+            demuxer.Process(p, n);
+            bad = demuxer.HasError();
+            return !bad && !stop;
+        });
+        if (bad) {
+            ESP_LOGE(TAG, "TTS Ogg stream is not Opus");
+            SetError("语音合成返回的 Ogg 不是 opus");
             return false;
         }
-        last_incoming_time_ = std::chrono::steady_clock::now();
+        return !cancel_;
     }
-    return !cancel_;
+
+    // mp3 / wav：simple decoder 支持任意大小的输入块，边收边解
+    std::call_once(g_audio_dec_once, []() {
+        esp_audio_dec_register_default();
+        esp_audio_simple_dec_register_default();
+    });
+    esp_audio_simple_dec_cfg_t dec_cfg = {};
+    dec_cfg.dec_type = format == SpeechFormat::kWav ? ESP_AUDIO_SIMPLE_DEC_TYPE_WAV : ESP_AUDIO_SIMPLE_DEC_TYPE_MP3;
+    esp_audio_simple_dec_handle_t dec = nullptr;
+    if (esp_audio_simple_dec_open(&dec_cfg, &dec) != ESP_AUDIO_ERR_OK || dec == nullptr) {
+        ESP_LOGE(TAG, "Failed to open %s decoder", format == SpeechFormat::kWav ? "wav" : "mp3");
+        SetError("语音合成解码器打不开");
+        return false;
+    }
+    std::vector<uint8_t> out(4608);  // 一帧 mp3 最多 1152 个采样 × 双声道 × 16 位
+    std::vector<int16_t> pending;    // 攒够约 60ms 再送进播放队列，和 Opus 一帧差不多
+    int rate = 0, channels = 1;
+    bool failed = false, aborted = false;
+
+    auto flush = [&](bool all) {
+        const size_t chunk = static_cast<size_t>(rate) * 60 / 1000;
+        while (!aborted && rate > 0 && !pending.empty() && (all || pending.size() >= chunk)) {
+            const size_t n = pending.size() < chunk || all ? pending.size() : chunk;
+            std::vector<int16_t> part(pending.begin(), pending.begin() + n);
+            pending.erase(pending.begin(), pending.begin() + n);
+            if (!audio.PushPcmToPlaybackQueue(std::move(part), rate, true)) aborted = true;  // 被打断了
+        }
+    };
+    auto decode = [&](const uint8_t* p, size_t n, bool eos) {
+        esp_audio_simple_dec_raw_t raw = {};
+        raw.buffer = const_cast<uint8_t*>(p);
+        raw.len = n;
+        raw.eos = eos;
+        while ((raw.len > 0 || eos) && !cancel_ && !aborted) {
+            esp_audio_simple_dec_out_t frame = {};
+            frame.buffer = out.data();
+            frame.len = out.size();
+            auto ret = esp_audio_simple_dec_process(dec, &raw, &frame);
+            if (ret == ESP_AUDIO_ERR_BUFF_NOT_ENOUGH) {
+                out.resize(frame.needed_size);
+                continue;
+            }
+            if (ret != ESP_AUDIO_ERR_OK) {
+                ESP_LOGE(TAG, "TTS decode failed: %d", ret);
+                failed = true;
+                return false;
+            }
+            if (frame.decoded_size > 0) {
+                if (rate == 0) {
+                    esp_audio_simple_dec_info_t info = {};
+                    esp_audio_simple_dec_get_info(dec, &info);
+                    if (info.bits_per_sample != 16) {
+                        ESP_LOGE(TAG, "TTS audio is %d-bit, only 16-bit supported", info.bits_per_sample);
+                        failed = true;
+                        return false;
+                    }
+                    rate = info.sample_rate;
+                    channels = info.channel ? info.channel : 1;
+                    ESP_LOGI(TAG, "TTS %s: %d Hz, %d ch", format == SpeechFormat::kWav ? "wav" : "mp3", rate, channels);
+                }
+                const auto* s = reinterpret_cast<const int16_t*>(frame.buffer);
+                const size_t samples = frame.decoded_size / sizeof(int16_t) / channels;
+                for (size_t i = 0; i < samples; i++) {  // 多声道混成单声道
+                    int sum = 0;
+                    for (int c = 0; c < channels; c++) sum += s[i * channels + c];
+                    pending.push_back(static_cast<int16_t>(sum / channels));
+                }
+                flush(false);
+            }
+            raw.buffer += raw.consumed;
+            raw.len -= raw.consumed;
+            if (raw.consumed == 0 && frame.decoded_size == 0) break;  // 不够一帧，等下一块
+            if (eos && raw.len == 0 && frame.decoded_size == 0) break;
+        }
+        return !failed && !aborted;
+    };
+
+    bool ok = pump([&](const uint8_t* p, size_t n) { return decode(p, n, false); });
+    if (ok && !cancel_) decode(nullptr, 0, true);  // 把解码器里剩下的冲出来
+    if (!failed && !cancel_) flush(true);
+    esp_audio_simple_dec_close(dec);
+    if (failed) {
+        SetError("语音合成解码失败");
+        return false;
+    }
+    return !cancel_ && !aborted;
 }
 
 // 发请求并返回 HTTP 状态码；连不上返回 0
@@ -623,6 +918,8 @@ static int PostStatus(Http& http, const std::string& url) {
 }
 
 std::function<std::string()> DirectApiProtocol::image_provider;
+std::string DirectApiProtocol::face_prompt;
+std::function<bool(const std::string&, std::string&)> DirectApiProtocol::face_handler;
 
 void DirectApiProtocol::AttachImage(std::string jpeg) {
     std::lock_guard<std::mutex> lock(g_image_mutex);
@@ -653,20 +950,21 @@ std::string DirectApiProtocol::SelfTest() {
                      : "大模型：" + describe(status) + "，检查地址 / Key / 模型";
     }
 
-    // 语音合成：看服务能不能返回 Ogg Opus
+    // 语音合成：和 Speak 一样先要 opus、不行再要 mp3，看实际回来的是什么格式
     {
-        auto http = NewHttp(cfg.tts.key);
-        http->SetHeader("Content-Type", "application/json");
-        http->SetContent("{\"model\":\"" + cfg.tts.model + "\",\"input\":\"测试\",\"voice\":\"" +
-                         cfg.tts_voice + "\",\"response_format\":\"opus\"}");
-        int status = PostStatus(*http, cfg.tts.url + "/audio/speech");
-        if (status < 200 || status >= 300) {
-            report += "\n语音合成：" + describe(status) + "，检查地址 / Key / 模型 / 音色";
+        int status = 0;
+        auto http = RequestSpeechWithFallback(cfg, "测试", status);
+        if (!http || status < 200 || status >= 300) {
+            report += "\n语音合成：" + describe(http ? status : 0) + "，检查地址 / Key / 模型 / 音色";
         } else {
-            char head[4] = {};
-            auto n = http->Read(head, sizeof(head));
-            bool ogg = n && *n == 4 && memcmp(head, "OggS", 4) == 0;
-            report += ogg ? "\n语音合成：正常，支持 opus" : "\n语音合成：返回的不是 opus，换支持 opus 的服务";
+            uint8_t head[4] = {};
+            auto n = http->Read(reinterpret_cast<char*>(head), sizeof(head));
+            switch (SniffSpeech(head, n ? static_cast<size_t>(*n) : 0)) {
+                case SpeechFormat::kOgg: report += "\n语音合成：正常（opus）"; break;
+                case SpeechFormat::kMp3: report += "\n语音合成：正常（mp3，设备自己解码）"; break;
+                case SpeechFormat::kWav: report += "\n语音合成：正常（wav）"; break;
+                default: report += "\n语音合成：返回的格式认不出，要 opus / mp3 / wav"; break;
+            }
         }
     }
     return report;

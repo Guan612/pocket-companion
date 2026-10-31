@@ -64,6 +64,10 @@ public:
     // 视觉模式：设了它，每轮提问时调用它拍一张（返回 JPEG，空串表示这轮不带图）
     static std::function<std::string()> image_provider;
 
+    // 表情脚本（板子支持才设置）：face_prompt 加进系统提示词；回复里的 <face>…</face> 交给 face_handler 播放
+    static std::string face_prompt;
+    static std::function<bool(const std::string& json, std::string& error)> face_handler;
+
 protected:
     bool SendText(const std::string& text) override;
 
@@ -83,6 +87,7 @@ private:
     int barge_in_ms_ = 0;  // 它说话时用户连续开口多久了（随时打断模式）
 
     std::vector<std::pair<std::string, std::string>> history_;  // role, content
+    std::string pending_face_;  // 这一轮回复里取出的表情脚本，开口说话时播
     SemaphoreHandle_t turn_sem_ = nullptr;
     TaskHandle_t worker_ = nullptr;
 

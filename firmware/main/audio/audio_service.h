@@ -142,6 +142,9 @@ public:
     void SetCallbacks(AudioServiceCallbacks& callbacks);
 
     bool PushPacketToDecodeQueue(std::unique_ptr<AudioStreamPacket> packet, bool wait = false);
+    // Pocket Companion：已经解码好的 PCM（直连 API 的 mp3 / wav 语音合成），重采样到喇叭的采样率后
+    // 直接进播放队列，打断 / 播完的判断和 Opus 一样。wait 时队列满了会等，被打断或停止返回 false
+    bool PushPcmToPlaybackQueue(std::vector<int16_t>&& pcm, int sample_rate, bool wait = false);
     std::unique_ptr<AudioStreamPacket> PopPacketFromSendQueue();
     void PlaySound(const std::string_view& sound);
     bool ReadAudioData(std::vector<int16_t>& data, int sample_rate, int samples);
@@ -159,6 +162,9 @@ private:
     std::mutex input_resampler_mutex_;
     esp_ae_rate_cvt_handle_t input_resampler_ = nullptr;
     esp_ae_rate_cvt_handle_t output_resampler_ = nullptr;
+    std::mutex pcm_resampler_mutex_;  // PushPcmToPlaybackQueue 自己的重采样器，和 Opus 解码的互不干扰
+    esp_ae_rate_cvt_handle_t pcm_resampler_ = nullptr;
+    int pcm_resampler_rate_ = 0;
 
     // Encoder/Decoder state
     int encoder_sample_rate_ = 16000;

@@ -19,6 +19,9 @@
 #include "lvgl_theme.h"
 #include "settings.h"
 
+#include <freertos/FreeRTOS.h>
+#include <freertos/semphr.h>
+
 #define TAG "MCP"
 
 McpServer::McpServer() {}
@@ -623,4 +626,122 @@ void McpServer::DoToolCall(int id, const std::string& tool_name, const cJSON* to
         }
         ReplyResult(id, *result, response_sender);
     });
+}
+
+// 直连模式：把 MCP 工具结果 JSON（{"content":[{"type":"text","text":"..."}]}）里的文本抽出来
+static std::string ExtractMcpText(const std::string& mcp_result) {
+    CJsonUniquePtr root(cJSON_Parse(mcp_result.c_str()));
+    auto content = root ? cJSON_GetObjectItem(root.get(), "content") : nullptr;
+    auto first = cJSON_IsArray(content) ? cJSON_GetArrayItem(content, 0) : nullptr;
+    auto text = first ? cJSON_GetObjectItem(first, "text") : nullptr;
+    return cJSON_IsString(text) ? std::string(text->valuestring) : mcp_result;
+}
+
+std::string McpServer::GetOpenAiToolsJson(const std::vector<std::string>& exclude) {
+    std::string json = "[";
+    bool first = true;
+    for (auto& tool : tools_) {
+        if (tool->user_only()) {
+            continue;
+        }
+        bool skipped = false;
+        for (auto& name : exclude) {
+            if (tool->name() == name) {
+                skipped = true;
+                break;
+            }
+        }
+        if (skipped) {
+            continue;
+        }
+        // 解析 MCP 格式（name/description/inputSchema），包一层 OpenAI 的 function 格式
+        CJsonUniquePtr mcp(cJSON_Parse(tool->to_json().c_str()));
+        auto name = mcp ? cJSON_GetObjectItem(mcp.get(), "name") : nullptr;
+        auto desc = mcp ? cJSON_GetObjectItem(mcp.get(), "description") : nullptr;
+        auto schema = mcp ? cJSON_GetObjectItem(mcp.get(), "inputSchema") : nullptr;
+        if (!cJSON_IsString(name) || !cJSON_IsString(desc) || !cJSON_IsObject(schema)) {
+            continue;
+        }
+        if (!first) {
+            json += ",";
+        }
+        first = false;
+        json += "{\"type\":\"function\",\"function\":{\"name\":\"";
+        json += name->valuestring;
+        json += "\",\"description\":";
+        char* printed = cJSON_PrintUnformatted(desc);
+        json += printed != nullptr ? printed : "null";
+        cJSON_free(printed);
+        json += ",\"parameters\":";
+        printed = cJSON_PrintUnformatted(schema);
+        json += printed != nullptr ? printed : "null";
+        cJSON_free(printed);
+        json += "}}";
+    }
+    json += "]";
+    return json;
+}
+
+std::string McpServer::CallToolLocal(const std::string& tool_name,
+                                     const std::string& arguments_json) {
+    auto tool_iter = std::find_if(tools_.begin(), tools_.end(), [&tool_name](const auto& tool) {
+        return tool->name() == tool_name;
+    });
+    if (tool_iter == tools_.end()) {
+        return "未知工具：" + tool_name;
+    }
+    McpTool* tool = tool_iter->get();
+
+    // 参数校验和 DoToolCall 相同，只是出错时把原因作为文本还给大模型
+    CJsonUniquePtr args(cJSON_Parse(arguments_json.c_str()));
+    PropertyList arguments = tool->properties();
+    for (auto& argument : arguments) {
+        bool found = false;
+        std::expected<void, std::string> validation;
+        if (cJSON_IsObject(args.get())) {
+            auto value = cJSON_GetObjectItem(args.get(), argument.name().c_str());
+            if (argument.type() == kPropertyTypeBoolean && cJSON_IsBool(value)) {
+                validation = argument.set_value<bool>(value->valueint == 1);
+                found = true;
+            } else if (argument.type() == kPropertyTypeInteger && cJSON_IsNumber(value)) {
+                validation = argument.set_value<int>(value->valueint);
+                found = true;
+            } else if (argument.type() == kPropertyTypeString && cJSON_IsString(value)) {
+                validation = argument.set_value<std::string>(value->valuestring);
+                found = true;
+            } else if (value != nullptr) {
+                return "参数类型错误：" + argument.name();
+            }
+        }
+        if (found && !validation) {
+            return validation.error();
+        }
+        if (!argument.has_default_value() && !found) {
+            return "缺少参数：" + argument.name();
+        }
+    }
+
+    // 和服务器模式一样投到主循环执行；直连的工作线程在这等结果。
+    // 超时后不再等（ctx 由 shared_ptr 兜底，主循环晚到也不会悬空）
+    struct LocalCall {
+        SemaphoreHandle_t done;
+        std::string text;
+    };
+    auto ctx = std::make_shared<LocalCall>();
+    ctx->done = xSemaphoreCreateBinary();
+    Application::GetInstance().Schedule([tool, arguments = std::move(arguments), ctx]() {
+        auto result = tool->Call(arguments);
+        if (result) {
+            ctx->text = ExtractMcpText(*result);
+        } else {
+            ctx->text = "工具执行失败：" + result.error();
+        }
+        xSemaphoreGive(ctx->done);
+    });
+    if (xSemaphoreTake(ctx->done, pdMS_TO_TICKS(8000)) != pdTRUE) {
+        ESP_LOGE(TAG, "Local tool %s timed out", tool_name.c_str());
+        return "工具执行超时";
+    }
+    vSemaphoreDelete(ctx->done);
+    return ctx->text;
 }

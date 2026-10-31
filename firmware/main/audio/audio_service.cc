@@ -43,6 +43,9 @@ AudioService::~AudioService() {
     if (output_resampler_ != nullptr) {
         esp_ae_rate_cvt_close(output_resampler_);
     }
+    if (pcm_resampler_ != nullptr) {
+        esp_ae_rate_cvt_close(pcm_resampler_);
+    }
 }
 
 void AudioService::Initialize(AudioCodec* codec) {
@@ -624,6 +627,55 @@ bool AudioService::PushPacketToDecodeQueue(std::unique_ptr<AudioStreamPacket> pa
     }
     playback_drained_notified_ = false;
     audio_decode_queue_.push_back(std::move(packet));
+    audio_queue_cv_.notify_all();
+    return true;
+}
+
+bool AudioService::PushPcmToPlaybackQueue(std::vector<int16_t>&& pcm, int sample_rate, bool wait) {
+    if (pcm.empty()) return true;
+    const int out_rate = codec_->output_sample_rate();
+    if (sample_rate != out_rate) {
+        std::lock_guard<std::mutex> resampler_lock(pcm_resampler_mutex_);
+        if (pcm_resampler_ == nullptr || pcm_resampler_rate_ != sample_rate) {
+            if (pcm_resampler_ != nullptr) {
+                esp_ae_rate_cvt_close(pcm_resampler_);
+                pcm_resampler_ = nullptr;
+            }
+            esp_ae_rate_cvt_cfg_t cfg = RATE_CVT_CFG(sample_rate, out_rate, ESP_AUDIO_MONO);
+            if (esp_ae_rate_cvt_open(&cfg, &pcm_resampler_) != ESP_AE_ERR_OK || pcm_resampler_ == nullptr) {
+                ESP_LOGE(TAG, "Failed to create PCM resampler %d -> %d", sample_rate, out_rate);
+                pcm_resampler_ = nullptr;
+                return false;
+            }
+            pcm_resampler_rate_ = sample_rate;
+        }
+        uint32_t target_size = 0;
+        esp_ae_rate_cvt_get_max_out_sample_num(pcm_resampler_, pcm.size(), &target_size);
+        std::vector<int16_t> resampled(target_size);
+        uint32_t actual_output = target_size;
+        esp_ae_rate_cvt_process(pcm_resampler_, (esp_ae_sample_t)pcm.data(), pcm.size(),
+                                (esp_ae_sample_t)resampled.data(), &actual_output);
+        resampled.resize(actual_output);
+        pcm = std::move(resampled);
+    }
+
+    std::unique_lock<std::mutex> lock(audio_queue_mutex_);
+    const uint32_t generation = playback_generation_;
+    if (audio_playback_queue_.size() >= MAX_PLAYBACK_TASKS_IN_QUEUE) {
+        if (!wait) return false;
+        audio_queue_cv_.wait(lock, [this, generation]() {
+            return service_stopped_.load() || generation != playback_generation_ ||
+                   audio_playback_queue_.size() < MAX_PLAYBACK_TASKS_IN_QUEUE;
+        });
+    }
+    if (service_stopped_.load() || generation != playback_generation_) {
+        return false;
+    }
+    AudioTask task;
+    task.type = kAudioTaskTypeDecodeToPlaybackQueue;
+    task.pcm = std::move(pcm);
+    playback_drained_notified_ = false;
+    audio_playback_queue_.push_back(std::move(task));
     audio_queue_cv_.notify_all();
     return true;
 }

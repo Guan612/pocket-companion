@@ -438,6 +438,13 @@ public:
     void ParseMessage(const cJSON* json, ResponseSender response_sender = nullptr);
     void ParseMessage(const std::string& message, ResponseSender response_sender = nullptr);
 
+    // 直连模式（OpenAI 兼容 API）的本地工具桥接：
+    // 把非 user-only 的工具导出成 function calling 的 tools 数组；exclude 里的名字跳过。
+    std::string GetOpenAiToolsJson(const std::vector<std::string>& exclude = {});
+    // 同步执行一个工具：投到主循环（和服务器模式同一条执行路径），阻塞等结果，
+    // 返回给大模型看的纯文本。arguments_json 是 function.arguments 那段 JSON。
+    std::string CallToolLocal(const std::string& name, const std::string& arguments_json);
+
 private:
     McpServer();
     ~McpServer();

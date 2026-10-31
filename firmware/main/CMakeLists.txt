@@ -1100,7 +1100,8 @@ endif()
 
 set(MAIN_PRIV_REQUIRES_EXTRA "")
 if(CONFIG_DIRECT_API)
-    list(APPEND SOURCES "protocols/direct_api_protocol.cc" "protocols/direct_api_config_server.cc")
+    list(APPEND SOURCES "protocols/direct_api_protocol.cc" "protocols/direct_api_config_server.cc"
+                        "protocols/direct_api_settings.cc" "long_term_memory.cc")
     list(APPEND MAIN_PRIV_REQUIRES_EXTRA esp_http_server)
 endif()
 if(CONFIG_XIAOZHI_NETWORK_ETHERNET AND CONFIG_XIAOZHI_ETH_PHY_IP101)
