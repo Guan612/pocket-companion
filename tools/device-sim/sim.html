@@ -3,101 +3,471 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>设备模拟器</title>
+<title>整机模拟</title>
 <style>
-:root{color-scheme:dark;--bg:#111318;--fg:#e8eaf0;--muted:#8b90a0;--card:#1b1e26;--accent:#6aa6ff}
+:root{color-scheme:dark;--bg:#111318;--fg:#e8eaf0;--muted:#8b90a0;--card:#1b1e26;--line:#2c3040;--accent:#6aa6ff;--ok:#5ad19a;--warn:#ffcf5a;--err:#ff7a7a}
 *{box-sizing:border-box}
-body{margin:0;user-select:none;-webkit-user-select:none;padding:16px;background:var(--bg);color:var(--fg);font:14px/1.6 system-ui,"PingFang SC","Microsoft YaHei",sans-serif}
+body{margin:0;padding:16px;background:var(--bg);color:var(--fg);font:14px/1.6 system-ui,"PingFang SC","Microsoft YaHei",sans-serif}
 h1{font-size:18px;margin:0 0 4px}
-p{margin:0 0 12px;color:var(--muted);max-width:760px}
-.device{display:inline-flex;gap:14px;align-items:center;padding:18px 22px;border-radius:24px;background:#2a2d36;max-width:100%}
+p{margin:0 0 12px;color:var(--muted)}
+kbd{background:var(--card);border:1px solid var(--line);border-radius:4px;padding:0 5px}
+.layout{display:grid;grid-template-columns:minmax(0,1fr) 400px;gap:24px;align-items:start}
+@media (max-width:1100px){.layout{grid-template-columns:minmax(0,1fr)}}
+.device{display:flex;gap:14px;align-items:center;padding:18px 22px;border-radius:24px;background:#2a2d36;width:fit-content;max-width:100%}
 canvas{display:block;user-select:none;-webkit-user-select:none;width:min(720px,calc(100vw - 150px));aspect-ratio:3/2;background:#000;border-radius:4px;cursor:pointer;touch-action:none}
 .boot{width:44px;height:44px;border-radius:50%;border:0;background:#3a3e4a;color:var(--fg);font:12px system-ui;cursor:pointer;flex:none}
 .boot:active{background:#4a5060}
-kbd{background:var(--card);border:1px solid #2c3040;border-radius:4px;padding:0 5px}
-#stats{margin-top:10px;color:var(--muted);font-variant-numeric:tabular-nums}
+.bar{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin:12px 0}
+button{font:inherit;color:var(--fg)}
+.bar button,.tabs button,.tabs a{padding:6px 12px;border-radius:8px;border:1px solid var(--line);background:var(--card);cursor:pointer;text-decoration:none;color:var(--fg)}
+.bar button:hover,.tabs button:hover,.tabs a:hover{border-color:var(--accent)}
+.pill{padding:2px 10px;border-radius:999px;background:var(--card);color:var(--muted);font-variant-numeric:tabular-nums}
+.pill b{color:var(--fg);font-weight:600}
+.label{color:var(--muted);margin-right:2px}
+.seg{display:inline-flex;border:1px solid var(--line);border-radius:8px;overflow:hidden}
+.seg button{padding:5px 12px;border:0;background:var(--card);cursor:pointer}
+.seg button+button{border-left:1px solid var(--line)}
+.seg button.on{background:#2b4a7a}
+.seg button.on.bad{background:#6b2f2f}
+.say{display:flex;gap:8px;align-items:center;margin:0 0 12px}
+.say input{flex:1;min-width:0;padding:7px 10px;border-radius:8px;border:1px solid var(--line);background:var(--card);color:var(--fg);font:inherit}
+#mic{color:var(--muted);white-space:nowrap}
+.monitor{height:240px;overflow:auto;margin:0;padding:10px 12px;border-radius:12px;background:#0b0c10;border:1px solid var(--line);font:12px/1.5 ui-monospace,Consolas,monospace;white-space:pre-wrap;word-break:break-all}
+.monitor .I{color:var(--ok)}.monitor .W{color:var(--warn)}.monitor .E{color:var(--err)}.monitor .S{color:var(--muted)}
+.phone{position:sticky;top:16px}
+.frame{width:100%;max-width:390px;height:min(760px,calc(100vh - 110px));min-height:520px;margin:0 auto;padding:12px;border-radius:40px;background:#000;border:1px solid #333;display:flex;flex-direction:column}
+.screen{flex:1;display:flex;flex-direction:column;border-radius:30px;overflow:hidden;background:#f4f5f7;color:#222}
+.status{display:flex;justify-content:space-between;padding:8px 18px 4px;font-size:12px;color:#333}
+.addr{margin:4px 12px 8px;padding:6px 12px;border-radius:10px;background:#e4e6ea;color:#333;font-size:13px;text-align:center;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.screen iframe{flex:1;width:100%;border:0;background:#fff}
+.empty{flex:1;display:flex;align-items:center;justify-content:center;padding:28px;text-align:center;color:#777}
+.tabs{display:flex;gap:8px;justify-content:center;margin-top:10px}
+.facebox{margin:0 0 12px;padding:10px 12px;border:1px solid var(--line);border-radius:12px;background:var(--card)}
+.facebox summary{cursor:pointer;color:var(--fg)}
+.examples{display:flex;flex-wrap:wrap;gap:6px;margin:10px 0}
+.examples button{padding:4px 10px;border-radius:999px;border:1px solid var(--line);background:#232838;cursor:pointer}
+.examples button:hover{border-color:var(--accent)}
+#faceJson{width:100%;min-height:96px;padding:8px;border-radius:8px;border:1px solid var(--line);background:#0b0c10;color:var(--fg);font:12px/1.5 ui-monospace,Consolas,monospace;resize:vertical}
+#faceMsg{color:var(--err)}
+[hidden]{display:none!important}
 </style>
 </head>
 <body>
-<h1>设备模拟器 · 480×320</h1>
-<p>运行的是固件里同一份界面代码（nomi_ui.c、face.c，LVGL 9.5，小智的中文字体），鼠标当触摸。
-左右滑切换 Nomi / 视觉模式，从顶部往下拉打开设置、往上推收起。
-说话用右边圆钮或 <kbd>空格</kbd>（BOOT 键，默认按住说话）。按 <kbd>Z</kbd> 立刻睡着，点屏幕唤醒。
-对话内容和视觉模式的取景画面都是模拟的，真正的摄像头和 API 只在设备上。</p>
-<div class="device">
-  <canvas id="lcd" width="480" height="320"></canvas>
-  <button class="boot" id="boot" title="BOOT 键">BOOT</button>
+<h1>整机模拟 · Pocket Companion</h1>
+<p>左边是设备：屏幕跑的是固件里同一份界面代码，开机、配网、联网、对话按固件的真实顺序走，底下是串口日志。
+右边是手机：设备开热点时弹出配网页，联网后打开网页设置页，两页都是固件里的同一份 HTML。
+说话用圆钮或 <kbd>空格</kbd>（BOOT 键），开机阶段点一下进配网；顶部下拉打开设置，<kbd>Z</kbd> 立刻睡着。
+「真实 API」时设备由这台电脑代为上网，按设置页填的地址真的去调语音识别、大模型和语音合成。</p>
+<div class="layout">
+  <section>
+    <div class="device">
+      <canvas id="lcd" width="480" height="320"></canvas>
+      <button class="boot" id="boot" title="BOOT 键">BOOT</button>
+    </div>
+    <div class="bar">
+      <span class="label">网络环境</span>
+      <div class="seg" data-key="router"><button data-v="1">路由器在线</button><button data-v="0" data-bad>路由器断开</button></div>
+      <div class="seg" data-key="internet"><button data-v="1">外网通</button><button data-v="0" data-bad>外网不通</button></div>
+      <div class="seg" data-key="api"><button data-v="real">真实 API</button><button data-v="mock">模拟回答</button></div>
+    </div>
+    <div class="say">
+      <input id="typed" placeholder="没有麦克风也能聊：在这里打字回车，就当你对设备说了这句话">
+      <span id="mic">麦克风：未使用</span>
+    </div>
+    <details class="facebox" open>
+      <summary>表情脚本试播：大模型会写这种 JSON 驱动表情（点例子直接播，也可以改了再播）</summary>
+      <div class="examples" id="examples"></div>
+      <textarea id="faceJson" spellcheck="false"></textarea>
+      <div class="bar"><button id="facePlay">播放</button><span id="faceMsg"></span></div>
+    </details>
+    <div class="bar">
+      <button id="reboot" title="设备存储保留">断电重启</button>
+      <button id="forget" title="清掉存过的 Wi-Fi 再开机，重走配网">清除 Wi-Fi 重启</button>
+      <button id="reset" title="清空 Wi-Fi、API 设置和长期记忆">恢复出厂</button>
+      <span class="pill">阶段 <b id="stage">—</b></span>
+      <span class="pill">API <b id="api">—</b></span>
+      <span class="pill" id="stats"></span>
+    </div>
+    <pre class="monitor" id="log"></pre>
+  </section>
+  <section class="phone">
+    <div class="frame">
+      <div class="screen">
+        <div class="status"><span id="clock"></span><span id="phoneWifi">Wi-Fi：家里的网络</span></div>
+        <div class="addr" id="addr">—</div>
+        <iframe id="page" title="手机浏览器" hidden></iframe>
+        <div class="empty" id="empty">手机还没打开设备的网页。<br>设备进入配网模式后，这里会像连上热点那样弹出配网页。</div>
+      </div>
+    </div>
+    <div class="tabs">
+      <button id="tabAp">配网页</button>
+      <button id="tabSettings">设置页</button>
+      <a id="open" target="_blank" rel="noopener">新窗口打开</a>
+    </div>
+  </section>
 </div>
-<div id="stats"></div>
 <script>
 (async()=>{
-  const stats=document.getElementById('stats');
-  try{
-    const wasi=new Proxy({},{get:()=>()=>0});  // 界面代码不用文件和时钟，WASI 给空实现即可
-    const [{instance},font]=await Promise.all([
-      WebAssembly.instantiateStreaming(fetch('device.wasm'),{wasi_snapshot_preview1:wasi}),
-      fetch('font_noto_sans_common_20_4.bin').then(r=>r.ok?r.arrayBuffer():null),
-    ]);
-    const e=instance.exports;
-    e._initialize&&e._initialize();
-    if(font){
-      const p=e.sim_font_buffer(font.byteLength);
-      new Uint8Array(e.memory.buffer,p,font.byteLength).set(new Uint8Array(font));
+  const W=480,H=320,FONT='font_noto_sans_common_20_4.bin',RATE=16000;
+  const STAGES=['开机','配网模式','连接 Wi-Fi','启动协议','联网就绪'];
+  const NETS=['off','ap','sta'];
+  const $=id=>document.getElementById(id);
+  const sleep=ms=>new Promise(r=>setTimeout(r,ms));
+  const cv=$('lcd'),ctx=cv.getContext('2d'),img=ctx.createImageData(W,H),px=new Uint32Array(img.data.buffer);
+  const logEl=$('log'),stats=$('stats'),enc=new TextEncoder(),dec=new TextDecoder();
+  const wasi=new Proxy({},{get:()=>()=>0});  // 界面代码不用文件和时钟，WASI 给空实现即可
+
+  let mod=null,font=null,e=null,cfg=null,t0=0,seq=0,lastNet=-1,lastStage=-1,apiOk=false,homeSsid='';
+  let env={router:true,internet:true,api:'real'};
+  const now=()=>Math.round(performance.now()-t0);
+
+  // ---------- 串口日志 ----------
+  const log=(text,cls)=>{
+    for(const line of text.split('\n')){
+      if(!line)continue;
+      const span=document.createElement('span');
+      span.className=cls||line[0];
+      span.textContent=line+'\n';
+      logEl.appendChild(span);
     }
-    const t0=performance.now();
-    e.sim_init(0);
+    while(logEl.childNodes.length>500)logEl.firstChild.remove();
+    logEl.scrollTop=logEl.scrollHeight;
+  };
 
-    const cv=document.getElementById('lcd'),ctx=cv.getContext('2d');
-    const W=480,H=320,img=ctx.createImageData(W,H),px=new Uint32Array(img.data.buffer);
+  // ---------- 往设备代码里传文字 ----------
+  const setStr=s=>{
+    const max=e.sim_str_size()-1;
+    let bytes=enc.encode(s||'');
+    if(bytes.length>max){let n=max;while(n>0&&(bytes[n]&0xc0)===0x80)n--;bytes=bytes.slice(0,n)}  // 别切在半个汉字上
+    const mem=new Uint8Array(e.memory.buffer,e.sim_str_buf(),bytes.length+1);
+    mem.set(bytes);mem[bytes.length]=0;
+  };
+  const setText=(id,s)=>{setStr(s);e.sim_set_text(id)};
 
-    // 鼠标 / 触屏 → 设备坐标
-    const point=(ev,down)=>{
-      const r=cv.getBoundingClientRect();
-      const x=Math.round((ev.clientX-r.left)/r.width*W),y=Math.round((ev.clientY-r.top)/r.height*H);
-      e.sim_pointer(Math.max(0,Math.min(W-1,x)),Math.max(0,Math.min(H-1,y)),down);
+  // ---------- 手机 ----------
+  let view='';
+  const phoneWifi=t=>$('phoneWifi').textContent='Wi-Fi：'+t;
+  const homeLabel=()=>(homeSsid||'家里的网络')+(env.router?'':'（路由器断开）');
+  const urlOf=v=>v==='ap'?cfg.ap_url:cfg.settings_url;
+  const show=v=>{
+    view=v;
+    const u=urlOf(v);
+    $('addr').textContent=u.shown.replace(/^https?:\/\//,'');
+    $('page').src=u.real+(u.real.includes('?')?'&':'?')+'_='+Date.now();
+    $('page').hidden=false;$('empty').hidden=true;
+    $('open').href=u.real;
+  };
+  $('tabAp').onclick=()=>show('ap');
+  $('tabSettings').onclick=()=>show('settings');
+  setInterval(()=>{$('clock').textContent=new Date().toTimeString().slice(0,5)},1000);
+
+  // 设备网络变化：先告诉 serve.py（决定哪个网页能打开），再让手机跟着动
+  const onNet=async n=>{
+    await fetch('/sim/net',{method:'POST',body:JSON.stringify({mode:NETS[n]})});
+    if(n===1){
+      phoneWifi(cfg.ap_ssid+'（设备热点）');
+      setTimeout(()=>{if(lastNet===1)show('ap')},800);  // 手机连上热点后弹出认证页
+    }else if(n===2){
+      phoneWifi(homeLabel());
+      if(view!=='settings')setTimeout(()=>{if(lastNet===2)show('settings')},1500);
+    }else{
+      phoneWifi(view==='ap'?homeLabel():homeLabel());  // 热点关了 / 路由器掉了
+    }
+  };
+
+  // ---------- 网络环境 ----------
+  const paintEnv=()=>{
+    for(const seg of document.querySelectorAll('.seg')){
+      const k=seg.dataset.key,v=String(k==='api'?env[k]:env[k]?1:0);
+      for(const b of seg.children){b.classList.toggle('on',b.dataset.v===v);b.classList.toggle('bad','bad' in b.dataset)}
+    }
+  };
+  for(const seg of document.querySelectorAll('.seg')){
+    seg.onclick=async ev=>{
+      const b=ev.target.closest('button');if(!b)return;
+      const k=seg.dataset.key,v=k==='api'?b.dataset.v:b.dataset.v==='1';
+      env=await (await fetch('/sim/env',{method:'POST',body:JSON.stringify({[k]:v})})).json();
+      paintEnv();
+      if(k==='router'&&e){e.sim_router(env.router?1:0);phoneWifi(lastNet===1?cfg.ap_ssid+'（设备热点）':homeLabel())}
+      log(`--- 网络环境：路由器${env.router?'在线':'断开'}，外网${env.internet?'通':'不通'}，API ${env.api==='real'?'真实调用':'模拟回答'} ---`,'S');
     };
-    let down=false;
-    cv.addEventListener('pointerdown',ev=>{down=true;cv.setPointerCapture(ev.pointerId);point(ev,1)});
-    cv.addEventListener('pointermove',ev=>point(ev,down?1:0));
-    // 浏览器有时不给 pointerup（拖出窗口、被当成手势取消等），一律当作松手，否则页面会停在半路
-    const release=ev=>{if(!down)return;down=false;point(ev,0)};
-    cv.addEventListener('pointerup',release);
-    cv.addEventListener('pointercancel',release);
-    cv.addEventListener('lostpointercapture',release);
-    cv.addEventListener('contextmenu',ev=>ev.preventDefault());
-    // BOOT 键：按下 / 松开分开传，支持按住说话
-    const boot=document.getElementById('boot');
-    boot.addEventListener('pointerdown',()=>e.sim_boot_down());
-    boot.addEventListener('pointerup',()=>e.sim_boot_up());
-    boot.addEventListener('pointerleave',()=>e.sim_boot_up());
-    addEventListener('keydown',ev=>{
-      if(ev.code==='Space'){ev.preventDefault();if(!ev.repeat)e.sim_boot_down()}
-      if(ev.code==='KeyZ')e.sim_force_sleep();  // 不用干等调暗时间
-    });
-    addEventListener('keyup',ev=>{if(ev.code==='Space')e.sim_boot_up()});
+  }
 
-    let frames=0,area=0;
-    const loop=()=>{
-      area+=e.sim_frame(Math.round(performance.now()-t0))/(W*H);frames++;
-      const x0=e.sim_dirty_x0(),y0=e.sim_dirty_y0(),x1=e.sim_dirty_x1(),y1=e.sim_dirty_y1();
-      if(x1>x0&&y1>y0){
-        const lcd=new Uint16Array(e.memory.buffer,e.sim_lcd(),W*H);
-        for(let y=y0;y<y1;y++)for(let x=x0;x<x1;x++){
-          const c=lcd[y*W+x];
-          px[y*W+x]=0xff000000|((c&31)<<19)|((((c>>5)&63)<<2)<<8)|((c>>11)<<3);
-        }
-        ctx.putImageData(img,0,0,x0,y0,x1-x0,y1-y0);
-        e.sim_clear_dirty();
+  // ---------- 录音（和设备一样：16k 单声道，交给 serve.py 时打成 WAV） ----------
+  let mic=null,rec=null,recStarted=0,recFinished=0,pendingTyped='',playing=null;
+  const setMic=t=>$('mic').textContent='麦克风：'+t;
+  const onAudio=buf=>{
+    if(!rec||rec.done||rec.typed||rec.mock)return;
+    rec.chunks.push(Float32Array.from(buf));rec.total+=buf.length;
+    if(rec.auto){  // 自动模式：设备端 VAD 听到说完（静音 0.9 秒）就结束
+      let s=0;for(const v of buf)s+=v*v;
+      if(Math.sqrt(s/buf.length)>0.02){rec.heard=true;rec.silence=0}else if(rec.heard)rec.silence+=buf.length*1000/RATE;
+      if(rec.heard&&rec.silence>=900&&e)e.sim_vad_end();
+    }
+    if(rec.total>=RATE*15&&e)e.sim_vad_end();  // kMaxRecordMs
+  };
+  const startRec=async()=>{
+    const r=rec={id:e.sim_turn_id(),chunks:[],total:0,heard:false,silence:0,auto:e.sim_talk_key()!==0,typed:pendingTyped};
+    pendingTyped='';
+    if(r.typed)return;
+    if(env.api==='mock'){  // 模拟回答不需要真的录音；自动模式假装 2.5 秒后说完
+      r.mock=true;
+      if(r.auto)r.timer=setTimeout(()=>{if(rec===r&&e)e.sim_vad_end()},2500);
+      return;
+    }
+    try{
+      if(!mic){
+        const stream=await navigator.mediaDevices.getUserMedia({audio:{channelCount:1,echoCancellation:true,noiseSuppression:true}});
+        const actx=new AudioContext({sampleRate:RATE});
+        const node=actx.createScriptProcessor(2048,1,1);
+        actx.createMediaStreamSource(stream).connect(node);node.connect(actx.destination);
+        node.onaudioprocess=ev=>onAudio(ev.inputBuffer.getChannelData(0));
+        mic={actx,stream};
       }
-      cv.style.filter=`brightness(${Math.max(e.sim_brightness(),0)/100})`;  // 背光，息屏时为 0
-      if(frames%30===0){
-        stats.textContent=`音量 ${e.sim_volume()}　亮度 ${e.sim_brightness()}　平均每帧刷新 ${(area/frames*100).toFixed(1)}% 屏幕`;
+      await mic.actx.resume();
+      if(rec===r)setMic('录音中…');
+    }catch(err){
+      setMic('不可用（'+err.name+'），用输入框打字');
+      log(`W (${now()}) sim: 拿不到麦克风：${err.message}。可以在输入框里打字代替说话`);
+    }
+  };
+  const makeWav=chunks=>{
+    const n=chunks.reduce((a,c)=>a+c.length,0),buf=new ArrayBuffer(44+n*2),v=new DataView(buf);
+    const str=(o,s)=>{for(let i=0;i<s.length;i++)v.setUint8(o+i,s.charCodeAt(i))};
+    str(0,'RIFF');v.setUint32(4,36+n*2,true);str(8,'WAVEfmt ');v.setUint32(16,16,true);v.setUint16(20,1,true);
+    v.setUint16(22,1,true);v.setUint32(24,RATE,true);v.setUint32(28,RATE*2,true);v.setUint16(32,2,true);
+    v.setUint16(34,16,true);str(36,'data');v.setUint32(40,n*2,true);
+    let o=44;for(const c of chunks)for(const s of c){v.setInt16(o,Math.max(-1,Math.min(1,s))*32767,true);o+=2}
+    return buf;
+  };
+  const play=(blob,alive)=>new Promise(done=>{
+    const a=new Audio(URL.createObjectURL(blob));
+    a.volume=Math.min(1,Math.max(0,e.sim_volume()/100));
+    playing=a;
+    const iv=setInterval(()=>{if(!alive()){a.pause();finish()}},100);
+    const finish=()=>{clearInterval(iv);if(playing===a)playing=null;done()};
+    a.onended=finish;a.onerror=finish;
+    a.play().catch(finish);
+  });
+  const speakOne=text=>fetch('/sim/speak',{method:'POST',body:JSON.stringify({text})}).then(async r=>{
+    if(r.status===204)return{mock:true};
+    if((r.headers.get('Content-Type')||'').includes('json'))return r.json();
+    return{blob:await r.blob(),log:JSON.parse(decodeURIComponent(r.headers.get('X-Sim-Log')||'%5B%5D'))};
+  }).catch(()=>({error:'语音合成连接失败'}));
+
+  // 一轮对话：RunTurn 的识别 / 大模型由 serve.py 做，这里把结果按 stt → llm → tts 的顺序交给设备
+  const sendTurn=async()=>{
+    const r=rec;rec=null;
+    if(!r)return;
+    r.done=true;clearTimeout(r.timer);
+    if(mic)setMic('待命');
+    const x=e,id=x.sim_turn_id();
+    if(id!==r.id)return;  // 这一轮已经被关掉 / 打断
+    const alive=()=>e===x&&x.sim_turn_id()===id;
+    x.sim_turn_thinking();
+    const device={volume:x.sim_volume(),brightness:x.sim_brightness(),mode:x.sim_mode()};
+    const res=await fetch('/sim/turn',{method:'POST',body:makeWav(r.chunks),headers:{
+      'Content-Type':'audio/wav','X-Sim-Typed':encodeURIComponent(r.typed||''),'X-Sim-Device':encodeURIComponent(JSON.stringify(device))}})
+      .then(r=>r.json()).catch(err=>({error:'语音识别连接失败',log:['E 模拟器连不上 serve.py：'+err]}));
+    if(!alive())return;
+    for(const l of res.log||[])log(`${l[0]} (${now()}) DirectApi: ${l.slice(2)}`);
+    for(const a of res.actions||[]){if(a.type==='face')playFace(a.script);else x.sim_apply(a.type==='volume'?0:1,a.value)}
+    if(res.error){setStr(res.error);x.sim_turn_error();return}
+    if(!res.stt){x.sim_turn_empty();return}
+    setStr(res.stt);x.sim_turn_stt();
+    setStr(res.emotion);x.sim_turn_emotion();
+    if(res.face)playFace(res.face);
+    x.sim_tts_start();
+    let next=res.sentences.length?speakOne(res.sentences[0]):null;
+    for(let i=0;i<res.sentences.length;i++){
+      setStr(res.sentences[i]);x.sim_tts_sentence();
+      const a=await next;
+      if(!alive())return;
+      next=i+1<res.sentences.length?speakOne(res.sentences[i+1]):null;
+      for(const l of a.log||[])log(`${l[0]} (${now()}) DirectApi: ${l.slice(2)}`);
+      if(a.error){setStr(a.error);x.sim_turn_error();return}
+      if(a.mock)await sleep(Math.max(1500,res.sentences[i].length*180));
+      else await play(a.blob,alive);
+      if(!alive())return;
+    }
+    x.sim_tts_stop();
+  };
+
+  // 输入框：当作对设备说了这句话（按一下 BOOT，"说完"就松开）
+  $('typed').addEventListener('keydown',async ev=>{
+    if(ev.key!=='Enter'||!e)return;
+    const text=ev.target.value.trim();
+    if(!text)return;
+    ev.target.value='';
+    if(e.sim_stage()!==4){log(`W (${now()}) sim: 设备还没联网就绪，先完成配网`);return}
+    if(rec&&e.sim_recording()){rec.typed=text;e.sim_vad_end();return}  // 自动模式正在听
+    pendingTyped=text;
+    e.sim_boot_down();
+    for(let i=0;i<40&&e&&!e.sim_recording();i++)await sleep(50);
+    if(!e||!e.sim_recording()){pendingTyped='';return}  // 比如 API 没配好，已经报错
+    if(e.sim_talk_key()===0)e.sim_boot_up();else e.sim_vad_end();
+  });
+
+  // ---------- 开机 ----------
+  const boot=async why=>{
+    e=null;rec=null;recStarted=0;recFinished=0;pendingTyped='';
+    if(playing){playing.pause();playing=null}
+    cfg=await (await fetch('/sim/boot')).json();
+    env=cfg.env;paintEnv();
+    if(!mod){
+      [mod,font]=await Promise.all([
+        WebAssembly.compileStreaming(fetch('device.wasm')),
+        fetch(FONT).then(r=>r.ok?r.arrayBuffer():null),
+      ]);
+    }
+    const inst=await WebAssembly.instantiate(mod,{wasi_snapshot_preview1:wasi});
+    const x=inst.exports;
+    x._initialize&&x._initialize();
+    if(font){
+      const p=x.sim_font_buffer(font.byteLength);
+      new Uint8Array(x.memory.buffer,p,font.byteLength).set(new Uint8Array(font));
+    }
+    e=x;
+    homeSsid=cfg.wifi_ssid||homeSsid;
+    apiOk=cfg.api_ok;
+    setText(0,cfg.wifi_ssid);setText(1,cfg.settings_url.shown);setText(2,cfg.device_ip);
+    setText(3,cfg.ap_url.shown);setText(4,cfg.ap_ssid);setText(5,cfg.voices.join(String.fromCharCode(10)));
+    seq=(await (await fetch('/sim/events?since=0')).json()).seq;  // 开机前的旧事件不再处理
+    lastNet=-1;lastStage=-1;
+    log(`--- ${why}：${cfg.wifi_ssid?'存过 Wi-Fi「'+cfg.wifi_ssid+'」':'没存 Wi-Fi'}，API ${cfg.api_ok?'已配好':'未配置'} ---`,'S');
+    t0=performance.now();
+    e.sim_init(0,cfg.wifi_ssid?1:0,cfg.api_ok?1:0,env.router?1:0);
+  };
+
+  // 配网页、设置页上发生的事交给设备代码
+  let polling=false;
+  setInterval(async()=>{
+    if(!e||polling)return;
+    polling=true;
+    try{
+      const r=await (await fetch('/sim/events?since='+seq)).json();
+      for(const ev of r.events){
+        if(!e)break;
+        if(ev.type==='wifi_saved'){homeSsid=ev.ssid;setText(0,ev.ssid);e.sim_wifi_saved()}
+        else if(ev.type==='ap_exit')e.sim_ap_exit();
+        else if(ev.type==='settings_saved'){apiOk=ev.api_ok;setText(5,(ev.voices||[]).join(String.fromCharCode(10)));e.sim_settings_saved(ev.api_ok?1:0)}
       }
-      requestAnimationFrame(loop);
-    };
+      seq=r.seq;
+    }catch{}finally{polling=false}
+  },400);
+
+  // ---------- 表情脚本试播 ----------
+  const FACE_EXAMPLES={
+    '惊喜':[{eyes:'ring',brow:'up',look:[0,-0.3],dur:0.8},{eyes:'arc',hands:'up',motion:'bounce',prop:{icon:'star',anim:'pop',at:'top'},dur:2.2}],
+    '唱歌':[{eyes:'arc',hands:'mic',motion:'sway',prop:{icon:'music',anim:'float',at:'left'},dur:3}],
+    '害羞':[{eyes:'arc',blush:1,look:[0.6,0.4],tilt:0.3,hands:'cheeks',dur:2.5}],
+    '尴尬':[{eyes:'dash',sweat:true,look:[-0.7,0],dur:2.5}],
+    '晕了':[{eyes:'spiral',motion:'sway',prop:{icon:'star',anim:'orbit',at:'top'},dur:3}],
+    '墨镜':[{eyes:'shades',motion:'nod',dur:2.5}],
+    '喝咖啡':[{eyes:'arc',prop:{icon:'cup',anim:'bob'},dur:3}],
+    '爱你':[{eyes:'heart',blush:0.8,motion:'bounce',prop:{icon:'heart',anim:'orbit',at:'top'},dur:2.5}],
+    '亮晶晶':[{eyes:'star',hands:'cheeks',prop:{icon:'sparkle',anim:'pop',at:'right'},dur:2.5}],
+    '生气':[{brow:'down',motion:'shake',prop:{icon:'lightning',anim:'pop',at:'top'},dur:2}],
+    '躲猫猫':[{hands:'cover',dur:1.2},{eyes:'ring',hands:'none',brow:'up',dur:1}],
+    '思考':[{eyes:'dot',look:[-0.6,-0.7],hands:'chin',prop:{icon:'question',anim:'bob',at:'top'},dur:2.5}],
+    '自画雨伞':[{look:[0,-0.8],prop:{strokes:[[10,50,20,30,40,18,60,18,80,30,90,50,10,50],[50,50,50,84,42,90,36,84]],anim:'swing'},dur:3}],
+  };
+  const readStr=()=>{const m=new Uint8Array(e.memory.buffer,e.sim_str_buf(),e.sim_str_size());return dec.decode(m.subarray(0,m.indexOf(0)))};
+  const playFace=json=>{
+    if(!e)return false;
+    setStr(json);
+    const ok=e.sim_face_play();
+    $('faceMsg').textContent=ok?'':'不合格：'+readStr();
+    return ok;
+  };
+  for(const [name,script] of Object.entries(FACE_EXAMPLES)){
+    const b=document.createElement('button');
+    b.textContent=name;
+    b.onclick=()=>{$('faceJson').value=JSON.stringify(script);playFace($('faceJson').value)};
+    $('examples').appendChild(b);
+  }
+  $('faceJson').value=JSON.stringify(FACE_EXAMPLES['惊喜']);
+  $('facePlay').onclick=()=>playFace($('faceJson').value);
+
+  // ---------- 输入 ----------
+  const point=(ev,down)=>{
+    if(!e)return;
+    const r=cv.getBoundingClientRect();
+    const x=Math.round((ev.clientX-r.left)/r.width*W),y=Math.round((ev.clientY-r.top)/r.height*H);
+    e.sim_pointer(Math.max(0,Math.min(W-1,x)),Math.max(0,Math.min(H-1,y)),down);
+  };
+  let down=false;
+  cv.addEventListener('pointerdown',ev=>{down=true;cv.setPointerCapture(ev.pointerId);point(ev,1)});
+  cv.addEventListener('pointermove',ev=>point(ev,down?1:0));
+  // 浏览器有时不给 pointerup（拖出窗口、被当成手势取消等），一律当作松手，否则页面会停在半路
+  const release=ev=>{if(!down)return;down=false;point(ev,0)};
+  cv.addEventListener('pointerup',release);
+  cv.addEventListener('pointercancel',release);
+  cv.addEventListener('lostpointercapture',release);
+  cv.addEventListener('contextmenu',ev=>ev.preventDefault());
+  const bootBtn=$('boot');
+  let bootDown=false;
+  bootBtn.addEventListener('pointerdown',()=>{if(e){bootDown=true;e.sim_boot_down()}});
+  const bootUp=()=>{if(e&&bootDown){bootDown=false;e.sim_boot_up()}};
+  bootBtn.addEventListener('pointerup',bootUp);
+  bootBtn.addEventListener('pointerleave',bootUp);
+  addEventListener('keydown',ev=>{
+    if(!e||ev.target.closest('input,textarea'))return;
+    if(ev.code==='Space'){ev.preventDefault();if(!ev.repeat)e.sim_boot_down()}
+    if(ev.code==='KeyZ')e.sim_force_sleep();  // 不用干等休眠时间
+  });
+  addEventListener('keyup',ev=>{if(ev.code==='Space'&&e&&!ev.target.closest('input,textarea'))e.sim_boot_up()});
+
+  $('reboot').onclick=()=>boot('断电重启');
+  $('forget').onclick=async()=>{await fetch('/sim/reset?what=wifi',{method:'POST'});boot('清除 Wi-Fi 后开机')};
+  $('reset').onclick=async()=>{await fetch('/sim/reset?what=all',{method:'POST'});boot('恢复出厂后开机')};
+
+  // ---------- 每帧 ----------
+  let frames=0,area=0;
+  const loop=()=>{
+    requestAnimationFrame(loop);
+    if(!e)return;
+    area+=e.sim_frame(now())/(W*H);frames++;
+    const x0=e.sim_dirty_x0(),y0=e.sim_dirty_y0(),x1=e.sim_dirty_x1(),y1=e.sim_dirty_y1();
+    if(x1>x0&&y1>y0){
+      const lcd=new Uint16Array(e.memory.buffer,e.sim_lcd(),W*H);
+      for(let y=y0;y<y1;y++)for(let x=x0;x<x1;x++){
+        const c=lcd[y*W+x];
+        px[y*W+x]=0xff000000|((c&31)<<19)|((((c>>5)&63)<<2)<<8)|((c>>11)<<3);
+      }
+      ctx.putImageData(img,0,0,x0,y0,x1-x0,y1-y0);
+      e.sim_clear_dirty();
+    }
+    cv.style.filter=`brightness(${Math.max(e.sim_brightness(),0)/100})`;  // 背光，息屏时为 0
+    const n=e.sim_log_len();
+    if(n){log(dec.decode(new Uint8Array(e.memory.buffer,e.sim_log_buf(),n)));e.sim_log_clear()}
+    const net=e.sim_net();
+    if(net!==lastNet){lastNet=net;onNet(net)}
+    const st=e.sim_stage();
+    if(st!==lastStage){lastStage=st;$('stage').textContent=STAGES[st]||st}
+    $('api').textContent=apiOk?'已配好':'未配置';
+    const started=e.sim_rec_started(),finished=e.sim_rec_finished();  // 先开始再结束，顺序不能反
+    if(started!==recStarted){recStarted=started;startRec()}
+    if(finished!==recFinished){recFinished=finished;sendTurn()}
+    const req=e.sim_request();
+    if(req===1){  // 设置里点了恢复出厂
+      fetch('/sim/reset?what=all',{method:'POST'}).then(()=>boot('恢复出厂后重启'));
+      return;
+    }
+    if(req===2){  // 测试 API：serve.py 照 SelfTest 代测
+      const x=e;
+      fetch('/sim/selftest',{method:'POST'}).then(r=>r.json()).then(r=>{if(e===x){setStr(r.text);x.sim_notify(8000)}});
+    }
+    if(frames%30===0){
+      stats.textContent=`音量 ${e.sim_volume()} · 亮度 ${e.sim_brightness()} · 每帧刷新 ${(area/frames*100).toFixed(1)}%`;
+    }
+  };
+
+  try{
+    await boot('上电');
     loop();
   }catch(err){
-    stats.textContent='加载失败：'+err+'。需要先运行 python build.py，再用 python -m http.server 打开。';
+    stats.textContent='加载失败：'+err+'。需要先运行 python build.py，再运行 python serve.py 打开。';
   }
 })();
 </script>

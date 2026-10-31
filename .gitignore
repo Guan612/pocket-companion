@@ -5,3 +5,5 @@ tools/device-sim/device.wasm
 tools/device-sim/font_*.bin
 tools/device-sim/third_party/
 tools/device-sim/lv_conf_device.h
+# 整机模拟的设备存储（含 API Key）
+tools/device-sim/.sim-nvs.json
