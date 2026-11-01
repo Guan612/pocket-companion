@@ -29,6 +29,8 @@ p,.hint{color:var(--muted);margin:4px 0;overflow-wrap:anywhere}
 .tag.ok{color:var(--ok)}.tag.err{color:var(--err)}
 label{display:block;margin:10px 0 0;color:var(--muted);font-size:14px}
 input,select,textarea{display:block;width:100%;margin-top:4px;padding:8px;border-radius:8px;border:1px solid var(--line);background:#14161c;color:var(--fg);font:inherit}
+label.speak{display:flex;align-items:center;gap:8px;cursor:pointer}
+label.speak input{width:auto;margin:0;accent-color:var(--accent)}
 button{font:inherit;color:var(--fg);background:#2b3142;border:1px solid var(--line);border-radius:8px;padding:7px 12px;cursor:pointer}
 button.primary{background:var(--accent);color:#0b1220;border:0;font-weight:600}
 button.danger{color:var(--err)}
@@ -75,6 +77,7 @@ button:disabled{opacity:.5}
   <p class="hint">合成要能返回 opus。按官方文档，目前支持的只有硅基流动和 OpenAI。</p>
   <label>音色<input id="tts_voice" list="voices" placeholder="alloy"></label>
   <datalist id="voices"></datalist>
+  <label class="speak"><input type="checkbox" id="tts_speak" checked>语音播报（不勾就只显示文字、不调用合成）</label>
   <p class="err" id="missing" hidden></p>
 </div>
 
@@ -316,7 +319,7 @@ $('#save').onclick = async () => {
   const voices = (ttsProvider && (presetOf(ttsProvider) || {}).voices) || (voice ? [voice] : []);
   const body = {
     providers: cfg.providers.map(p => ({id: p.id, name: p.name, preset: p.preset, url: p.url, models: p.models, key: p.key || ''})),
-    roles: {...cfg.roles, asr: {...cfg.roles.asr, lang: $('#asr_lang').value.trim()}, tts: {...cfg.roles.tts, voice, voices}},
+    roles: {...cfg.roles, asr: {...cfg.roles.asr, lang: $('#asr_lang').value.trim()}, tts: {...cfg.roles.tts, voice, voices, speak: $('#tts_speak').checked}},
     prompt: $('#prompt').value, memory_md: $('#memory').value,
   };
   $('#save').disabled = true; msg('保存中…');
@@ -336,6 +339,7 @@ async function load() {
   for (const r of ['chat', 'vision', 'asr', 'tts']) cfg.roles[r] = cfg.roles[r] || {p: '', m: ''};
   $('#asr_lang').value = c.roles.asr.lang || '';
   $('#tts_voice').value = c.roles.tts.voice || '';
+  $('#tts_speak').checked = c.roles.tts.speak !== false;
   $('#prompt').value = c.prompt || '';
   $('#memory').value = c.memory_md || '';
   memSize();

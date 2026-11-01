@@ -101,7 +101,9 @@ esp_err_t HandleConfig(httpd_req_t* req) {
         cJSON_AddStringToObject(role, "m", s.GetString(r.model_key).c_str());
     }
     cJSON_AddStringToObject(cJSON_GetObjectItem(roles, "asr"), "lang", s.GetString(kAsrLang).c_str());
-    cJSON_AddStringToObject(cJSON_GetObjectItem(roles, "tts"), "voice", s.GetString(kTtsVoice).c_str());
+    cJSON* tts_role = cJSON_GetObjectItem(roles, "tts");
+    cJSON_AddStringToObject(tts_role, "voice", s.GetString(kTtsVoice).c_str());
+    cJSON_AddBoolToObject(tts_role, "speak", s.GetString(kTtsSpeak) != "0");
     cJSON_AddStringToObject(root, "prompt", s.GetString(kPrompt).c_str());
     cJSON_AddStringToObject(root, "memory_md", LongTermMemory::Get().c_str());
     cJSON* limits = cJSON_AddObjectToObject(root, "limits");
@@ -191,6 +193,9 @@ esp_err_t HandleSave(httpd_req_t* req) {
         voices += v->valuestring;
     }
     s.SetString(kTtsVoices, voices);
+    // 语音播报开关；不带这个字段的旧页面提交时不改它，免得被误关
+    cJSON* speak = cJSON_GetObjectItem(cJSON_GetObjectItem(roles, "tts"), "speak");
+    if (cJSON_IsBool(speak)) s.SetString(kTtsSpeak, cJSON_IsTrue(speak) ? "1" : "0");
     s.SetString(kPrompt, JsonString(root, "prompt"));
     LongTermMemory::Set(memory);
     ESP_LOGI(TAG, "Settings saved (%u providers)", (unsigned)list.size());

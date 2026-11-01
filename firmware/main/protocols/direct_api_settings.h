@@ -5,7 +5,7 @@
 //   prov_<编号>      {"name","preset","url","models":[…]}，一个供应商一条，避开 NVS 单条 4000 字节的上限
 //   pkey_<编号>      这个供应商的 Key，单独存，永远不回传给网页
 //   chat_p / chat_m  对话用哪个供应商的哪个模型；vis_*（视觉，空着就用对话模型）、asr_*、tts_* 同理
-//   asr_lang、tts_voice、tts_voices（这家的音色列表，屏幕上选音色用）、prompt、memory（长期记忆，见 long_term_memory.h）
+//   asr_lang、tts_voice、tts_voices（这家的音色列表，屏幕上选音色用）、tts_speak（语音播报开关，"0" 才是关）、prompt、memory（长期记忆，见 long_term_memory.h）
 // 网页设置页（direct_api_config_server.cc）负责写，DirectApiConfig::Load 负责读。
 #pragma once
 
@@ -24,6 +24,7 @@ constexpr const char* kProviderList = "prov_list";
 constexpr const char* kAsrLang = "asr_lang";
 constexpr const char* kTtsVoice = "tts_voice";
 constexpr const char* kTtsVoices = "tts_voices";  // 合成供应商的音色列表（一行一个），给屏幕上的音色选择用
+constexpr const char* kTtsSpeak = "tts_speak";    // 语音播报开关，"0" 关；没存过按开算
 constexpr const char* kPrompt = "prompt";
 
 struct Provider {

@@ -278,6 +278,13 @@ button{font:inherit;color:var(--fg)}
     setStr(res.emotion);x.sim_turn_emotion();
     if(res.face)playFace(res.face);
     x.sim_tts_start();
+    if(res.speak===false){  // 语音播报关了：只出字幕，按阅读速度停一会儿，不调合成
+      for(const s of res.sentences){
+        setStr(s);x.sim_tts_sentence();
+        await sleep(Math.min(4000,400+s.length*60));
+        if(!alive())return;
+      }
+    }else{
     let next=res.sentences.length?speakOne(res.sentences[0]):null;
     for(let i=0;i<res.sentences.length;i++){
       setStr(res.sentences[i]);x.sim_tts_sentence();
@@ -289,6 +296,7 @@ button{font:inherit;color:var(--fg)}
       if(a.mock)await sleep(Math.max(1500,res.sentences[i].length*180));
       else await play(a.blob,alive);
       if(!alive())return;
+    }
     }
     x.sim_tts_stop();
   };

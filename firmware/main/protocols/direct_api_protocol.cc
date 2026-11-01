@@ -240,6 +240,7 @@ DirectApiConfig DirectApiConfig::Load() {
     c.tts_voice = s.GetString(kTtsVoice);
     c.asr_language = s.GetString(kAsrLang);
     c.system_prompt = s.GetString(kPrompt);
+    c.tts_speak = s.GetString(kTtsSpeak) != "0";  // 没存过就是开
     if (c.tts_voice.empty()) c.tts_voice = "alloy";
     if (c.asr_language.empty()) c.asr_language = "zh";
     if (c.system_prompt.empty()) c.system_prompt = kDefaultPrompt;
@@ -278,6 +279,20 @@ bool DirectApiProtocol::Start() {
                 return std::unexpected("长期记忆已满，请提示主人到网页设置页整理");
             }
             return std::string("已记住");
+        });
+
+    McpServer::GetInstance().AddTool(
+        "self.voice.set_speak",
+        "打开或关闭语音播报。关闭后回复只显示在屏幕上（字幕和聊天记录），不再播放语音、也不调"
+        "用语音合成接口；主人说\"别念了\"\"不用语音回复\"\"只用文字\"之类时关掉，说\"恢复播报\"时打"
+        "开。enabled 为 true 打开、false 关闭，设置后从这句回复立即生效。",
+        PropertyList({Property("enabled", kPropertyTypeBoolean)}),
+        [](const PropertyList& properties) -> ToolResult {
+            bool enabled = properties["enabled"].value<bool>();
+            Settings(DirectApiSettings::kNs, true).SetString(DirectApiSettings::kTtsSpeak,
+                                                             enabled ? "1" : "0");
+            return enabled ? std::string("语音播报已打开")
+                           : std::string("语音播报已关闭，这句起回复只用文字显示");
         });
 
     // TLS 握手和 JSON 解析比较吃栈
@@ -451,6 +466,7 @@ void DirectApiProtocol::RunTurn(std::vector<std::vector<uint8_t>> packets) {
 
     std::string reply = Chat(cfg, text);
     if (cancel_) return;
+    cfg = DirectApiConfig::Load();  // 工具可能刚改了播报开关，这句回复就要用上新状态
     if (reply.empty() && pending_face_.empty()) {  // 只做了表情、没说话也算正常
         SetError("大模型没有返回内容");
         return;
@@ -468,14 +484,27 @@ void DirectApiProtocol::RunTurn(std::vector<std::vector<uint8_t>> packets) {
     for (int i = 0; i < 50 && app.GetDeviceState() != kDeviceStateSpeaking && !cancel_; i++) {
         vTaskDelay(pdMS_TO_TICKS(20));
     }
-    for (const auto& sentence : SplitSentences(body)) {
-        if (cancel_) break;
-        EmitJson("tts", "state", "sentence_start", "text", sentence.c_str());
-        if (!Speak(cfg, sentence)) break;
-    }
-    // 等本轮语音播完再结束，否则自动模式会边放边开始录音
-    while (!cancel_ && !app.GetAudioService().IsPlaybackIdle()) {
-        vTaskDelay(pdMS_TO_TICKS(50));
+    if (cfg.tts_speak) {
+        for (const auto& sentence : SplitSentences(body)) {
+            if (cancel_) break;
+            EmitJson("tts", "state", "sentence_start", "text", sentence.c_str());
+            if (!Speak(cfg, sentence)) break;
+        }
+        // 等本轮语音播完再结束，否则自动模式会边放边开始录音
+        while (!cancel_ && !app.GetAudioService().IsPlaybackIdle()) {
+            vTaskDelay(pdMS_TO_TICKS(50));
+        }
+    } else {
+        // 关了播报就只出字幕不调合成；按阅读速度给每句留一点显示时间
+        for (const auto& sentence : SplitSentences(body)) {
+            if (cancel_) break;
+            EmitJson("tts", "state", "sentence_start", "text", sentence.c_str());
+            int read_ms = 400 + sentence.size() * 60;  // UTF-8 中文 3 字节/字 ≈ 180ms/字
+            if (read_ms > 4000) read_ms = 4000;
+            for (int waited = 0; !cancel_ && waited < read_ms; waited += 100) {
+                vTaskDelay(pdMS_TO_TICKS(100));
+            }
+        }
     }
     EmitJson("tts", "state", "stop");
 }

@@ -54,7 +54,7 @@ MEMORY_MAX_BYTES = 2000  # LongTermMemory::kMaxBytes
 
 def empty_settings():
     return {"providers": [], "keys": {}, "roles": {r: {"p": "", "m": ""} for r in ROLES},
-            "asr_lang": "", "tts_voice": "", "tts_voices": [], "prompt": ""}
+            "asr_lang": "", "tts_voice": "", "tts_voices": [], "tts_speak": True, "prompt": ""}
 
 
 def voice_labels():
@@ -200,7 +200,8 @@ def load_cfg():
     llm, vision = resolve("chat"), resolve("vision")
     return {"llm": llm, "vision": vision if vision["url"] and vision["model"] else llm,
             "asr": resolve("asr"), "tts": resolve("tts"), "voice": c["tts_voice"] or "alloy",
-            "lang": c["asr_lang"] or "zh", "prompt": c["prompt"] or DEFAULT_PROMPT}
+            "lang": c["asr_lang"] or "zh", "prompt": c["prompt"] or DEFAULT_PROMPT,
+            "speak": bool(c.get("tts_speak", True))}
 
 
 def http_post(url, key, body, ctype):
@@ -415,7 +416,7 @@ def run_turn(wav, typed, device):
             raise TurnError("大模型没有返回内容")
         emotion, body = split_emotion(reply)
         return {"stt": text, "emotion": emotion, "face": face, "sentences": split_sentences(body),
-                "actions": actions, "log": lines}
+                "actions": actions, "log": lines, "speak": cfg["speak"]}
     except TurnError as e:
         return {"error": str(e), "actions": actions, "log": lines}
 
@@ -747,6 +748,7 @@ class StaHandler(Handler):
                 roles = json.loads(json.dumps(c["roles"]))
                 roles["asr"]["lang"] = c["asr_lang"]
                 roles["tts"]["voice"] = c["tts_voice"]
+                roles["tts"]["speak"] = bool(c.get("tts_speak", True))
                 data = {"providers": [{**p, "has_key": bool(c["keys"].get(p["id"]))} for p in c["providers"]],
                         "roles": roles, "prompt": c["prompt"], "memory_md": nvs["memory"],
                         "limits": {"providers": MAX_PROVIDERS, "models": MAX_MODELS, "memory": MEMORY_MAX_BYTES}}
@@ -812,6 +814,8 @@ class StaHandler(Handler):
             c["asr_lang"] = str((roles_in.get("asr") or {}).get("lang", ""))
             c["tts_voice"] = str((roles_in.get("tts") or {}).get("voice", ""))
             c["tts_voices"] = [v for v in (roles_in.get("tts") or {}).get("voices", []) if isinstance(v, str) and v][:20]
+            if isinstance((roles_in.get("tts") or {}).get("speak"), bool):  # 旧页面不带就不动
+                c["tts_speak"] = roles_in["tts"]["speak"]
             c["prompt"] = str(req.get("prompt", ""))
             nvs["memory"] = memory
             save_nvs()
