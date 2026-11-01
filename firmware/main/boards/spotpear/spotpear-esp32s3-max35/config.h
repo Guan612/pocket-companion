@@ -87,6 +87,7 @@
 #define CAMERA_PIN_XCLK   GPIO_NUM_41
 #define CAMERA_PIN_PWDN   GPIO_NUM_NC
 #define CAMERA_PIN_RESET  GPIO_NUM_NC
-#define CAMERA_XCLK_HZ    20000000
+// 20M 时 DVP 字节率太高，驱动乒乓搬运（半缓冲 12 行）余量不足会花屏；10M 够用且稳
+#define CAMERA_XCLK_HZ    10000000
 
 #endif  // _BOARD_CONFIG_H_

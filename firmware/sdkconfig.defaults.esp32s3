@@ -21,10 +21,12 @@ CONFIG_ESP32S3_DATA_CACHE_LINE_64B=y
 
 CONFIG_SR_WN_WN9_NIHAOXIAOZHI_TTS=y
 
-# Use an internal DMA bounce buffer so incomplete RGB frames can be rejected.
-# Limit its size to preserve internal heap for AFE and WakeNet.
+# 花屏根因：内部乒乓缓冲半区只有 6 行（7680B），EOF 事件队列深度 1，
+# VGA@XCLK20M 下 cam_task 每 0.8ms 必须搬完一段，调度一抖就 EV-EOF-OVF
+# 丢数据（横条错位）。对策：最大 DMA 缓冲 + XCLK 降到 10MHz，余量放大 4 倍。
+# （PSRAM DMA 直写模式试过：EDMA 不开 burst、优先级最低，丢字节更严重。）
 CONFIG_CAMERA_PSRAM_DMA=n
-CONFIG_CAMERA_DMA_BUFFER_SIZE_MAX=16384
+CONFIG_CAMERA_DMA_BUFFER_SIZE_MAX=32768
 
 CONFIG_ESP_SYSTEM_EVENT_TASK_STACK_SIZE=4096
 
