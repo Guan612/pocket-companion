@@ -31,14 +31,11 @@ public:
     bool PlayFace(const std::string& json, std::string& error);
     // 写进系统提示词的表情脚本说明
     static std::string FacePrompt();
-    // 视觉模式的一帧取景画面（NOMI_PREVIEW_W×NOMI_PREVIEW_H，RGB565 本机字节序）
-    void SetPreview(const uint16_t* pixels);
-    // 设置页里保存的模式、BOOT 键用法
+    // 设置页里保存的选项（BOOT 键用法、调暗 / 息屏时间）
     static int GetSavedInt(const char* key, int def);
     // 以下由板子设置
     static bool aec_supported;                          // 有没有喇叭回采（焊了 ES7210）
     static std::function<void()> on_user_activity;      // 触摸时，用来重置休眠计时
-    static std::function<void(int)> on_mode_changed;    // 左右滑切换了模式（NOMI_MODE_*）
     static std::function<void()> on_power_timing_changed;  // 设置页里改了调暗 / 息屏时间
 
     // 设置页里选的调暗 / 息屏时间（秒），-1 表示从不

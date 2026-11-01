@@ -385,12 +385,9 @@ class TurnError(Exception):
     """一轮对话失败，消息就是固件 SetError 的文字，设备会显示成「错误」提示。"""
 
 
-MOCK = {0: ("今天适合出去走走吗？",
-            '[happy]<face>[{"eyes":"arc","motion":"bounce","prop":{"icon":"sun","anim":"spin","at":"top"},"dur":2.5}]</face>'
-            "当然适合！外面阳光正好，气温也舒服。记得带瓶水，傍晚可能会起风哦。"),
-        1: ("这是什么植物？",
-            '[happy]<face>[{"eyes":"ring","brow":"up","dur":0.8},{"eyes":"arc","prop":{"icon":"leaf","anim":"swing"},"dur":2.5}]</face>'
-            "这是一盆绿萝，叶子很精神，看得出你照顾得不错。它喜欢散射光，一周浇一次水就够了。")}
+MOCK = ("今天适合出去走走吗？",
+        '[happy]<face>[{"eyes":"arc","motion":"bounce","prop":{"icon":"sun","anim":"spin","at":"top"},"dur":2.5}]</face>'
+        "当然适合！外面阳光正好，气温也舒服。记得带瓶水，傍晚可能会起风哦。")
 
 
 def run_turn(wav, typed, device):
@@ -402,7 +399,7 @@ def run_turn(wav, typed, device):
         if env["api"] == "mock":
             if net["mode"] != "sta" or not env["router"] or not env["internet"]:
                 raise TurnError("语音识别连接失败")
-            text, reply = MOCK[1 if device.get("mode") == 1 else 0]
+            text, reply = MOCK
             log("I （模拟 API）不发真实请求")
             reply, face = extract_face(reply)
         else:

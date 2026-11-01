@@ -1,4 +1,4 @@
-// Nomi 界面：两种模式（Nomi / 视觉）左右滑切换，顶部下拉打开设置。
+// Nomi 界面：两种页面（表情 / 历史对话）左右滑切换，顶部下拉打开设置。
 //
 // 说话靠 BOOT 键和唤醒词，触摸只负责切模式、开设置和叫醒。
 // 只依赖 LVGL 和 face.c，设备（NomiDisplay）和浏览器模拟器（tools/device-sim）共用同一份代码。
@@ -23,7 +23,6 @@ typedef enum {
 } nomi_state_t;
 
 // 设置项（get_int / set_int 的 key）
-#define NOMI_KEY_MODE "mode"              // 0 Nomi 模式，1 视觉模式（每次提问自动拍照给大模型）
 #define NOMI_KEY_TALK_KEY "talk_key"      // BOOT 键：0 按住说话，1 点一下开始
 #define NOMI_KEY_VOLUME "volume"          // 0..100
 #define NOMI_KEY_BRIGHTNESS "brightness"  // 10..100
@@ -35,16 +34,9 @@ typedef enum {
 #define NOMI_KEY_DIM "dim"                // NOMI_DIM_SECONDS 的下标
 #define NOMI_KEY_OFF "off"                // NOMI_OFF_SECONDS 的下标
 
-#define NOMI_MODE_CHAT 0
-#define NOMI_MODE_VISION 1
-
 // 多久后调暗 / 息屏，-1 表示从不；设置页的选项和这里一一对应
 #define NOMI_DIM_SECONDS {30, 60, 120, 300, -1}
 #define NOMI_OFF_SECONDS {120, 300, 600, 1800, -1}
-
-// 视觉模式实时取景的画面大小（RGB565，本机字节序）
-#define NOMI_PREVIEW_W 320
-#define NOMI_PREVIEW_H 240
 
 typedef struct {
     nomi_state_t (*get_state)(void);
@@ -56,6 +48,9 @@ typedef struct {
     const char *(*get_text)(const char *key);
     // 动作：test_api、reconfigure_wifi、factory_reset
     void (*action)(const char *name);
+    // 聊天历史（第二页）：下标 0 最旧；role 为 "user" / "assistant"，文本只需在下一次调用前有效
+    int (*history_count)(void);
+    const char *(*history_get)(int index, const char **role);
 } nomi_ui_callbacks_t;
 
 // face_buf：480×320 RGB565 画布缓冲，由调用方分配；font：中文字体
@@ -75,8 +70,6 @@ void nomi_ui_notify(const char *text, uint32_t duration_ms);
 void nomi_ui_set_sleep(bool sleeping);
 // 右上角电量；level < 0 表示没有电池信息，隐藏
 void nomi_ui_set_battery(int level, bool charging);
-// 视觉模式的一帧取景画面，NOMI_PREVIEW_W×NOMI_PREVIEW_H，会拷贝一份
-void nomi_ui_set_preview(const uint16_t *pixels);
 
 // 播放一段表情脚本（JSON，格式见 face_script.h）；不合格返回 false，原因写进 err
 bool nomi_ui_play_face(const char *json, char *err, size_t err_size);

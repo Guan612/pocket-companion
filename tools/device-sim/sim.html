@@ -265,7 +265,7 @@ button{font:inherit;color:var(--fg)}
     if(id!==r.id)return;  // 这一轮已经被关掉 / 打断
     const alive=()=>e===x&&x.sim_turn_id()===id;
     x.sim_turn_thinking();
-    const device={volume:x.sim_volume(),brightness:x.sim_brightness(),mode:x.sim_mode()};
+    const device={volume:x.sim_volume(),brightness:x.sim_brightness()};
     const res=await fetch('/sim/turn',{method:'POST',body:makeWav(r.chunks),headers:{
       'Content-Type':'audio/wav','X-Sim-Typed':encodeURIComponent(r.typed||''),'X-Sim-Device':encodeURIComponent(JSON.stringify(device))}})
       .then(r=>r.json()).catch(err=>({error:'语音识别连接失败',log:['E 模拟器连不上 serve.py：'+err]}));

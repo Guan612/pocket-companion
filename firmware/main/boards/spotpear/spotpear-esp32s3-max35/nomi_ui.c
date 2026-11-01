@@ -26,19 +26,19 @@ static nomi_ui_callbacks_t s_cb;
 static const lv_font_t *s_font;
 static uint16_t *s_buf;
 
-// 页面结构：外层上下翻（设置 / 主界面），主界面里左右翻（Nomi / 视觉），状态栏和字幕浮在主界面上
+// 页面结构：外层上下翻（设置 / 主界面），主界面里左右翻（表情 / 历史对话），状态栏和字幕浮在主界面上
 static lv_obj_t *s_outer, *s_settings_tile, *s_main_tile;
-static lv_obj_t *s_modes, *s_chat_tile, *s_vision_tile;
-static lv_obj_t *s_canvas, *s_mini_face, *s_preview, *s_preview_hint;
-static lv_obj_t *s_status, *s_mode_label, *s_battery, *s_subtitle, *s_toast;
-static lv_draw_buf_t *s_preview_buf;
+static lv_obj_t *s_modes, *s_chat_tile, *s_hist_tile;
+static lv_obj_t *s_canvas, *s_hist_list;
+static lv_obj_t *s_status, *s_battery, *s_subtitle, *s_toast;
 static lv_timer_t *s_toast_timer;
 static uint32_t s_last_ms, s_emotion_until;
 static float s_acc;
 static face_mode_t s_emotion_mode = FACE_IDLE;
 static bool s_sleeping, s_subtitles_on = true;
-static int s_mode = NOMI_MODE_CHAT;
-static bool s_mode_by_code;  // 代码切换模式时不当作用户选择保存
+static bool s_page_by_code;   // 代码切页面时不当作用户操作
+static bool s_hist_was_open;  // 睡着前停在历史页的话，醒来回那里
+static bool s_hist_dirty;     // 有新消息，历史页可见时要重建列表
 static nomi_state_t s_last_state = NOMI_STATE_IDLE;
 static uint32_t s_subtitle_hide_at;  // 到这个时刻收起字幕，0 表示不收
 
@@ -62,8 +62,9 @@ static void user_activity(void)
 }
 
 static void show_main(bool anim);
-static void show_mode(int mode, bool anim);
+static void show_page(int page, bool anim);
 static void on_face_pressed(lv_event_t *e);
+static void rebuild_history(bool to_bottom);
 
 // 二维码用 Nayuki 的 qrcodegen：设备上由小智依赖的 esp_emote_gfx 带进来，模拟器里由 LVGL 带进来。
 // 两份同名，不能同时链接，所以不打开 LVGL 的 qrcode 控件，只声明这里用到的三个函数。
@@ -104,6 +105,11 @@ static face_mode_t pick_mode(uint32_t now)
     }
 }
 
+static bool hist_page_active(void)
+{
+    return lv_tileview_get_tile_active(s_modes) == s_hist_tile;
+}
+
 static void face_tick(lv_timer_t *timer)
 {
     (void)timer;
@@ -129,12 +135,17 @@ static void face_tick(lv_timer_t *timer)
     }
     s_last_state = state;
 
-    // 表情直接画进画布缓冲，只通知 LVGL 重画变化的那块；视觉模式角落的小脸用的是同一块缓冲
+    // 来了新消息且正停在历史页：把列表重建一遍（说话时逐句更新，一次重建就几毫秒）
+    if (s_hist_dirty && hist_page_active()) {
+        s_hist_dirty = false;
+        rebuild_history(false);
+    }
+
+    // 表情直接画进画布缓冲，只通知 LVGL 重画变化的那块
     rrect_t d = face_render(s_buf);
     if (!rrect_empty(d)) {
         lv_area_t area = {d.x0, d.y0, d.x1 - 1, d.y1 - 1};
         lv_obj_invalidate_area(s_canvas, &area);
-        if (s_mode == NOMI_MODE_VISION) lv_obj_invalidate(s_mini_face);
     }
 }
 
@@ -166,7 +177,7 @@ void nomi_ui_set_font(const lv_font_t *font)
 {
     if (!font) return;
     s_font = font;
-    lv_obj_t *roots[] = {s_status, s_mode_label, s_subtitle, s_toast, s_settings_tile, s_vision_tile};
+    lv_obj_t *roots[] = {s_status, s_subtitle, s_toast, s_settings_tile, s_hist_tile};
     for (size_t i = 0; i < sizeof(roots) / sizeof(roots[0]); i++) {
         if (roots[i]) lv_obj_set_style_text_font(roots[i], font, 0);
     }
@@ -178,9 +189,37 @@ void nomi_ui_set_status(const char *status)
     lv_label_set_text(s_status, status ? status : "");
 }
 
+// 字幕只有两行高，放不下的句子按 UTF-8 从后往前截出能放下的尾巴（正在念的就是最后这句），
+// 前面补一个省略号。估宽从宽了算，截多了没关系，截少了还有 DOTS 模式兜底。
+static const char *trim_subtitle(const char *text)
+{
+    static char buf[512];
+    if (!s_font) return text;
+    const int budget = (FACE_W - 40) * 2;  // 两行的像素预算
+    const int lh = lv_font_get_line_height(s_font);
+    size_t len = strlen(text);
+    int used = 0;
+    size_t start = 0, i = len;
+    while (i > 0) {
+        size_t cs = i - 1;  // 往前找到这个字符的开头
+        while (cs > 0 && ((unsigned char)text[cs] & 0xC0) == 0x80) cs--;
+        int w = i - cs >= 3 ? lh : lh / 2;  // 中文按整字宽、半角按一半估
+        if (used + w > budget - lh) {
+            start = i;
+            break;
+        }
+        used += w;
+        i = cs;
+    }
+    if (start == 0) return text;  // 全放得下
+    snprintf(buf, sizeof(buf), "…%s", text + start);
+    return buf;
+}
+
 void nomi_ui_set_subtitle(const char *role, const char *text)
 {
     s_subtitle_hide_at = 0;  // 有新字幕就别收了
+    s_hist_dirty = true;     // 历史页记下这条消息，可见时重建（字幕关了也要记）
     if (!s_subtitles_on || !text || !*text) {
         lv_obj_add_flag(s_subtitle, LV_OBJ_FLAG_HIDDEN);
         return;
@@ -188,7 +227,7 @@ void nomi_ui_set_subtitle(const char *role, const char *text)
     // 用户说的话偏灰，助手的回答用亮白
     bool from_user = role && strcmp(role, "user") == 0;
     set_color(s_subtitle, from_user ? C_MUTED : C_TEXT);
-    lv_label_set_text(s_subtitle, text);
+    lv_label_set_text(s_subtitle, trim_subtitle(text));
     lv_obj_remove_flag(s_subtitle, LV_OBJ_FLAG_HIDDEN);
 }
 
@@ -209,7 +248,7 @@ void nomi_ui_set_battery(int level, bool charging)
     lv_obj_remove_flag(s_battery, LV_OBJ_FLAG_HIDDEN);
 }
 
-// 睡着时回到主界面、显示大脸（取景也停了）；醒来回到原来的模式
+// 睡着时回到表情页（睡着动画在大脸上）；醒来回到原来停的页面
 void nomi_ui_set_sleep(bool sleeping)
 {
     s_sleeping = sleeping;
@@ -217,13 +256,12 @@ void nomi_ui_set_sleep(bool sleeping)
     if (sleeping) {
         lv_obj_add_flag(s_subtitle, LV_OBJ_FLAG_HIDDEN);
         show_main(false);
-        if (s_mode == NOMI_MODE_VISION) {
-            s_mode_by_code = true;
-            lv_tileview_set_tile(s_modes, s_chat_tile, LV_ANIM_OFF);
-            s_mode_by_code = false;
-        }
-    } else if (s_mode == NOMI_MODE_VISION) {
-        show_mode(NOMI_MODE_VISION, false);
+        s_hist_was_open = hist_page_active();
+        if (s_hist_was_open) show_page(0, false);
+    } else if (s_hist_was_open) {
+        s_hist_was_open = false;
+        s_hist_dirty = true;
+        show_page(1, false);
     }
 }
 
@@ -245,46 +283,54 @@ void nomi_ui_notify(const char *text, uint32_t duration_ms)
     lv_timer_set_repeat_count(s_toast_timer, 1);
 }
 
-/* ---------- 视觉模式：实时取景 ---------- */
+/* ---------- 第二页：历史对话 ---------- */
 
-void nomi_ui_set_preview(const uint16_t *pixels)
+// 按回调里的记录重建整个列表；to_bottom 为 true 时滚到最下面
+static void rebuild_history(bool to_bottom)
 {
-    if (!s_preview_buf || !pixels) return;
-    memcpy(s_preview_buf->data, pixels, NOMI_PREVIEW_W * NOMI_PREVIEW_H * sizeof(uint16_t));
-    lv_obj_add_flag(s_preview_hint, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_invalidate(s_preview);
+    if (!s_cb.history_count || !s_cb.history_get) return;
+    bool was_at_bottom = lv_obj_get_scroll_bottom(s_hist_list) <= 2;
+    lv_obj_clean(s_hist_list);
+    int n = s_cb.history_count();
+    if (n <= 0) {
+        lv_obj_t *hint = lv_label_create(s_hist_list);
+        lv_label_set_text(hint, "还没有对话\n\n聊过的话会记在这里\n往右滑回去叫它说话吧");
+        lv_obj_set_width(hint, LV_PCT(100));
+        lv_obj_set_style_text_align(hint, LV_TEXT_ALIGN_CENTER, 0);
+        lv_obj_set_style_text_opa(hint, LV_OPA_60, 0);
+    }
+    for (int i = 0; i < n; i++) {
+        const char *role = "";
+        const char *text = s_cb.history_get(i, &role);
+        if (!text || !*text) continue;
+        lv_obj_t *label = lv_label_create(s_hist_list);
+        // 自己的话带个称呼、用灰色；它的回答用亮白
+        bool from_user = strcmp(role, "user") == 0;
+        lv_label_set_text_fmt(label, "%s%s", from_user ? "我：" : "", text);
+        lv_obj_set_width(label, LV_PCT(100));
+        set_color(label, from_user ? C_MUTED : C_TEXT);
+    }
+    if (to_bottom || was_at_bottom) {
+        lv_obj_update_layout(s_hist_list);  // 先算好布局才知道能滚多远
+        lv_obj_scroll_to_y(s_hist_list, LV_COORD_MAX, LV_ANIM_OFF);
+    }
 }
 
-static void build_vision(void)
+// 左右翻到另一页：翻到历史页时把列表刷成最新的
+static void on_page_changed(lv_event_t *e)
 {
-    // 取景画面 320×240，放大 1.5 倍铺满 480×320（上下各裁掉一点）
-    s_preview_buf = lv_draw_buf_create(NOMI_PREVIEW_W, NOMI_PREVIEW_H, LV_COLOR_FORMAT_RGB565, 0);
-    if (s_preview_buf) {
-        memset(s_preview_buf->data, 0, s_preview_buf->data_size);
-        s_preview = lv_image_create(s_vision_tile);
-        lv_image_set_src(s_preview, s_preview_buf);
-        lv_image_set_scale(s_preview, 384);  // 256 为原大小
-        lv_obj_center(s_preview);
+    (void)e;
+    if (s_page_by_code) return;
+    if (hist_page_active()) {
+        s_hist_dirty = false;
+        rebuild_history(true);
     }
+}
 
-    s_preview_hint = lv_label_create(s_vision_tile);
-    lv_label_set_text(s_preview_hint, "正在打开摄像头…");
-    set_color(s_preview_hint, C_MUTED);
-    lv_obj_center(s_preview_hint);
-
-    // 角落里的小号 Nomi：直接缩放显示大脸那块缓冲，状态和大脸完全同步
-    s_mini_face = lv_image_create(s_vision_tile);
-    lv_image_set_src(s_mini_face, lv_canvas_get_draw_buf(s_canvas));
-    lv_image_set_scale(s_mini_face, 192);  // 360×240，叠在取景画面正中间
-    lv_image_set_inner_align(s_mini_face, LV_IMAGE_ALIGN_CENTER);
-    lv_obj_set_size(s_mini_face, 360, 240);
-    // 叠加混合：脸的黑底加上去等于没有，只剩白色五官和小手浮在取景画面上
-    lv_obj_set_style_blend_mode(s_mini_face, LV_BLEND_MODE_ADDITIVE, 0);
-    lv_obj_set_style_image_opa(s_mini_face, LV_OPA_90, 0);
-    lv_obj_center(s_mini_face);
-
-    lv_obj_add_flag(s_vision_tile, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_add_event_cb(s_vision_tile, on_face_pressed, LV_EVENT_PRESSED, NULL);
+static void on_modes_scroll(lv_event_t *e)
+{
+    (void)e;
+    user_activity();
 }
 
 /* ---------- 设置页的小部件 ---------- */
@@ -528,7 +574,7 @@ static void build_role_page(lv_obj_t *page)
         add_choice(page, "音色", "OpenAI 的音色名，别家的音色请在网页设置页里填", NOMI_KEY_VOICE,
                    voice_map, rows);
     }
-    add_info(page, "自定义", "人设提示词、API 地址和 Key、视觉模式用的模型，都在网页设置页里改");
+    add_info(page, "自定义", "人设提示词、API 地址和 Key、看图识物的模型，都在网页设置页里改");
 }
 
 static void build_display_page(lv_obj_t *page)
@@ -655,17 +701,12 @@ static void show_main(bool anim)
     lv_tileview_set_tile(s_outer, s_main_tile, anim ? LV_ANIM_ON : LV_ANIM_OFF);
 }
 
-static void show_mode(int mode, bool anim)
+// 代码切页面：0 表情，1 历史
+static void show_page(int page, bool anim)
 {
-    s_mode_by_code = true;
-    lv_tileview_set_tile(s_modes, mode == NOMI_MODE_VISION ? s_vision_tile : s_chat_tile,
-                         anim ? LV_ANIM_ON : LV_ANIM_OFF);
-    s_mode_by_code = false;
-}
-
-static void update_mode_label(void)
-{
-    lv_label_set_text(s_mode_label, s_mode == NOMI_MODE_VISION ? "视觉模式" : "");
+    s_page_by_code = true;
+    lv_tileview_set_tile(s_modes, page ? s_hist_tile : s_chat_tile, anim ? LV_ANIM_ON : LV_ANIM_OFF);
+    s_page_by_code = false;
 }
 
 // 外层开始上下翻：从主界面往下拉时先把设置页刷新成最新的值
@@ -674,25 +715,6 @@ static void on_outer_scroll(lv_event_t *e)
     (void)e;
     user_activity();
     if (lv_tileview_get_tile_active(s_outer) == s_main_tile) build_settings();
-}
-
-// 左右翻到另一个模式：记下来并告诉设备（开关取景、提问时要不要带照片）
-static void on_mode_changed(lv_event_t *e)
-{
-    (void)e;
-    if (s_mode_by_code) return;
-    int mode = lv_tileview_get_tile_active(s_modes) == s_vision_tile ? NOMI_MODE_VISION : NOMI_MODE_CHAT;
-    if (mode == s_mode) return;
-    s_mode = mode;
-    if (mode == NOMI_MODE_CHAT) lv_obj_remove_flag(s_preview_hint, LV_OBJ_FLAG_HIDDEN);
-    update_mode_label();
-    set_int(NOMI_KEY_MODE, mode, true);
-}
-
-static void on_modes_scroll(lv_event_t *e)
-{
-    (void)e;
-    user_activity();
 }
 
 // 触摸只用来叫醒它；说话交给 BOOT 键和唤醒词
@@ -728,7 +750,6 @@ void nomi_ui_create(lv_obj_t *screen, uint16_t *face_buf, const lv_font_t *font,
     s_font = font;
     s_cb = *callbacks;
     s_subtitles_on = get_int(NOMI_KEY_SUBTITLES, 1);
-    s_mode = get_int(NOMI_KEY_MODE, NOMI_MODE_CHAT) == NOMI_MODE_VISION ? NOMI_MODE_VISION : NOMI_MODE_CHAT;
 
     lv_obj_set_style_bg_color(screen, lv_color_black(), 0);
     lv_obj_remove_flag(screen, LV_OBJ_FLAG_SCROLLABLE);
@@ -740,11 +761,11 @@ void nomi_ui_create(lv_obj_t *screen, uint16_t *face_buf, const lv_font_t *font,
     lv_obj_add_event_cb(s_outer, on_outer_scroll, LV_EVENT_SCROLL_BEGIN, NULL);
     lv_obj_add_event_cb(s_outer, on_outer_scroll_end, LV_EVENT_SCROLL_END, NULL);
 
-    // 主界面里：Nomi 在左，视觉在右
+    // 主界面里：表情在左，历史对话在右
     s_modes = add_tileview(s_main_tile);
     s_chat_tile = add_tile(s_modes, 0, 0, LV_DIR_RIGHT, 0x000000);
-    s_vision_tile = add_tile(s_modes, 1, 0, LV_DIR_LEFT, 0x000000);
-    lv_obj_add_event_cb(s_modes, on_mode_changed, LV_EVENT_VALUE_CHANGED, NULL);
+    s_hist_tile = add_tile(s_modes, 1, 0, LV_DIR_LEFT, C_PAGE);
+    lv_obj_add_event_cb(s_modes, on_page_changed, LV_EVENT_VALUE_CHANGED, NULL);
     lv_obj_add_event_cb(s_modes, on_modes_scroll, LV_EVENT_SCROLL_BEGIN, NULL);
 
     face_init(lv_tick_get() * 2654435761u + 1);
@@ -755,8 +776,17 @@ void nomi_ui_create(lv_obj_t *screen, uint16_t *face_buf, const lv_font_t *font,
     lv_obj_add_flag(s_canvas, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_add_event_cb(s_canvas, on_face_pressed, LV_EVENT_PRESSED, NULL);
 
-
-    build_vision();
+    // 历史对话页：一列消息，上下滚动；进来时按回调里的记录重建
+    s_hist_list = lv_obj_create(s_hist_tile);
+    lv_obj_remove_style_all(s_hist_list);
+    lv_obj_set_size(s_hist_list, LV_PCT(100), LV_PCT(100));
+    lv_obj_set_flex_flow(s_hist_list, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_all(s_hist_list, 16, 0);
+    lv_obj_set_style_pad_bottom(s_hist_list, 40, 0);  // 最后一行别被字幕挡住
+    lv_obj_set_style_pad_row(s_hist_list, 10, 0);
+    lv_obj_set_scrollbar_mode(s_hist_list, LV_SCROLLBAR_MODE_AUTO);
+    lv_obj_add_flag(s_hist_list, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(s_hist_list, on_face_pressed, LV_EVENT_PRESSED, NULL);
 
     // 以下浮在主界面上，左右切模式时不动
     lv_obj_t *grip = lv_obj_create(s_main_tile);  // 顶部小横条：提示往下拉打开设置
@@ -771,10 +801,6 @@ void nomi_ui_create(lv_obj_t *screen, uint16_t *face_buf, const lv_font_t *font,
     set_color(s_status, C_MUTED);
     lv_obj_align(s_status, LV_ALIGN_TOP_MID, 0, 16);
     lv_label_set_text(s_status, "");
-
-    s_mode_label = lv_label_create(s_main_tile);
-    set_color(s_mode_label, C_MUTED);
-    lv_obj_align(s_mode_label, LV_ALIGN_TOP_LEFT, 12, 10);
 
     s_battery = lv_label_create(s_main_tile);
     lv_obj_set_style_text_font(s_battery, &lv_font_montserrat_14, 0);
@@ -794,8 +820,6 @@ void nomi_ui_create(lv_obj_t *screen, uint16_t *face_buf, const lv_font_t *font,
 
     build_settings();
     show_main(false);
-    show_mode(s_mode, false);
-    update_mode_label();
 
     // 通知条在最上层，翻到哪一页都看得到
     s_toast = lv_label_create(screen);

@@ -27,7 +27,6 @@
 
 static uint16_t s_lcd[LCD_W * LCD_H];
 static uint16_t s_face[FACE_W * FACE_H];
-static uint16_t s_preview[NOMI_PREVIEW_W * NOMI_PREVIEW_H];
 static uint8_t s_draw_buf[LCD_W * DRAW_LINES * 2] __attribute__((aligned(64)));
 static int s_dx0 = LCD_W, s_dy0 = LCD_H, s_dx1, s_dy1;
 static int s_px, s_py, s_pressed;
@@ -100,8 +99,56 @@ static void set_recording(bool on)
 }
 
 // 设置项存在内存里，刷新页面就没了
-static int s_mode, s_talk_key, s_aec, s_subtitles = 1, s_persona, s_voice = 4, s_dim = 1, s_off = 1;
+static int s_talk_key, s_aec, s_subtitles = 1, s_persona, s_voice = 4, s_dim = 1, s_off = 1;
 static int s_volume = 70, s_brightness = 80;
+
+/* ---------- 聊天历史（对应 NomiDisplay::AddChatMessage） ---------- */
+
+#define HIST_MAX 40
+#define HIST_TEXT_LEN 1024
+static char s_hist_text[HIST_MAX][HIST_TEXT_LEN];
+static char s_hist_role[HIST_MAX][12];
+static int s_hist_n;
+
+static bool ascii_alnum(char c)
+{
+    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9');
+}
+
+static void hist_add(const char *role, const char *text)
+{
+    if (!text || !*text) return;
+    // 同一条回答的下一句接着记（小智逐句下发字幕）
+    if (s_hist_n && !strcmp(role, "assistant") && !strcmp(s_hist_role[s_hist_n - 1], "assistant")) {
+        char *last = s_hist_text[s_hist_n - 1];
+        size_t len = strlen(last);
+        if (len && len < HIST_TEXT_LEN - 1 && ascii_alnum(last[len - 1]) && ascii_alnum(text[0])) {
+            last[len++] = ' ';
+        }
+        snprintf(last + len, HIST_TEXT_LEN - len, "%s", text);
+        return;
+    }
+    if (s_hist_n >= HIST_MAX) {
+        memmove(s_hist_text, s_hist_text + 1, (HIST_MAX - 1) * HIST_TEXT_LEN);
+        memmove(s_hist_role, s_hist_role + 1, (HIST_MAX - 1) * sizeof(s_hist_role[0]));
+        s_hist_n--;
+    }
+    snprintf(s_hist_role[s_hist_n], sizeof(s_hist_role[0]), "%s", role);
+    snprintf(s_hist_text[s_hist_n], HIST_TEXT_LEN, "%s", text);
+    s_hist_n++;
+}
+
+static int hist_count(void) { return s_hist_n; }
+
+static const char *hist_get(int index, const char **role)
+{
+    if (index < 0 || index >= s_hist_n) {
+        *role = "";
+        return "";
+    }
+    *role = s_hist_role[index];
+    return s_hist_text[index];
+}
 
 static void set_stage(stage_t stage)
 {
@@ -435,25 +482,6 @@ static void advance(void)
     }
 }
 
-// 假取景：缓慢移动的彩色渐变加一个圆，看得出画面在动
-static void update_preview(void)
-{
-    static uint32_t last;
-    if (s_mode != NOMI_MODE_VISION || s_sleep_level || s_ms - last < 150) return;
-    last = s_ms;
-    float t = s_ms / 1000.0f;
-    int cx = (int)(160 + 60 * sinf(t * 0.7f)), cy = (int)(120 + 30 * cosf(t * 0.9f));
-    for (int y = 0; y < NOMI_PREVIEW_H; y++) {
-        for (int x = 0; x < NOMI_PREVIEW_W; x++) {
-            int r = 40 + x / 4, g = 60 + y / 3, b = 90 + (int)(40 * sinf(t + x * 0.02f));
-            int dx = x - cx, dy = y - cy;
-            if (dx * dx + dy * dy < 40 * 40) r = 120, g = 200, b = 110;  // 一盆"绿萝"
-            s_preview[y * NOMI_PREVIEW_W + x] = (uint16_t)(((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3));
-        }
-    }
-    nomi_ui_set_preview(s_preview);
-}
-
 /* ---------- nomi_ui 回调（对应 NomiDisplay） ---------- */
 
 static nomi_state_t get_state(void)
@@ -466,7 +494,6 @@ static nomi_state_t get_state(void)
 
 static int get_int(const char *key, int def)
 {
-    if (!strcmp(key, NOMI_KEY_MODE)) return s_mode;
     if (!strcmp(key, NOMI_KEY_TALK_KEY)) return s_talk_key;
     if (!strcmp(key, NOMI_KEY_VOLUME)) return s_volume;
     if (!strcmp(key, NOMI_KEY_BRIGHTNESS)) return s_brightness;
@@ -483,8 +510,7 @@ static int get_int(const char *key, int def)
 static void set_int(const char *key, int value, bool final)
 {
     (void)final;
-    if (!strcmp(key, NOMI_KEY_MODE)) s_mode = value;
-    else if (!strcmp(key, NOMI_KEY_TALK_KEY)) s_talk_key = value;
+    if (!strcmp(key, NOMI_KEY_TALK_KEY)) s_talk_key = value;
     else if (!strcmp(key, NOMI_KEY_VOLUME)) s_volume = value;
     else if (!strcmp(key, NOMI_KEY_BRIGHTNESS)) s_brightness = value;
     else if (!strcmp(key, NOMI_KEY_AEC)) s_aec = value;
@@ -607,6 +633,8 @@ void sim_init(uint32_t ms, int has_wifi, int api_ok, int router)
         .set_int = set_int,
         .get_text = get_text,
         .action = action,
+        .history_count = hist_count,
+        .history_get = hist_get,
     };
     // 没拿到小智字体时退回 LVGL 自带的中文子集（缺字较多）
     const lv_font_t *font = s_font_bin ? cbin_font_create(s_font_bin) : NULL;
@@ -630,7 +658,6 @@ int sim_frame(uint32_t ms)
     advance_boot();
     advance_station();
     advance();
-    update_preview();
     lv_timer_handler();
     return s_dx1 > s_dx0 ? (s_dx1 - s_dx0) * (s_dy1 - s_dy0) : 0;
 }
@@ -659,7 +686,6 @@ int sim_volume(void) { return s_volume; }
 int sim_net(void) { return s_net; }
 int sim_stage(void) { return s_stage; }
 int sim_chat(void) { return s_chat; }
-int sim_mode(void) { return s_mode; }
 int sim_talk_key(void) { return s_talk_key; }
 
 int sim_request(void)
@@ -721,10 +747,11 @@ void sim_vad_end(void) { set_recording(false); }
 // RunTurn 一开始：EmitJson("llm", "emotion", "thinking")
 void sim_turn_thinking(void) { nomi_ui_set_emotion("thinking"); }
 
-// "stt"：识别出的文字作为用户字幕
+// "stt"：识别出的文字作为用户字幕，记进聊天历史
 void sim_turn_stt(void)
 {
     dev_log('I', "Application", ">> %s", s_str);
+    hist_add("user", s_str);
     nomi_ui_set_subtitle("user", s_str);
 }
 
@@ -744,6 +771,7 @@ void sim_tts_start(void) { set_chat(CHAT_SPEAKING); }
 void sim_tts_sentence(void)
 {
     dev_log('I', "Application", "<< %s", s_str);
+    hist_add("assistant", s_str);
     nomi_ui_set_subtitle("assistant", s_str);
 }
 

@@ -24,6 +24,7 @@
 #include <cstdio>
 #include <cstring>
 #include <string>
+#include <vector>
 
 #define TAG "NomiDisplay"
 
@@ -52,6 +53,48 @@ const Persona kPersonas[] = {
 const char* const kVoices[] = {"alloy", "echo", "fable", "onyx", "nova", "shimmer"};
 
 std::string PersonaPrompt(int index) { return std::string(kPersonas[index].prompt) + kEmotionRule; }
+
+// ---------- 聊天历史（第二页显示用） ----------
+
+struct ChatEntry {
+    std::string role, text;
+};
+std::vector<ChatEntry> g_chat_log;  // 只在 LVGL 任务里访问（所有调用方都在同一线程）
+constexpr size_t kChatLogMax = 100;
+
+bool IsAsciiAlnum(char c) {
+    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9');
+}
+
+// 逐句下发字幕（小智一句话一条消息），同一条回答的句子接着记，别拆成好几条
+void AddChatMessage(const char* role, const char* content) {
+    if (content == nullptr || *content == '\0') return;
+    std::string text = content;
+    if (text.size() > 2000) text.resize(2000);
+    if (strcmp(role, "assistant") == 0 && !g_chat_log.empty() && g_chat_log.back().role == "assistant") {
+        std::string& last = g_chat_log.back().text;
+        // 英文单词之间补个空格，中文直接连上
+        if (!last.empty() && IsAsciiAlnum(last.back()) && IsAsciiAlnum(text.front())) last += ' ';
+        last += text;
+    } else {
+        g_chat_log.push_back({role, std::move(text)});
+    }
+    if (g_chat_log.size() > kChatLogMax) {
+        g_chat_log.erase(g_chat_log.begin(), g_chat_log.end() - kChatLogMax);
+    }
+}
+
+int HistoryCount() { return static_cast<int>(g_chat_log.size()); }
+
+const char* HistoryGet(int index, const char** role) {
+    static const char* kEmpty = "";
+    if (index < 0 || index >= static_cast<int>(g_chat_log.size())) {
+        *role = "";
+        return kEmpty;
+    }
+    *role = g_chat_log[index].role.c_str();
+    return g_chat_log[index].text.c_str();
+}
 
 // 音色跟着语音合成选的供应商走：网页设置页保存时把那家的音色列表写进 tts_voices（一行一个），
 // 没有就用 OpenAI 的六个
@@ -155,9 +198,7 @@ void SetInt(const char* key, int value, bool final) {
     }
 
     Settings(kNomiNs, true).SetInt(key, value);
-    if (!strcmp(key, NOMI_KEY_MODE)) {
-        if (NomiDisplay::on_mode_changed) NomiDisplay::on_mode_changed(value);
-    } else if (!strcmp(key, NOMI_KEY_AEC)) {
+    if (!strcmp(key, NOMI_KEY_AEC)) {
         ApplyAec(value);
     } else if (!strcmp(key, NOMI_KEY_DIM) || !strcmp(key, NOMI_KEY_OFF)) {
         if (NomiDisplay::on_power_timing_changed) NomiDisplay::on_power_timing_changed();
@@ -231,7 +272,6 @@ void Action(const char* name) {
 
 bool NomiDisplay::aec_supported = false;
 std::function<void()> NomiDisplay::on_user_activity;
-std::function<void(int)> NomiDisplay::on_mode_changed;
 std::function<void()> NomiDisplay::on_power_timing_changed;
 
 NomiDisplay::NomiDisplay(esp_lcd_panel_io_handle_t panel_io, esp_lcd_panel_handle_t panel,
@@ -277,6 +317,8 @@ void NomiDisplay::SetupUI() {
         .set_int = SetInt,
         .get_text = GetText,
         .action = Action,
+        .history_count = HistoryCount,
+        .history_get = HistoryGet,
     };
     // 先用内置字体，资源分区里的完整中文字体加载后会经 SetTextFont 换上
     nomi_ui_create(screen, face_buf_, &BUILTIN_TEXT_FONT, &callbacks);
@@ -293,6 +335,7 @@ bool NomiDisplay::SetTextFont(std::shared_ptr<LvglFont> text_font) {
     if (ok && ui_ready_ && text_font && text_font->font()) {
         DisplayLockGuard lock(this);
         nomi_ui_set_font(text_font->font());
+        ESP_LOGI(TAG, "Nomi UI switched to assets text font");
     }
     return ok;
 }
@@ -335,6 +378,10 @@ void NomiDisplay::SetChatMessage(const char* role, const char* content) {
         if (content != nullptr && *content) nomi_ui_notify(content, 4000);
         return;
     }
+    // 推送通知的字幕不进聊天历史
+    if (Application::GetInstance().GetDeviceState() != kDeviceStateNotifying) {
+        AddChatMessage(role ? role : "", content);
+    }
     nomi_ui_set_subtitle(role, content);
 }
 
@@ -359,12 +406,6 @@ void NomiDisplay::SetPreviewImage(std::unique_ptr<LvglImage> image) {
 }
 
 int NomiDisplay::GetSavedInt(const char* key, int def) { return Settings(kNomiNs).GetInt(key, def); }
-
-void NomiDisplay::SetPreview(const uint16_t* pixels) {
-    if (!ui_ready_) return;
-    DisplayLockGuard lock(this);
-    nomi_ui_set_preview(pixels);
-}
 
 bool NomiDisplay::PlayFace(const std::string& json, std::string& error) {
     if (!ui_ready_) {
