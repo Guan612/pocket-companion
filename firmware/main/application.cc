@@ -370,8 +370,10 @@ void Application::ActivationTask() {
     ota_ = std::make_unique<Ota>();
 
 #if CONFIG_DIRECT_API
-    // 直连 API 不连小智服务器：不激活，也不让官方 OTA 覆盖我们的固件
+    // 直连 API 不连小智服务器：不激活，也不让官方 OTA 覆盖我们的固件。
+    // 但资源分区（完整中文字体等）要照常应用，不然整个界面只能显示内置小字库，到处缺字
     ota_->MarkCurrentVersionValid();
+    CheckAssetsVersion();
 #else
     // Check for new assets version
     CheckAssetsVersion();
