@@ -31,6 +31,7 @@ namespace {
 constexpr int kMicSampleRate = 16000;      // 小智上行 Opus 的采样率
 constexpr int kMicFrameMs = 60;            // 小智上行 Opus 的帧长
 constexpr int kEndSilenceMs = 900;         // 说完后静音多久算一句结束
+constexpr int kNoSpeechMs = 5000;          // 自动聆听一直没人开口，多久放弃、回待机
 constexpr int kBargeInMs = 300;            // 它说话时用户开口多久算打断
 constexpr int kMaxRecordMs = 15000;
 constexpr size_t kHistoryLimit = 12;
@@ -355,6 +356,8 @@ bool DirectApiProtocol::SendAudio(std::unique_ptr<AudioStreamPacket> packet) {
                 silence_ms_ += kMicFrameMs;
             }
             done = heard_voice_ && silence_ms_ >= kEndSilenceMs;
+            // 一直没人开口就别傻等满 15 秒：结束这轮，RunTurn 会回待机
+            done = done || (!heard_voice_ && recorded_ms_ >= kNoSpeechMs);
         }
         done = done || recorded_ms_ >= kMaxRecordMs;
     }
@@ -448,6 +451,18 @@ void DirectApiProtocol::RunTurn(std::vector<std::vector<uint8_t>> packets) {
             SendStartListening(mode_);
         }
     };
+
+    // 这一轮从没听到人声（唤醒后没人说话 / 说话间隙的空窗）：不浪费一次
+    // 语音识别，直接结束聆听回待机，想继续对话再唤醒或按键
+    bool heard;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        heard = heard_voice_;
+    }
+    if (!heard && mode_ != kListeningModeManualStop) {
+        app.StopListening();
+        return;
+    }
 
     EmitJson("llm", "emotion", "thinking");
     std::string text = Transcribe(cfg, packets);
