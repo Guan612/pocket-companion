@@ -184,6 +184,9 @@ TOOLS = [
     {"type": "function", "function": {"name": "self.memory.remember",
      "description": "把主人希望长期记住的事存进设备的长期记忆。适合：主人告诉你名字/称呼、喜好、固定安排，或明确说\"记住\"。一次记一条简短的事实，闲聊内容不要记。",
      "parameters": {"type": "object", "properties": {"fact": {"type": "string", "maxLength": 200}}, "required": ["fact"]}}},
+    {"type": "function", "function": {"name": "self.camera.look",
+     "description": "看一眼摄像头拍到的画面并说出看到了什么。主人让你看东西、认东西、读画面上的文字、描述眼前的场景时调用；question 写上你想从画面里知道的问题。",
+     "parameters": {"type": "object", "properties": {"question": {"type": "string"}}, "required": ["question"]}}},
 ]
 
 
@@ -279,6 +282,8 @@ def call_tool(name, args, device, actions):
         return "正在表演"
     if name == "self.memory.remember":
         return "已记住" if remember(str(a.get("fact", ""))) else "长期记忆已满，请提示主人到网页设置页整理"
+    if name == "self.camera.look":  # 模拟器没有摄像头，按固件"没拍到"的分支走
+        return "已拍下画面，照片随后作为用户消息发给你"
     return f"Unknown tool: {name}"
 
 
@@ -355,11 +360,17 @@ def chat(cfg, user_text, device, actions, log):
             break
         log(f"I LLM wants {len(calls)} tool call(s)")
         req["messages"].append(message)
+        looked = False
         for tc in calls:
             fn = tc.get("function") or {}
+            if fn.get("name") == "self.camera.look":
+                looked = True
             result = call_tool(fn.get("name", ""), fn.get("arguments"), device, actions)
             log(f"I Tool {fn.get('name')} -> {result[:120]}")
             req["messages"].append({"role": "tool", "tool_call_id": tc.get("id", ""), "content": result})
+        if looked:
+            # 模拟器没有摄像头：和固件"照片没编出来"分支一样，补一条用户消息说明
+            req["messages"].append({"role": "user", "content": "（这次没有拍到画面，跟主人说一声吧）"})
     log(f"I LLM: {reply}")
     reply, face = extract_face(reply)  # 表情脚本不进历史，也不念出来
     if not reply:

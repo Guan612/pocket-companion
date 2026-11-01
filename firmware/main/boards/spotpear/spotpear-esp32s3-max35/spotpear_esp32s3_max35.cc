@@ -8,6 +8,7 @@
 #include "esp32_camera.h"
 #include "image_to_jpeg.h"
 #if CONFIG_DIRECT_API
+#include "direct_api_config_server.h"
 #include "direct_api_protocol.h"
 #endif
 #include "nomi_display.h"
@@ -40,10 +41,9 @@ private:
     AdcBatteryMonitor* battery_ = nullptr;
     PowerSaveTimer* power_save_timer_ = nullptr;
     Esp32Camera* camera_ = nullptr;
-    std::mutex camera_mutex_;        // 取景任务和提问时抓拍不能同时拿帧
-    std::atomic<bool> vision_on_{false};
+    std::mutex camera_mutex_;  // 抓拍不能和别的抓拍同时拿帧
     std::atomic<bool> sleeping_{false};
-    bool holding_ = false;           // BOOT 键按住说话中
+    bool holding_ = false;     // BOOT 键按住说话中
     esp_timer_handle_t dim_timer_ = nullptr;  // 睡着一会儿后调暗屏幕
 
     // ES8311、GT911、摄像头 SCCB 共用这条总线
@@ -235,76 +235,44 @@ private:
         config.pixel_format = PIXFORMAT_RGB565;
         config.frame_size = FRAMESIZE_VGA;  // 640×480，识图够清楚，JPEG 约几十 KB
         config.jpeg_quality = 12;
-        config.fb_count = 2;  // 取景和提问时抓拍可能同时要帧
+        config.fb_count = 2;  // 双缓冲：拍的那帧 DMA 不会正在被覆写（单缓冲会拍到写一半的帧）
         config.fb_location = CAMERA_FB_IN_PSRAM;
-        config.grab_mode = CAMERA_GRAB_LATEST;  // 取景要最新的一帧，不要排队的旧帧
+        config.grab_mode = CAMERA_GRAB_LATEST;  // 总是拿到最新的画面
         camera_ = new Esp32Camera(config);
-
-        vision_on_ = NomiDisplay::GetSavedInt(NOMI_KEY_MODE, NOMI_MODE_CHAT) == NOMI_MODE_VISION;
-        NomiDisplay::on_mode_changed = [this](int mode) { vision_on_ = mode == NOMI_MODE_VISION; };
-#if CONFIG_DIRECT_API
-        // 视觉模式：每轮说完话时抓一帧，和问题一起发给支持图片输入的大模型
-        DirectApiProtocol::image_provider = [this]() {
-            return vision_on_ ? CaptureJpeg() : std::string();
-        };
-#endif
-        xTaskCreatePinnedToCore(PreviewTask, "cam_preview", 4096, this, 2, nullptr, 1);
     }
 
-    // 视觉模式且醒着时，约每 150 毫秒取一帧，缩成 320×240 送给界面做取景
-    static void PreviewTask(void* arg) {
-        auto* self = static_cast<SpotpearMax35Board*>(arg);
-        auto* preview = static_cast<uint16_t*>(
-            heap_caps_malloc(NOMI_PREVIEW_W * NOMI_PREVIEW_H * sizeof(uint16_t), MALLOC_CAP_SPIRAM));
-        while (preview != nullptr) {
-            vTaskDelay(pdMS_TO_TICKS(150));
-            if (!self->vision_on_ || self->sleeping_) continue;
-            std::lock_guard<std::mutex> lock(self->camera_mutex_);
-            camera_fb_t* fb = esp_camera_fb_get();
-            if (fb == nullptr) continue;
-            if (fb->format == PIXFORMAT_RGB565 && fb->width >= NOMI_PREVIEW_W &&
-                fb->height >= NOMI_PREVIEW_H) {
-                // 按比例抽点缩小，同时把摄像头的大端 RGB565 换成本机字节序
-                auto* src = reinterpret_cast<const uint16_t*>(fb->buf);
-                for (int y = 0; y < NOMI_PREVIEW_H; y++) {
-                    const uint16_t* row = src + (y * fb->height / NOMI_PREVIEW_H) * fb->width;
-                    for (int x = 0; x < NOMI_PREVIEW_W; x++) {
-                        preview[y * NOMI_PREVIEW_W + x] =
-                            __builtin_bswap16(row[x * fb->width / NOMI_PREVIEW_W]);
-                    }
-                }
-                self->display_->SetPreview(preview);
-            }
-            esp_camera_fb_return(fb);
-        }
-        vTaskDelete(nullptr);
-    }
-
-    // 取一帧 RGB565 转成 JPEG。摄像头输出是大端 RGB565，编码器要小端，先换字节
-    std::string CaptureJpeg() {
+    // 取一帧 RGB565。摄像头输出是大端，看图模型 / 编码器要小端，先换字节；
+    // raw=true 直接返回换好字节序的原始帧（设置页 /cam.jpg?raw=1 调试用）
+    std::string CaptureFrame(bool raw) {
         std::lock_guard<std::mutex> lock(camera_mutex_);
         camera_fb_t* fb = esp_camera_fb_get();
         if (fb == nullptr) return "";
-        std::string jpeg;
+        std::string out;
         if (fb->format == PIXFORMAT_RGB565) {
             size_t pixels = fb->width * fb->height;
             auto* buf = static_cast<uint16_t*>(heap_caps_malloc(pixels * 2, MALLOC_CAP_SPIRAM));
             if (buf != nullptr) {
                 auto* src = reinterpret_cast<const uint16_t*>(fb->buf);
                 for (size_t i = 0; i < pixels; i++) buf[i] = __builtin_bswap16(src[i]);
-                uint8_t* out = nullptr;
-                size_t out_len = 0;
-                if (image_to_jpeg(reinterpret_cast<uint8_t*>(buf), pixels * 2, fb->width,
-                                  fb->height, V4L2_PIX_FMT_RGB565, 80, &out, &out_len)) {
-                    jpeg.assign(reinterpret_cast<char*>(out), out_len);
-                    free(out);
+                if (raw) {
+                    out.assign(reinterpret_cast<const char*>(buf), pixels * 2);
+                } else {
+                    uint8_t* jpeg = nullptr;
+                    size_t jpeg_len = 0;
+                    if (image_to_jpeg(reinterpret_cast<uint8_t*>(buf), pixels * 2, fb->width,
+                                      fb->height, V4L2_PIX_FMT_RGB565, 80, &jpeg, &jpeg_len)) {
+                        out.assign(reinterpret_cast<char*>(jpeg), jpeg_len);
+                        free(jpeg);
+                    }
                 }
                 heap_caps_free(buf);
             }
         }
         esp_camera_fb_return(fb);
-        return jpeg;
+        return out;
     }
+
+    std::string CaptureJpeg() { return CaptureFrame(false); }
 
     // BOOT 键说话：默认按住说话（像对讲机），设置里可改成点一下开始、说完自动结束
     bool HoldToTalk() { return NomiDisplay::GetSavedInt(NOMI_KEY_TALK_KEY, 0) == 0; }
@@ -360,6 +328,30 @@ private:
         DirectApiProtocol::face_handler = [this](const std::string& json, std::string& error) {
             return display_->PlayFace(json, error);
         };
+        // 设置页 /cam.jpg：直接拉一张大模型看到的照片（?raw=1 是原始帧），调视觉用
+        DirectApiConfigServer::debug_capture = [this](bool raw) { return CaptureFrame(raw); };
+        // 让大模型看一眼摄像头：拍照和编码要一两秒，放到独立任务里做，别卡主循环；
+        // 拍好的 JPEG 经 AttachImage 交给直连协议，由它随下一轮请求发给视觉模型（见 Chat()）
+        mcp_server.AddTool("self.camera.look",
+                           "看一眼摄像头拍到的画面并说出看到了什么。主人让你看东西、认东西、读画面上的文字、"
+                           "描述眼前的场景时调用；question 写上你想从画面里知道的问题。",
+                           PropertyList({Property("question", kPropertyTypeString)}),
+                           [this](const PropertyList& properties) -> ToolResult {
+                               (void)properties;
+                               if (xTaskCreate(
+                                       [](void* arg) {
+                                           auto* self = static_cast<SpotpearMax35Board*>(arg);
+                                           std::string jpeg = self->CaptureJpeg();
+                                           if (!jpeg.empty()) {
+                                               DirectApiProtocol::AttachImage(std::move(jpeg));
+                                           }
+                                           vTaskDelete(nullptr);
+                                       },
+                                       "cam_look", 8192, this, 3, nullptr) != pdPASS) {
+                                   return std::unexpected("相机忙，稍后再试");
+                               }
+                               return std::string("已拍下画面，照片随后作为用户消息发给你");
+                           });
 #endif
     }
 

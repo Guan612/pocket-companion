@@ -272,9 +272,29 @@ std::string DeviceIp() {
     return buf;
 }
 
+esp_err_t HandleCamJpeg(httpd_req_t* req) {
+    if (!DirectApiConfigServer::debug_capture) {
+        return httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "camera debug hook not set");
+    }
+    char query[64] = {};
+    bool raw = false;
+    if (httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK) {
+        raw = strstr(query, "raw=1") != nullptr;
+    }
+    std::string data = DirectApiConfigServer::debug_capture(raw);
+    if (data.empty()) {
+        return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "capture failed");
+    }
+    httpd_resp_set_type(req, raw ? "application/octet-stream" : "image/jpeg");
+    return httpd_resp_send(req, data.data(), data.size());
+}
+
 }  // namespace
 
 namespace DirectApiConfigServer {
+
+// 调试：看看大模型收到的照片长什么样（?raw=1 是送编码器前的原始帧）
+std::function<std::string(bool raw)> debug_capture;
 
 std::string Start() {
     if (s_server == nullptr) {
@@ -289,6 +309,7 @@ std::string Start() {
             {.uri = "/config.json", .method = HTTP_GET, .handler = HandleConfig, .user_ctx = nullptr},
             {.uri = "/save", .method = HTTP_POST, .handler = HandleSave, .user_ctx = nullptr},
             {.uri = "/models", .method = HTTP_POST, .handler = HandleModels, .user_ctx = nullptr},
+            {.uri = "/cam.jpg", .method = HTTP_GET, .handler = HandleCamJpeg, .user_ctx = nullptr},
         };
         for (const auto& u : uris) httpd_register_uri_handler(s_server, &u);
     }

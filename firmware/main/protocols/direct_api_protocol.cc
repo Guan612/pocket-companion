@@ -438,13 +438,9 @@ void DirectApiProtocol::RunTurn(std::vector<std::vector<uint8_t>> packets) {
     std::string text = Transcribe(cfg, packets);
     packets.clear();
     if (cancel_) return;
-    // 视觉模式：说完话的这一刻拍一张，和问题一起发
-    if (!text.empty() && !HasPendingImage() && image_provider) {
-        std::string jpeg = image_provider();
-        if (!jpeg.empty()) AttachImage(std::move(jpeg));
-    }
+    // 上一轮拍的照片现在才编完、而这轮又没说话：就当在问照片的事，不然照片会一直挂着
     if (text.empty() && HasPendingImage()) {
-        text = kDefaultImageQuestion;  // 拍了照但没说话
+        text = kDefaultImageQuestion;
     }
     if (text.empty()) {
         EmitJson("llm", "emotion", "neutral");  // 没听清：结束"思考中"（它会一直保持到有结果）
@@ -535,9 +531,10 @@ std::string DirectApiProtocol::Transcribe(const DirectApiConfig& cfg,
 std::string DirectApiProtocol::Chat(const DirectApiConfig& cfg, const std::string& user_text) {
     history_.emplace_back("user", user_text);
 
-    // 这一轮带图就用视觉模型（可在网页设置页单独配置，默认和对话模型一样）
+    // 带图就用视觉模型（可在网页设置页单独配置，默认和对话模型一样）
+    static bool tools_broken = false;  // 服务不支持 function calling 时，这次开机不再带 tools
     std::string image = TakePendingImage();
-    const DirectApiEndpoint& ep = image.empty() ? cfg.llm : cfg.vision;
+    const DirectApiEndpoint* ep = image.empty() ? &cfg.llm : &cfg.vision;
 
     // 长期记忆拼进系统提示词；带工具时补一句使用指引
     auto build_system = [&cfg](bool with_tools) {
@@ -556,10 +553,31 @@ std::string DirectApiProtocol::Chat(const DirectApiConfig& cfg, const std::strin
         return sys;
     };
 
-    static bool tools_broken = false;  // 服务不支持 function calling 时，这次开机不再带 tools
+    // 往请求里补一条用户消息；带图时用多模态格式（拍照工具的结果就是这样交给模型的）
+    auto append_user_message = [](cJSON* req, const std::string& text, const std::string& image) {
+        cJSON* msgs = cJSON_GetObjectItem(req, "messages");
+        cJSON* m = cJSON_CreateObject();
+        cJSON_AddStringToObject(m, "role", "user");
+        if (image.empty()) {
+            cJSON_AddStringToObject(m, "content", text.c_str());
+        } else {
+            cJSON* parts = cJSON_AddArrayToObject(m, "content");
+            cJSON* text_part = cJSON_CreateObject();
+            cJSON_AddStringToObject(text_part, "type", "text");
+            cJSON_AddStringToObject(text_part, "text", text.c_str());
+            cJSON_AddItemToArray(parts, text_part);
+            cJSON* image_part = cJSON_CreateObject();
+            cJSON_AddStringToObject(image_part, "type", "image_url");
+            cJSON* url = cJSON_AddObjectToObject(image_part, "image_url");
+            cJSON_AddStringToObject(url, "url", ("data:image/jpeg;base64," + Base64(image)).c_str());
+            cJSON_AddItemToArray(parts, image_part);
+        }
+        cJSON_AddItemToArray(msgs, m);
+    };
+
     auto build_request = [&](bool with_tools) {
         cJSON* req = cJSON_CreateObject();
-        cJSON_AddStringToObject(req, "model", ep.model.c_str());
+        cJSON_AddStringToObject(req, "model", ep->model.c_str());
         cJSON* messages = cJSON_AddArrayToObject(req, "messages");
         auto add = [messages](const std::string& role, const std::string& content) {
             cJSON* m = cJSON_CreateObject();
@@ -568,7 +586,7 @@ std::string DirectApiProtocol::Chat(const DirectApiConfig& cfg, const std::strin
             cJSON_AddItemToArray(messages, m);
         };
         add("system", build_system(with_tools));
-        // 历史只存文字；这一轮如果拍了照，用户消息改成"文字 + 图片"的多模态格式
+        // 历史只存文字；进来时就带着照片的话，用户消息改成"文字 + 图片"的多模态格式
         for (size_t i = 0; i < history_.size(); i++) {
             if (i + 1 < history_.size() || image.empty()) {
                 add(history_[i].first, history_[i].second);
@@ -589,7 +607,7 @@ std::string DirectApiProtocol::Chat(const DirectApiConfig& cfg, const std::strin
             cJSON_AddItemToArray(messages, m);
             ESP_LOGI(TAG, "Sending image (%u bytes JPEG) with question", (unsigned)image.size());
         }
-        // 设备端 MCP 工具 → OpenAI function calling；带图的请求走视觉模型，不带 tools
+        // 设备端 MCP 工具 → OpenAI function calling；拍照工具在板子上有自己的定义
         if (with_tools) {
             cJSON* tools = cJSON_Parse(McpServer::GetInstance()
                                            .GetOpenAiToolsJson({"self.camera.take_photo"})
@@ -608,11 +626,11 @@ std::string DirectApiProtocol::Chat(const DirectApiConfig& cfg, const std::strin
     std::string reply;
     for (int round = 0; round < 4 && reply.empty(); round++) {
         char* json = cJSON_PrintUnformatted(req);
-        auto http = NewHttp(ep.key);
+        auto http = NewHttp(ep->key);
         http->SetHeader("Content-Type", "application/json");
         http->SetContent(std::string(json));
         cJSON_free(json);
-        if (!http->Open("POST", ep.url + "/chat/completions")) {
+        if (!http->Open("POST", ep->url + "/chat/completions")) {
             cJSON_Delete(req);
             history_.pop_back();
             SetError("大模型连接失败");
@@ -657,6 +675,7 @@ std::string DirectApiProtocol::Chat(const DirectApiConfig& cfg, const std::strin
         ESP_LOGI(TAG, "LLM wants %d tool call(s)", cJSON_GetArraySize(tool_calls));
         cJSON* msgs = cJSON_GetObjectItem(req, "messages");
         cJSON_AddItemToArray(msgs, cJSON_Duplicate(message, true));
+        std::string photo_question;  // 非空表示模型调了看摄像头，等照片编好补给它
         cJSON* tc = nullptr;
         cJSON_ArrayForEach(tc, tool_calls) {
             auto id = cJSON_GetObjectItem(tc, "id");
@@ -666,6 +685,14 @@ std::string DirectApiProtocol::Chat(const DirectApiConfig& cfg, const std::strin
             if (!cJSON_IsString(id) || !cJSON_IsString(fname)) {
                 ESP_LOGW(TAG, "Malformed tool_call, skipping");
                 break;
+            }
+            if (strcmp(fname->valuestring, "self.camera.look") == 0) {
+                photo_question = kDefaultImageQuestion;
+                if (cJSON_IsString(fargs)) {
+                    CJsonUniquePtr args(cJSON_Parse(fargs->valuestring));
+                    cJSON* q = args ? cJSON_GetObjectItem(args.get(), "question") : nullptr;
+                    if (cJSON_IsString(q) && q->valuestring[0]) photo_question = q->valuestring;
+                }
             }
             std::string result = McpServer::GetInstance().CallToolLocal(
                 fname->valuestring, cJSON_IsString(fargs) ? fargs->valuestring : "{}");
@@ -677,6 +704,32 @@ std::string DirectApiProtocol::Chat(const DirectApiConfig& cfg, const std::strin
             cJSON_AddItemToArray(msgs, tr);
         }
         cJSON_Delete(root);
+        // 模型想看摄像头：等拍照任务编出 JPEG（不占主循环），补一条带图的用户消息，换视觉模型再问
+        if (!photo_question.empty()) {
+            std::string jpeg;
+            for (int i = 0; i < 160 && !cancel_; i++) {
+                jpeg = TakePendingImage();
+                if (!jpeg.empty()) break;
+                vTaskDelay(pdMS_TO_TICKS(50));  // 最多等 8 秒
+            }
+            if (jpeg.empty()) {
+                ESP_LOGW(TAG, "Photo did not arrive in time");
+                append_user_message(req, "（这次没有拍到画面，跟主人说一声吧）", "");
+            } else {
+                image = std::move(jpeg);
+                ep = &cfg.vision;
+                ESP_LOGI(TAG, "Sending photo (%u bytes JPEG): %s", (unsigned)image.size(),
+                         photo_question.c_str());
+                append_user_message(req, photo_question, image);
+            }
+            // 视觉模型不一定支持 function calling，这轮别再把 tools 发过去
+            cJSON_DeleteItemFromObject(req, "tools");
+            if (cancel_) {
+                history_.pop_back();
+                cJSON_Delete(req);
+                return "";
+            }
+        }
         // 下一轮带着 tool 结果重新请求
     }
     cJSON_Delete(req);
@@ -917,7 +970,6 @@ static int PostStatus(Http& http, const std::string& url) {
     return status ? *status : 0;
 }
 
-std::function<std::string()> DirectApiProtocol::image_provider;
 std::string DirectApiProtocol::face_prompt;
 std::function<bool(const std::string&, std::string&)> DirectApiProtocol::face_handler;
 

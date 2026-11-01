@@ -58,11 +58,8 @@ public:
     // 用当前配置试调一次大模型和语音合成，返回给人看的结果（会阻塞几秒）
     static std::string SelfTest();
 
-    // 附上一张 JPEG，下一轮提问时和问题一起发给大模型（多模态）；没说话就默认问看到了什么
+    // 收一张拍好的 JPEG（self.camera.look 的拍照任务放进来的），这一轮的请求会带上它发给视觉模型
     static void AttachImage(std::string jpeg);
-
-    // 视觉模式：设了它，每轮提问时调用它拍一张（返回 JPEG，空串表示这轮不带图）
-    static std::function<std::string()> image_provider;
 
     // 表情脚本（板子支持才设置）：face_prompt 加进系统提示词；回复里的 <face>…</face> 交给 face_handler 播放
     static std::string face_prompt;

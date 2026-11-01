@@ -3,6 +3,7 @@
 #ifndef DIRECT_API_CONFIG_SERVER_H
 #define DIRECT_API_CONFIG_SERVER_H
 
+#include <functional>
 #include <string>
 
 namespace DirectApiConfigServer {
@@ -12,6 +13,9 @@ std::string Start();
 
 // 最近一次 Start() 得到的访问地址
 const std::string& Url();
+
+// 调试：设置了它，GET /cam.jpg 返回一张摄像头 JPEG（?raw=1 返回送编码器前的原始 RGB565 帧）
+extern std::function<std::string(bool raw)> debug_capture;
 
 }  // namespace DirectApiConfigServer
 
