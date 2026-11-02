@@ -11,6 +11,7 @@
 #include "direct_api_config_server.h"
 #include "direct_api_protocol.h"
 #endif
+#include "nomi_clock.h"
 #include "nomi_display.h"
 #include "nomi_ui.h"
 #include "power_save_timer.h"
@@ -52,6 +53,7 @@ private:
     bool camera_ready_ = false;  // 摄像头初始化成功（采集平时停着，抓拍时才开）
     std::atomic<bool> sleeping_{false};
     bool holding_ = false;     // BOOT 键按住说话中
+    bool alarm_press_ = false;  // 这次按 BOOT 键是为了关闹钟：松开、单击都不再当说话
     esp_timer_handle_t dim_timer_ = nullptr;  // 睡着一会儿后调暗屏幕
 
     // ES8311、GT911、摄像头 SCCB 共用这条总线
@@ -302,6 +304,12 @@ private:
     void InitializeButtons() {
         boot_button_.OnPressDown([this]() {
             power_save_timer_->WakeUp();
+            // 闹钟在响：按一下就是关掉它
+            alarm_press_ = NomiClock::GetInstance().IsRinging();
+            if (alarm_press_) {
+                NomiClock::GetInstance().StopRinging();
+                return;
+            }
             auto& app = Application::GetInstance();
             if (HoldToTalk() && app.GetDeviceState() != kDeviceStateStarting) {
                 holding_ = true;
@@ -315,6 +323,7 @@ private:
             }
         });
         boot_button_.OnClick([this]() {
+            if (alarm_press_) return;
             auto& app = Application::GetInstance();
             if (app.GetDeviceState() == kDeviceStateStarting) {
                 EnterWifiConfigMode();
@@ -345,7 +354,19 @@ private:
                                }
                                return std::string("正在表演");
                            });
+        // 时钟页：闹钟、倒计时提醒、天气城市
+        auto& clock = NomiClock::GetInstance();
+        clock.RegisterTools();
+        clock.on_ring_start = [this](const std::string& time, const std::string& label) {
+            power_save_timer_->WakeUp();  // 睡着 / 息屏也要亮起来
+            GetBacklight()->RestoreBrightness();
+            display_->ShowAlarm(time, label);
+        };
+        clock.on_ring_stop = [this]() { display_->HideAlarm(); };
 #if CONFIG_DIRECT_API
+        // 每轮对话的系统提示词里带上现在几点、天气、已设的闹钟（设"明早 7 点"要知道今天是哪天）
+        DirectApiProtocol::context_provider = []() { return NomiClock::GetInstance().PromptContext(); };
+        DirectApiConfigServer::on_city_changed = []() { NomiClock::GetInstance().RefreshWeather(); };
         DirectApiProtocol::face_prompt = NomiDisplay::FacePrompt();
         DirectApiProtocol::face_handler = [this](const std::string& json, std::string& error) {
             return display_->PlayFace(json, error);
@@ -386,6 +407,7 @@ public:
         InitializeCamera();
         InitializeButtons();
         InitializeTools();
+        NomiClock::GetInstance().Start();  // 时区、闹钟；联网后自己对时、拉天气
         GetBacklight()->RestoreBrightness();
     }
 

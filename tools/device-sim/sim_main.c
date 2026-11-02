@@ -54,7 +54,7 @@ static void dev_log(char level, const char *tag, const char *fmt, ...)
 
 /* ---------- 网页那一面传进来的文字 ---------- */
 
-enum { TEXT_WIFI_SSID, TEXT_CONFIG_URL, TEXT_IP, TEXT_AP_URL, TEXT_AP_SSID, TEXT_VOICES, TEXT_SAVED_WIFI, TEXT_COUNT };
+enum { TEXT_WIFI_SSID, TEXT_CONFIG_URL, TEXT_IP, TEXT_AP_URL, TEXT_AP_SSID, TEXT_VOICES, TEXT_SAVED_WIFI, TEXT_CITY, TEXT_COUNT };
 static char s_str[4096];  // JS 先把 UTF-8 写进这里，再调 sim_set_text / sim_turn_* / sim_face_play 等
 static char s_text[TEXT_COUNT][400];  // 已存 Wi-Fi 列表最长 10 × 33 字节
 
@@ -102,7 +102,7 @@ static void set_recording(bool on)
 // 设置项存在内存里，刷新页面就没了
 static int s_talk_key, s_aec, s_subtitles = 1, s_persona, s_voice = 4, s_dim = 1, s_off = 1;
 static int s_volume = 70, s_brightness = 80;
-static int s_one_shot;  // 一问一答
+static int s_one_shot, s_sleep_show;  // 一问一答、睡着时显示（0 时钟 1 表情）
 static int s_speak = 1;  // 语音播报（静音模式）：真值在 serve.py 的设备存储里，改了经 JS 写回去
 
 /* ---------- 聊天历史（对应 NomiDisplay::AddChatMessage） ---------- */
@@ -489,6 +489,143 @@ static void advance(void)
     }
 }
 
+/* ---------- 时钟页（对应 NomiClock）：时间由 JS 每帧给，天气是假的，闹钟只记在内存里 ---------- */
+
+static double s_local_time;  // 本地时间的 epoch 秒（JS 换算好时区），0 表示还没对上时间
+typedef struct {
+    int id;
+    double at;  // 本地 epoch 秒（只响一次）
+    int hm;     // 每天几点（分钟数），-1 表示只响一次
+    char label[64];
+} sim_alarm_t;
+static sim_alarm_t s_alarms[10];
+static int s_alarm_n, s_alarm_next_id = 1;
+static char s_ring_label[64];
+
+static void alarm_add(double seconds, const char *label, int hm)
+{
+    if (s_alarm_n >= 10 || s_local_time <= 0) return;
+    sim_alarm_t *a = &s_alarms[s_alarm_n++];
+    a->id = s_alarm_next_id++;
+    a->hm = hm;
+    a->at = s_local_time + seconds;
+    snprintf(a->label, sizeof(a->label), "%s", label ? label : "");
+    dev_log('I', "NomiClock", "Alarm #%d added", a->id);
+}
+
+static void alarm_delete(int id)
+{
+    for (int i = 0; i < s_alarm_n; i++) {
+        if (s_alarms[i].id == id || id == 0) {
+            memmove(&s_alarms[i], &s_alarms[i + 1], (s_alarm_n - i - 1) * sizeof(s_alarms[0]));
+            s_alarm_n--;
+            i--;
+        }
+    }
+}
+
+static double alarm_next(const sim_alarm_t *a)
+{
+    if (a->hm < 0) return a->at;
+    double t = floor(s_local_time / 86400) * 86400 + a->hm * 60;
+    return t > s_local_time ? t : t + 86400;
+}
+
+static const char *clock_text(const char *key)
+{
+    static char buf[600];
+    static const char *const week[] = {"日", "一", "二", "三", "四", "五", "六"};
+    if (s_local_time <= 0) return "";
+    long long t = (long long)s_local_time;
+    int day = (int)(t / 86400), sec = (int)(t % 86400);
+    int wday = (day + 4) % 7;  // 1970-01-01 是周四
+    if (!strcmp(key, "clock_time")) {
+        snprintf(buf, sizeof(buf), "%02d:%02d", sec / 3600, sec / 60 % 60);
+        return buf;
+    }
+    if (!strcmp(key, "clock_date")) {
+        // 天数换公历（Howard Hinnant 的 civil_from_days）
+        int z = day + 719468, era = z / 146097, doe = z - era * 146097;
+        int yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+        int doy = doe - (365 * yoe + yoe / 4 - yoe / 100), mp = (5 * doy + 2) / 153;
+        int d = doy - (153 * mp + 2) / 5 + 1, m = mp < 10 ? mp + 3 : mp - 9;
+        snprintf(buf, sizeof(buf), "%d月%d日 星期%s", m, d, week[wday]);
+        return buf;
+    }
+    if (!strcmp(key, "weather_temp")) return "24°";
+    if (!strcmp(key, "weather_text")) {
+        snprintf(buf, sizeof(buf), "多云 · %s  21~27°", s_text[TEXT_CITY][0] ? s_text[TEXT_CITY] : "深圳（模拟）");
+        return buf;
+    }
+    if (!strcmp(key, "alarms")) {
+        int order[10];  // 按下次响的时间排
+        for (int i = 0; i < s_alarm_n; i++) order[i] = i;
+        for (int i = 1; i < s_alarm_n; i++) {
+            for (int j = i; j > 0 && alarm_next(&s_alarms[order[j]]) < alarm_next(&s_alarms[order[j - 1]]); j--) {
+                int tmp = order[j];
+                order[j] = order[j - 1];
+                order[j - 1] = tmp;
+            }
+        }
+        size_t len = 0;
+        buf[0] = '\0';
+        for (int i = 0; i < s_alarm_n && len < sizeof(buf) - 100; i++) {
+            const sim_alarm_t *a = &s_alarms[order[i]];
+            long long at = (long long)alarm_next(a);
+            int days = (int)(at / 86400) - day, s = (int)(at % 86400);
+            const char *when = days == 0 ? "今天" : days == 1 ? "明天" : "后天";
+            len += snprintf(buf + len, sizeof(buf) - len, "%s%d\t%s %02d:%02d%s\t%s", len ? "\n" : "", a->id, when,
+                            s / 3600, s / 60 % 60, a->hm >= 0 ? " · 每天" : "", a->label);
+        }
+        return buf;
+    }
+    return "";
+}
+
+// 每秒查一次有没有到点的闹钟（NomiClock::CheckAlarms）
+static void check_alarms(void)
+{
+    static long long last_sec, last_min;
+    long long sec = (long long)s_local_time, min = sec / 60;
+    if (s_local_time <= 0 || sec == last_sec) return;
+    last_sec = sec;
+    bool new_minute = min != last_min;
+    last_min = min;
+    for (int i = 0; i < s_alarm_n; i++) {
+        sim_alarm_t *a = &s_alarms[i];
+        bool fire = a->hm < 0 ? a->at <= s_local_time : new_minute && a->hm == (int)(sec % 86400 / 60);
+        if (!fire) continue;
+        char t[8];
+        snprintf(t, sizeof(t), "%02d:%02d", (int)(sec % 86400 / 3600), (int)(sec / 60 % 60));
+        snprintf(s_ring_label, sizeof(s_ring_label), "%s", a->label);
+        dev_log('I', "NomiClock", "Alarm %s %s", t, a->label);
+        if (a->hm < 0) {
+            alarm_delete(a->id);
+            i--;
+        }
+        wake();
+        nomi_ui_alarm_show(t, s_ring_label);
+    }
+}
+
+// JS 每帧给一次本地时间（epoch 秒，已按时区换算）。设备要连上路由器、SNTP 对过时才有时间，
+// 对过一次之后断网也还准
+void sim_set_time(double local_seconds)
+{
+    static bool synced;
+    if (s_net == NET_STA && s_stage == STAGE_READY) synced = true;
+    s_local_time = synced ? local_seconds : 0;
+}
+
+// 调试面板：加两个闹钟（1 分钟后的提醒、每天 7 点），或者 2 秒后响一个
+void sim_alarm_demo(void)
+{
+    alarm_add(60, "喝水", -1);
+    alarm_add(0, "起床", 7 * 60);
+}
+
+void sim_alarm_ring(void) { alarm_add(2, "开会", -1); }
+
 /* ---------- nomi_ui 回调（对应 NomiDisplay） ---------- */
 
 static nomi_state_t get_state(void)
@@ -515,6 +652,8 @@ static int get_int(const char *key, int def)
     if (!strcmp(key, NOMI_KEY_DIM)) return s_dim;
     if (!strcmp(key, NOMI_KEY_OFF)) return s_off;
     if (!strcmp(key, NOMI_KEY_ONE_SHOT)) return s_one_shot;
+    if (!strcmp(key, NOMI_KEY_SLEEP_SHOW)) return s_sleep_show;
+    if (!strcmp(key, "weather_code")) return s_local_time > 0 ? 2 : -1;  // 假天气：多云
     return def;
 }
 
@@ -535,6 +674,7 @@ static void set_int(const char *key, int value, bool final)
     else if (!strcmp(key, NOMI_KEY_DIM)) s_dim = value;
     else if (!strcmp(key, NOMI_KEY_OFF)) s_off = value;
     else if (!strcmp(key, NOMI_KEY_ONE_SHOT)) s_one_shot = value;
+    else if (!strcmp(key, NOMI_KEY_SLEEP_SHOW)) s_sleep_show = value;
 }
 
 // GetText：没连上路由器时 Wi-Fi、IP 都是空的；设置页地址协议启动后才有
@@ -556,12 +696,20 @@ static const char *get_text(const char *key)
     if (!strcmp(key, "ip")) return online ? s_text[TEXT_IP] : "";
     if (!strcmp(key, "config_url")) return online && s_stage == STAGE_READY ? s_text[TEXT_CONFIG_URL] : "";
     if (!strcmp(key, "version")) return "Pocket Companion " FW_VERSION "（模拟器）";
-    return "";
+    if (!strcmp(key, "weather_city")) return s_text[TEXT_CITY];
+    return clock_text(key);
 }
 
 static void action(const char *name)
 {
-    if (!strcmp(name, "toggle_listen")) {
+    if (!strcmp(name, "alarm_stop") || !strcmp(name, "alarm_snooze")) {
+        // NomiClock::StopRinging / Snooze：稍后提醒就是 5 分钟后再加一个
+        if (!strcmp(name, "alarm_snooze")) alarm_add(5 * 60, s_ring_label, -1);
+        dev_log('I', "NomiClock", "%s", name);
+        nomi_ui_alarm_hide();
+    } else if (!strncmp(name, "alarm_delete:", 13)) {
+        alarm_delete(atoi(name + 13));
+    } else if (!strcmp(name, "toggle_listen")) {
         // 屏幕上的“连续聆听”开关：待机点开 = 点一下 BOOT 开始；聆听 / 说话中点关 = 退出对话
         if (s_stage != STAGE_READY) return;
         if (s_chat == CHAT_IDLE) start_chat();
@@ -686,6 +834,7 @@ int sim_frame(uint32_t ms)
     advance_boot();
     advance_station();
     advance();
+    check_alarms();
     lv_timer_handler();
     return s_dx1 > s_dx0 ? (s_dx1 - s_dx0) * (s_dy1 - s_dy0) : 0;
 }

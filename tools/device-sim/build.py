@@ -31,6 +31,8 @@ EXPORTS = [
     "sim_turn_emotion", "sim_tts_start", "sim_tts_sentence", "sim_tts_stop", "sim_turn_error", "sim_apply",
     # 表情脚本
     "sim_face_play",
+    # 时钟页：本地时间、闹钟调试
+    "sim_set_time", "sim_alarm_demo", "sim_alarm_ring",
 ]
 
 
@@ -69,7 +71,8 @@ def main():
     write_device_widgets()
     lvgl = lvgl_dir()
     sources = sorted(str(p) for p in (lvgl / "src").rglob("*.c"))
-    sources += [str(HERE / "sim_main.c"), *(str(BOARD / f) for f in ("nomi_ui.c", "face.c", "face_script.c", "raster.c"))]
+    sources += [str(HERE / "sim_main.c"), *(str(BOARD / f) for f in ("nomi_ui.c", "face.c", "face_script.c", "raster.c",
+                                                                    "nomi_font_clock_120.c", "nomi_font_weather_36.c"))]
     sources.append(str(CJSON / "cJSON.c"))
     sources.append(str(FONTS / "src" / "cbin_font.c"))
     shutil.copyfile(FONTS / "cbin" / FONT_BIN, HERE / FONT_BIN)

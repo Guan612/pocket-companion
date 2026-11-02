@@ -55,7 +55,7 @@ MAX_SAVED_WIFI = 10  # esp-wifi-connect SsidManager 的 MAX_WIFI_SSID_COUNT
 
 def empty_settings():
     return {"providers": [], "keys": {}, "roles": {r: {"p": "", "m": ""} for r in ROLES},
-            "asr_lang": "", "tts_voice": "", "tts_voices": [], "tts_speak": True, "prompt": ""}
+            "asr_lang": "", "tts_voice": "", "tts_voices": [], "tts_speak": True, "prompt": "", "city": ""}
 
 
 def voice_labels():
@@ -595,8 +595,9 @@ class SimHandler(Handler):
                 saved = list(nvs["wifi"])
                 net["ssid"] = wifi  # 模拟器开机连存储里第一个
                 speak = bool(nvs["directapi"].get("tts_speak", True))
+                city = nvs["directapi"].get("city", "")
             return self.send(200, {"wifi_ssid": wifi, "saved_wifi": saved, "api_ok": api_complete(), "ap_ssid": AP_SSID,
-                                   "env": env, "voices": voice_labels(), "speak": speak, **urls})
+                                   "env": env, "voices": voice_labels(), "speak": speak, "city": city, **urls})
         if u.path == "/sim/events":
             since = int(parse_qs(u.query).get("since", ["0"])[0])
             with lock:
@@ -770,7 +771,7 @@ class StaHandler(Handler):
                 roles["tts"]["voice"] = c["tts_voice"]
                 roles["tts"]["speak"] = bool(c.get("tts_speak", True))
                 data = {"providers": [{**p, "has_key": bool(c["keys"].get(p["id"]))} for p in c["providers"]],
-                        "roles": roles, "prompt": c["prompt"], "memory_md": nvs["memory"],
+                        "roles": roles, "prompt": c["prompt"], "city": c.get("city", ""), "memory_md": nvs["memory"],
                         "limits": {"providers": MAX_PROVIDERS, "models": MAX_MODELS, "memory": MEMORY_MAX_BYTES}}
             return self.send(200, data)
         if u.path == "/wifi.json":
@@ -871,11 +872,13 @@ class StaHandler(Handler):
             if isinstance((roles_in.get("tts") or {}).get("speak"), bool):  # 旧页面不带就不动
                 c["tts_speak"] = roles_in["tts"]["speak"]
             c["prompt"] = str(req.get("prompt", ""))
+            if isinstance(req.get("city"), str) and len(req["city"].encode()) <= 60:  # 旧页面不带就不动
+                c["city"] = req["city"]
             nvs["memory"] = memory
             save_nvs()
         ok = api_complete()
         print(f"设置页：已保存 {len(providers)} 个供应商（{'可以对话了' if ok else '对话 / 语音识别 / 语音合成还没选全'}）")
-        push_event("settings_saved", api_ok=ok, voices=voice_labels())
+        push_event("settings_saved", api_ok=ok, voices=voice_labels(), city=nvs["directapi"].get("city", ""))
         self.send(200, {"ok": True})
 
     def models(self, req):

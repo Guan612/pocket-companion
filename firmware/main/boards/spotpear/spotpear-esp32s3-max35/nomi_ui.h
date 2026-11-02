@@ -1,4 +1,4 @@
-// Nomi 界面：两种页面（表情 / 历史对话）左右滑切换，顶部下拉打开设置。
+// Nomi 界面：三页（历史对话 / 表情 / 时钟）左右滑切换，顶部下拉打开设置。
 //
 // 说话靠 BOOT 键和唤醒词，触摸只负责切模式、开设置和叫醒。
 // 只依赖 LVGL 和 face.c，设备（NomiDisplay）和浏览器模拟器（tools/device-sim）共用同一份代码。
@@ -37,6 +37,7 @@ typedef enum {
 #define NOMI_KEY_VOICE "voice"            // voices 列表里的下标，-1 为自定义
 #define NOMI_KEY_DIM "dim"                // NOMI_DIM_SECONDS 的下标
 #define NOMI_KEY_OFF "off"                // NOMI_OFF_SECONDS 的下标
+#define NOMI_KEY_SLEEP_SHOW "sleep_show"  // 睡着时显示：0 时钟页，1 表情（还没对上时间时总是表情）
 #define NOMI_KEY_ONE_SHOT "one_shot"      // 一问一答：1 = 回答完一句就回待机，0 = 连续对话（默认）
 
 // 多久后调暗 / 息屏，-1 表示从不；设置页的选项和这里一一对应
@@ -51,9 +52,14 @@ typedef struct {
     void (*set_int)(const char *key, int value, bool final);
     // 只读文字：personas、voices（'\n' 分隔）、wifi（带信号）、wifi_ssid、ip、config_url、version、
     // saved_wifi（已存的 Wi-Fi，'\n' 分隔）、hotspot / hotspot_url（配网热点名和网址，不在配网模式时为空）。
+    // 时钟页：clock_time（"14:32"，没对上时间为空）、clock_date、weather_temp（"26°"）、
+    // weather_text（"多云 · 深圳  23~32°"，城市没找到时是提示）、weather_city（设的城市，空 = 自动）、
+    // alarms（接下来要响的闹钟，按时间排，一行一个 "编号\t什么时候\t事由"）。
+    // get_int("weather_code") 是 WMO 天气代码，夜里加 1000，没有天气时 -1。
     // 不认识的 key 返回空串
     const char *(*get_text)(const char *key);
-    // 动作：test_api、reconfigure_wifi、factory_reset
+    // 动作：test_api、reconfigure_wifi、factory_reset、alarm_stop / alarm_snooze（响铃时"知道了" /
+    // "稍后提醒"）、alarm_delete:<编号>（时钟页上删闹钟）
     void (*action)(const char *name);
     // 聊天历史（第二页）：下标 0 最旧；role 为 "user" / "assistant"，文本只需在下一次调用前有效
     int (*history_count)(void);
@@ -79,6 +85,10 @@ void nomi_ui_notify(const char *text, uint32_t duration_ms);
 void nomi_ui_set_sleep(bool sleeping);
 // 右上角电量；level < 0 表示没有电池信息，隐藏
 void nomi_ui_set_battery(int level, bool charging);
+
+// 闹钟响了：盖住整屏显示时间和事由，带"知道了""稍后提醒"两个按钮（点了走 action）
+void nomi_ui_alarm_show(const char *time, const char *label);
+void nomi_ui_alarm_hide(void);
 
 // 播放一段表情脚本（JSON，格式见 face_script.h）；不合格返回 false，原因写进 err
 bool nomi_ui_play_face(const char *json, char *err, size_t err_size);

@@ -90,6 +90,12 @@ button:disabled{opacity:.5}
   <div class="row"><button id="wifiAdd">添加 / 更新密码</button><span id="wifiMsg" class="hint"></span></div>
 </div>
 
+<h2>天气</h2>
+<div class="card">
+  <label>城市<input id="wx_city" maxlength="20" autocomplete="off" placeholder="留空按网络位置自动判断，比如：深圳"></label>
+  <p class="hint">时钟页显示这个城市的天气，问它天气也按这里。也可以直接跟它说「我在深圳」。</p>
+</div>
+
 <h2>人设提示词</h2>
 <textarea id="prompt" rows="4" placeholder="留空用默认提示词"></textarea>
 
@@ -329,7 +335,7 @@ $('#save').onclick = async () => {
   const body = {
     providers: cfg.providers.map(p => ({id: p.id, name: p.name, preset: p.preset, url: p.url, models: p.models, key: p.key || ''})),
     roles: {...cfg.roles, asr: {...cfg.roles.asr, lang: $('#asr_lang').value.trim()}, tts: {...cfg.roles.tts, voice, voices, speak: $('#tts_speak').checked}},
-    prompt: $('#prompt').value, memory_md: $('#memory').value,
+    prompt: $('#prompt').value, memory_md: $('#memory').value, city: $('#wx_city').value.trim(),
   };
   $('#save').disabled = true; msg('保存中…');
   try {
@@ -389,6 +395,7 @@ async function load() {
   $('#tts_voice').value = c.roles.tts.voice || '';
   $('#tts_speak').checked = c.roles.tts.speak !== false;
   $('#prompt').value = c.prompt || '';
+  $('#wx_city').value = c.city || '';
   $('#memory').value = c.memory_md || '';
   memSize();
   renderPresets();

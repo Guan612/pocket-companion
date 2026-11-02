@@ -66,6 +66,8 @@ public:
     // 表情脚本（板子支持才设置）：face_prompt 加进系统提示词；回复里的 <face>…</face> 交给 face_handler 播放
     static std::string face_prompt;
     static std::function<bool(const std::string& json, std::string& error)> face_handler;
+    // 板子补进系统提示词的当下信息（现在几点、天气、已设的闹钟），每轮请求前取一次
+    static std::function<std::string()> context_provider;
 
     // 正在"思考"：一句话录完（已停止收音）到开口说话之间——识别、大模型、工具调用、拍照都在这段。
     // 设备状态这时仍是聆听（自动模式）或待机（松键后），屏幕靠它显示"思考中"

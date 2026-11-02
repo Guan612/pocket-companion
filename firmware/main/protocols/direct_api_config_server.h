@@ -17,6 +17,9 @@ const std::string& Url();
 // 停掉设置页（进配网模式前：配网热点的网页也要用 80 端口）。之后可以再 Start()
 void Stop();
 
+// 保存时天气城市变了（板子用它马上重新查天气）
+extern std::function<void()> on_city_changed;
+
 }  // namespace DirectApiConfigServer
 
 #endif  // DIRECT_API_CONFIG_SERVER_H

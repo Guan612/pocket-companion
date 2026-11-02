@@ -5,6 +5,7 @@
 #include "display/lvgl_display/lvgl_font.h"
 #include "display/lvgl_display/lvgl_theme.h"
 #include "face_script.h"
+#include "nomi_clock.h"
 #include "nomi_ui.h"
 #include "settings.h"
 #include "wifi_board.h"
@@ -24,6 +25,7 @@
 #include <wifi_manager.h>
 
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -164,6 +166,7 @@ int GetInt(const char* key, int def) {
         // 一问一答由直连协议在每轮说完时读，存在它的命名空间里
         return Settings(kDirectApiNs).GetString("one_shot") == "1";
     }
+    if (!strcmp(key, "weather_code")) return NomiClock::GetInstance().WeatherCode();
     if (!strcmp(key, NOMI_KEY_PERSONA)) {
         // 按当前提示词反查是哪个预设；网页里改过就算自定义
         std::string prompt = Settings(kDirectApiNs).GetString("prompt");
@@ -274,13 +277,31 @@ const char* GetText(const char* key) {
 #endif
     } else if (!strcmp(key, "version")) {
         text = std::string("Pocket Companion ") + esp_app_get_description()->version;
+    } else if (!strcmp(key, "clock_time")) {
+        text = NomiClock::GetInstance().TimeText();
+    } else if (!strcmp(key, "clock_date")) {
+        text = NomiClock::GetInstance().DateText();
+    } else if (!strcmp(key, "weather_temp")) {
+        text = NomiClock::GetInstance().WeatherTemp();
+    } else if (!strcmp(key, "weather_text")) {
+        text = NomiClock::GetInstance().WeatherText();
+    } else if (!strcmp(key, "weather_city")) {
+        text = NomiClock::GetInstance().WeatherCity();
+    } else if (!strcmp(key, "alarms")) {
+        text = NomiClock::GetInstance().AlarmsText();
     }
     return text.c_str();
 }
 
 void Action(const char* name) {
     auto& app = Application::GetInstance();
-    if (!strcmp(name, "reconfigure_wifi")) {
+    if (!strcmp(name, "alarm_stop")) {
+        NomiClock::GetInstance().StopRinging();
+    } else if (!strcmp(name, "alarm_snooze")) {
+        NomiClock::GetInstance().Snooze();
+    } else if (!strncmp(name, "alarm_delete:", 13)) {
+        NomiClock::GetInstance().DeleteAlarm(atoi(name + 13));
+    } else if (!strcmp(name, "reconfigure_wifi")) {
         app.Schedule([]() { static_cast<WifiBoard&>(Board::GetInstance()).EnterWifiConfigMode(); });
     } else if (!strcmp(name, "factory_reset")) {
         app.Schedule([]() {
@@ -501,4 +522,16 @@ void NomiDisplay::SetSleep(bool sleeping) {
     if (!ui_ready_) return;
     DisplayLockGuard lock(this);
     nomi_ui_set_sleep(sleeping);
+}
+
+void NomiDisplay::ShowAlarm(const std::string& time, const std::string& label) {
+    if (!ui_ready_) return;
+    DisplayLockGuard lock(this);
+    nomi_ui_alarm_show(time.c_str(), label.c_str());
+}
+
+void NomiDisplay::HideAlarm() {
+    if (!ui_ready_) return;
+    DisplayLockGuard lock(this);
+    nomi_ui_alarm_hide();
 }

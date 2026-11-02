@@ -109,6 +109,7 @@ esp_err_t HandleConfig(httpd_req_t* req) {
     cJSON_AddStringToObject(tts_role, "voice", s.GetString(kTtsVoice).c_str());
     cJSON_AddBoolToObject(tts_role, "speak", s.GetString(kTtsSpeak) != "0");
     cJSON_AddStringToObject(root, "prompt", s.GetString(kPrompt).c_str());
+    cJSON_AddStringToObject(root, "city", s.GetString(kWeatherCity).c_str());
     cJSON_AddStringToObject(root, "memory_md", LongTermMemory::Get().c_str());
     cJSON* limits = cJSON_AddObjectToObject(root, "limits");
     cJSON_AddNumberToObject(limits, "providers", kMaxProviders);
@@ -201,8 +202,16 @@ esp_err_t HandleSave(httpd_req_t* req) {
     cJSON* speak = cJSON_GetObjectItem(cJSON_GetObjectItem(roles, "tts"), "speak");
     if (cJSON_IsBool(speak)) s.SetString(kTtsSpeak, cJSON_IsTrue(speak) ? "1" : "0");
     s.SetString(kPrompt, JsonString(root, "prompt"));
+    // 天气城市；不带这个字段的旧页面提交时不改它
+    cJSON* city = cJSON_GetObjectItem(root, "city");
+    bool city_changed = false;
+    if (cJSON_IsString(city) && strlen(city->valuestring) <= 60 && s.GetString(kWeatherCity) != city->valuestring) {
+        s.SetString(kWeatherCity, city->valuestring);
+        city_changed = true;
+    }
     LongTermMemory::Set(memory);
     ESP_LOGI(TAG, "Settings saved (%u providers)", (unsigned)list.size());
+    if (city_changed && DirectApiConfigServer::on_city_changed) DirectApiConfigServer::on_city_changed();
 
     cJSON* ok = cJSON_CreateObject();
     cJSON_AddBoolToObject(ok, "ok", true);
@@ -350,6 +359,8 @@ std::string DeviceIp() {
 }  // namespace
 
 namespace DirectApiConfigServer {
+
+std::function<void()> on_city_changed;
 
 std::string Start() {
     if (s_server == nullptr) {

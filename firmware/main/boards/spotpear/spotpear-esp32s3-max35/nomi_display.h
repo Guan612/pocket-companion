@@ -26,6 +26,9 @@ public:
 
     // 由板子的休眠计时器调用
     void SetSleep(bool sleeping);
+    // 闹钟响铃：整屏提醒（NomiClock 经板子调过来）
+    void ShowAlarm(const std::string& time, const std::string& label);
+    void HideAlarm();
 
     // 表情脚本（JSON，格式见 face_script.h）：大模型回复里的 <face> 和 self.face.play 工具都走这里
     bool PlayFace(const std::string& json, std::string& error);

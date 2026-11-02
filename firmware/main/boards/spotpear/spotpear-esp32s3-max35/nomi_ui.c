@@ -21,26 +21,44 @@
 #define C_ACCENT 0x6aa6ff
 #define C_DANGER 0xff6b6b
 #define C_PAGE 0x111318
+#define C_WARM 0xffc857  // 太阳、闪电、闹钟铃铛
+
+#define CLOCK_REFRESH_MS 1000  // 时钟页多久对一次时间、天气、闹钟（文字没变就不重画）
+#define DOTS_SHOW_MS 2500      // 翻页后页码小圆点留多久
+
+// 时钟页的大数字和天气图标（lv_font_conv 从 LVGL 自带的 Montserrat / FontAwesome 生成，见文件头）
+LV_FONT_DECLARE(nomi_font_clock_120);
+LV_FONT_DECLARE(nomi_font_weather_36);
 
 static nomi_ui_callbacks_t s_cb;
 static const lv_font_t *s_font;
 static uint16_t *s_buf;
 
-// 页面结构：外层上下翻（设置 / 主界面），主界面里左右翻（表情 / 历史对话），状态栏和字幕浮在主界面上
+// 页面结构：外层上下翻（设置 / 主界面），主界面里左右翻（历史对话 / 表情 / 时钟），
+// 状态栏、字幕和页码小圆点浮在主界面上
+enum { PAGE_HIST, PAGE_FACE, PAGE_CLOCK, PAGE_COUNT };
 static lv_obj_t *s_outer, *s_settings_tile, *s_main_tile;
-static lv_obj_t *s_modes, *s_chat_tile, *s_hist_tile;
+static lv_obj_t *s_modes, *s_chat_tile, *s_hist_tile, *s_clock_tile;
 static lv_obj_t *s_canvas, *s_hist_list;
-static lv_obj_t *s_status, *s_battery, *s_subtitle, *s_toast;
+static lv_obj_t *s_status, *s_battery, *s_subtitle, *s_toast, *s_dots;
 static lv_timer_t *s_toast_timer;
 static uint32_t s_last_ms, s_emotion_until;
 static float s_acc;
 static face_mode_t s_emotion_mode = FACE_IDLE;
 static bool s_sleeping, s_subtitles_on = true;
-static bool s_page_by_code;   // 代码切页面时不当作用户操作
-static bool s_hist_was_open;  // 睡着前停在历史页的话，醒来回那里
+static bool s_page_by_code;          // 代码切页面时不当作用户操作
+static int s_page_before_sleep = -1;  // 睡着前停在哪页，醒来回那里
 static bool s_hist_dirty;     // 有新消息，历史页可见时要重建列表
 static nomi_state_t s_last_state = NOMI_STATE_IDLE;
 static uint32_t s_subtitle_hide_at;  // 到这个时刻收起字幕，0 表示不收
+static uint32_t s_dots_until;        // 页码小圆点显示到这个时刻
+// 时钟页
+static lv_obj_t *s_clock_digit[5], *s_clock_date, *s_wx_row, *s_wx_icon, *s_wx_temp, *s_wx_text, *s_alarm_list;
+static uint32_t s_clock_next;    // 下次对时钟页的时刻
+static char s_alarms_shown[512];  // 时钟页上闹钟列表对应的文字，变了才重建
+static lv_obj_t *s_armed_delete;  // 点过一次、等确认的删除按钮
+// 响铃
+static lv_obj_t *s_alarm_layer, *s_alarm_time, *s_alarm_label, *s_alarm_bell;
 // 历史页增量更新：列表里的标签和记录一一对应，只追加新消息、改最后一条、删掉记录头上丢掉的
 static int s_hist_shown;        // 列表里已有几条消息
 static int s_hist_base;         // 上次同步时记录已经从头上丢掉了几条
@@ -73,8 +91,11 @@ static void user_activity(void)
 
 static void show_main(bool anim);
 static void show_page(int page, bool anim);
+static int current_page(void);
 static void on_face_pressed(lv_event_t *e);
 static void sync_history(bool to_bottom);
+static void clock_refresh(bool force);
+static void update_dots(void);
 
 // 二维码用 Nayuki 的 qrcodegen：设备上由小智依赖的 esp_emote_gfx 带进来，模拟器里由 LVGL 带进来。
 // 两份同名，不能同时链接，所以不打开 LVGL 的 qrcode 控件，只声明这里用到的三个函数。
@@ -122,13 +143,21 @@ static bool hist_page_active(void)
 }
 
 // 表情只在看得见、而且没在翻页时才画。屏幕是 40MHz SPI，整屏刷一次要 60ms，表情每帧还要重画
-// 一大块；停在设置 / 历史页、或者手指正在拖页面时还照画，翻页和滚动就会被它拖慢
+// 一大块；停在设置 / 历史 / 时钟页、或者手指正在拖页面时还照画，翻页和滚动就会被它拖慢
 // 注意 tileview 的"当前页"在第一次切页 / 滑动结束前是 NULL，所以只按"停在别的页"判断看不见
 static bool face_visible(void)
 {
     if (lv_tileview_get_tile_active(s_outer) == s_settings_tile) return false;
-    if (lv_tileview_get_tile_active(s_modes) == s_hist_tile) return false;
+    lv_obj_t *tile = lv_tileview_get_tile_active(s_modes);
+    if (tile == s_hist_tile || tile == s_clock_tile) return false;
+    if (s_alarm_layer && !lv_obj_has_flag(s_alarm_layer, LV_OBJ_FLAG_HIDDEN)) return false;
     return !lv_obj_is_scrolling(s_outer) && !lv_obj_is_scrolling(s_modes);
+}
+
+static bool in_conversation(nomi_state_t state)
+{
+    return state == NOMI_STATE_LISTENING || state == NOMI_STATE_THINKING || state == NOMI_STATE_SPEAKING ||
+           state == NOMI_STATE_CONNECTING;
 }
 
 static void face_tick(lv_timer_t *timer)
@@ -160,8 +189,22 @@ static void face_tick(lv_timer_t *timer)
         lv_obj_add_flag(s_subtitle, LV_OBJ_FLAG_HIDDEN);
         s_subtitle_hide_at = 0;
     }
+    // 停在时钟页时叫它说话：翻回表情页（听、想、说的样子都在脸上）
+    if (in_conversation(state) && !in_conversation(s_last_state) && current_page() == PAGE_CLOCK) {
+        show_page(PAGE_FACE, !s_sleeping);
+    }
     s_last_state = state;
 
+    // 时钟页：每秒对一次时间、天气、闹钟（看不见时也对，文字没变就不重画，翻过去时已经是对的）
+    if ((int32_t)(now - s_clock_next) >= 0) {
+        s_clock_next = now + CLOCK_REFRESH_MS;
+        clock_refresh(false);
+    }
+
+    // 页码小圆点：翻页时和翻完后一小会儿显示；有字幕时让开
+    bool dots = (lv_obj_is_scrolling(s_modes) || (int32_t)(s_dots_until - now) > 0) &&
+                lv_obj_has_flag(s_subtitle, LV_OBJ_FLAG_HIDDEN);
+    if (lv_obj_has_flag(s_dots, LV_OBJ_FLAG_HIDDEN) == dots) lv_obj_set_flag(s_dots, LV_OBJ_FLAG_HIDDEN, !dots);
 
     // 来了新消息且正停在历史页：只把新句子补上去（不在拖动列表时做，免得滚动中跳一下）
     if (s_hist_dirty && hist_page_active() && !lv_obj_is_scrolling(s_hist_list)) {
@@ -207,7 +250,7 @@ void nomi_ui_set_font(const lv_font_t *font)
     if (!font) return;
     if (font != s_font) s_settings_sig[0] = '\0';  // 设置页里有几层显式设了字体，下次下拉时重建
     s_font = font;
-    lv_obj_t *roots[] = {s_status, s_subtitle, s_toast, s_settings_tile, s_hist_tile};
+    lv_obj_t *roots[] = {s_status, s_subtitle, s_toast, s_settings_tile, s_hist_tile, s_clock_tile, s_alarm_layer};
     for (size_t i = 0; i < sizeof(roots) / sizeof(roots[0]); i++) {
         if (roots[i]) lv_obj_set_style_text_font(roots[i], font, 0);
     }
@@ -283,7 +326,8 @@ void nomi_ui_set_battery(int level, bool charging)
     lv_obj_remove_flag(s_battery, LV_OBJ_FLAG_HIDDEN);
 }
 
-// 睡着时回到表情页（睡着动画在大脸上）；醒来回到原来停的页面
+// 睡着时翻到时钟页（设置里选了"表情"、或者还没对上时间时，回到表情页看睡着动画）；
+// 醒来回到原来停的页面。是被叫醒来说话的就停在表情页
 void nomi_ui_set_sleep(bool sleeping)
 {
     s_sleeping = sleeping;
@@ -291,12 +335,17 @@ void nomi_ui_set_sleep(bool sleeping)
     if (sleeping) {
         lv_obj_add_flag(s_subtitle, LV_OBJ_FLAG_HIDDEN);
         show_main(false);
-        s_hist_was_open = hist_page_active();
-        if (s_hist_was_open) show_page(0, false);
-    } else if (s_hist_was_open) {
-        s_hist_was_open = false;
-        s_hist_dirty = true;
-        show_page(1, false);
+        s_page_before_sleep = current_page();
+        bool clock = get_int(NOMI_KEY_SLEEP_SHOW, 0) == 0 && get_text("clock_time")[0];
+        show_page(clock ? PAGE_CLOCK : PAGE_FACE, false);
+        if (clock) clock_refresh(true);
+    } else if (s_page_before_sleep >= 0) {
+        int page = s_page_before_sleep;
+        s_page_before_sleep = -1;
+        nomi_state_t state = s_cb.get_state ? s_cb.get_state() : NOMI_STATE_IDLE;
+        if (page == PAGE_CLOCK && in_conversation(state)) page = PAGE_FACE;
+        if (page == PAGE_HIST) s_hist_dirty = true;
+        if (page != current_page()) show_page(page, false);
     }
 }
 
@@ -376,7 +425,7 @@ static void sync_history(bool to_bottom)
         s_hist_hint = NULL;
     } else if (n == 0 && !s_hist_hint) {
         s_hist_hint = lv_label_create(s_hist_list);
-        lv_label_set_text(s_hist_hint, "还没有对话\n\n聊过的话会记在这里\n往右滑回去叫它说话吧");
+        lv_label_set_text(s_hist_hint, "还没有对话\n\n聊过的话会记在这里\n往左滑回去叫它说话吧");
         lv_obj_set_width(s_hist_hint, LV_PCT(100));
         lv_obj_set_style_text_align(s_hist_hint, LV_TEXT_ALIGN_CENTER, 0);
         lv_obj_set_style_text_opa(s_hist_hint, LV_OPA_60, 0);
@@ -391,7 +440,9 @@ static void sync_history(bool to_bottom)
 static void on_page_changed(lv_event_t *e)
 {
     (void)e;
+    update_dots();
     if (s_page_by_code) return;
+    s_dots_until = lv_tick_get() + DOTS_SHOW_MS;
     if (hist_page_active()) {
         s_hist_dirty = false;
         sync_history(true);
@@ -402,6 +453,7 @@ static void on_modes_scroll(lv_event_t *e)
 {
     (void)e;
     user_activity();
+    clock_refresh(false);  // 往时钟页翻时上面已经是对的
 }
 
 /* ---------- 设置页的小部件 ---------- */
@@ -678,9 +730,17 @@ static void build_display_page(lv_obj_t *page)
 {
     static const char *const dim[] = {"30 秒", "1 分", "2 分", "5 分", "从不", ""};
     static const char *const off[] = {"2 分", "5 分", "10 分", "30 分", "从不", ""};
+    static const char *const sleep_show[] = {"时钟", "表情", ""};
     add_slider(page, "亮度", NOMI_KEY_BRIGHTNESS, MIN_BRIGHTNESS, 80);
     add_choice(page, "多久后睡着", "睡着后过 30 秒屏幕再调暗", NOMI_KEY_DIM, dim, 1);
+    add_choice(page, "睡着时显示", "时钟页有时间、天气和闹钟；还没对上时间时显示表情", NOMI_KEY_SLEEP_SHOW,
+               sleep_show, 1);
     add_choice(page, "多久后息屏", NULL, NOMI_KEY_OFF, off, 1);
+    const char *city = get_text("weather_city");
+    lv_obj_t *item = add_item(page, "天气城市", "网页设置页里能改，也可以直接跟它说「我在深圳」");
+    lv_obj_t *label = lv_label_create(item);
+    lv_label_set_text(label, city[0] ? city : "自动（按网络位置）");
+    set_color(label, C_MUTED);
 }
 
 // 已存的 Wi-Fi，一行一个，正连着的标出来
@@ -790,11 +850,13 @@ static void on_outer_scroll_end(lv_event_t *e)
 // 重建要删掉再建一百来个控件，正赶在手指开始拖的那一下，拖动会顿一下
 static void settings_signature(char *out, size_t size)
 {
-    static const char *const keys[] = {NOMI_KEY_TALK_KEY, NOMI_KEY_AEC,     NOMI_KEY_AEC_SUPPORTED,
-                                       NOMI_KEY_SUBTITLES, NOMI_KEY_PERSONA, NOMI_KEY_VOICE,
-                                       NOMI_KEY_BRIGHTNESS, NOMI_KEY_DIM,    NOMI_KEY_OFF,
-                                       NOMI_KEY_VOLUME,    NOMI_KEY_TTS_SPEAK, NOMI_KEY_ONE_SHOT};
-    static const char *const texts[] = {"voices", "wifi_ssid", "ip", "config_url", "hotspot", "saved_wifi"};
+    static const char *const keys[] = {NOMI_KEY_TALK_KEY,  NOMI_KEY_AEC,       NOMI_KEY_AEC_SUPPORTED,
+                                       NOMI_KEY_SUBTITLES, NOMI_KEY_PERSONA,   NOMI_KEY_VOICE,
+                                       NOMI_KEY_BRIGHTNESS, NOMI_KEY_DIM,      NOMI_KEY_OFF,
+                                       NOMI_KEY_VOLUME,    NOMI_KEY_TTS_SPEAK, NOMI_KEY_ONE_SHOT,
+                                       NOMI_KEY_SLEEP_SHOW};
+    static const char *const texts[] = {"voices", "wifi_ssid", "ip", "config_url", "hotspot", "saved_wifi",
+                                        "weather_city"};
     size_t len = 0;
     out[0] = '\0';
     for (size_t i = 0; i < sizeof(keys) / sizeof(keys[0]) && len < size; i++) {
@@ -879,12 +941,366 @@ static void show_main(bool anim)
     lv_tileview_set_tile(s_outer, s_main_tile, anim ? LV_ANIM_ON : LV_ANIM_OFF);
 }
 
-// 代码切页面：0 表情，1 历史
+static lv_obj_t *page_tile(int page)
+{
+    return page == PAGE_HIST ? s_hist_tile : page == PAGE_CLOCK ? s_clock_tile : s_chat_tile;
+}
+
+static int current_page(void)
+{
+    lv_obj_t *tile = lv_tileview_get_tile_active(s_modes);
+    return tile == s_hist_tile ? PAGE_HIST : tile == s_clock_tile ? PAGE_CLOCK : PAGE_FACE;
+}
+
+// 代码切页面（PAGE_*）
 static void show_page(int page, bool anim)
 {
     s_page_by_code = true;
-    lv_tileview_set_tile(s_modes, page ? s_hist_tile : s_chat_tile, anim ? LV_ANIM_ON : LV_ANIM_OFF);
+    lv_tileview_set_tile(s_modes, page_tile(page), anim ? LV_ANIM_ON : LV_ANIM_OFF);
     s_page_by_code = false;
+    update_dots();
+    if (page == PAGE_CLOCK) clock_refresh(true);
+}
+
+/* ---------- 页码小圆点 ---------- */
+
+static void update_dots(void)
+{
+    if (!s_dots) return;
+    int page = current_page();
+    for (int i = 0; i < PAGE_COUNT; i++) {
+        lv_obj_t *dot = lv_obj_get_child(s_dots, i);
+        lv_obj_set_style_bg_opa(dot, i == page ? LV_OPA_COVER : LV_OPA_40, 0);
+    }
+}
+
+static void create_dots(void)
+{
+    s_dots = lv_obj_create(s_main_tile);
+    lv_obj_remove_style_all(s_dots);
+    lv_obj_set_size(s_dots, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
+    lv_obj_set_flex_flow(s_dots, LV_FLEX_FLOW_ROW);
+    lv_obj_set_style_pad_column(s_dots, 8, 0);
+    lv_obj_remove_flag(s_dots, LV_OBJ_FLAG_CLICKABLE);
+    for (int i = 0; i < PAGE_COUNT; i++) {
+        lv_obj_t *dot = lv_obj_create(s_dots);
+        lv_obj_remove_style_all(dot);
+        lv_obj_set_size(dot, 6, 6);
+        lv_obj_set_style_radius(dot, 3, 0);
+        lv_obj_set_style_bg_color(dot, lv_color_hex(C_TEXT), 0);
+    }
+    lv_obj_align(s_dots, LV_ALIGN_BOTTOM_MID, 0, -6);
+}
+
+/* ---------- 第三页：时钟 ---------- */
+
+// 天气图标（FontAwesome，字库里只收了这几个）。code 夜里加了 1000
+static const char *weather_icon(int code, uint32_t *color)
+{
+    bool night = code >= 1000;
+    code %= 1000;
+    *color = C_TEXT;
+    if (code == 0) {
+        if (!night) *color = C_WARM;
+        return night ? "\xEF\x86\x86" : "\xEF\x86\x85";  // 月亮 / 太阳
+    }
+    if (code <= 2) return night ? "\xEF\x9B\x83" : "\xEF\x9B\x84";  // 云遮月 / 云遮日
+    if (code == 3) return "\xEF\x83\x82";                            // 云
+    if (code == 45 || code == 48) return "\xEF\x9D\x9F";             // 雾
+    if (code >= 95) {
+        *color = C_WARM;
+        return "\xEF\x83\xA7";  // 闪电
+    }
+    if ((code >= 71 && code <= 77) || code == 85 || code == 86) return "\xEF\x8B\x9C";  // 雪花
+    *color = C_ACCENT;
+    if (code == 65 || code == 66 || code == 67 || code == 82) return "\xEF\x9D\x80";  // 大雨
+    if ((code == 80 || code == 81) && !night) return "\xEF\x9D\x83";                  // 阵雨（带太阳）
+    return "\xEF\x9C\xBD";                                                             // 雨
+}
+
+// 文字变了才设（设了就要重画那块）
+static void set_text_if_changed(lv_obj_t *label, const char *text)
+{
+    if (strcmp(lv_label_get_text(label), text) != 0) lv_label_set_text(label, text);
+}
+
+static void on_alarm_delete(lv_event_t *e)
+{
+    lv_obj_t *btn = lv_event_get_target(e);
+    user_activity();
+    if (s_armed_delete != btn) {
+        // 第一次点只变成"删除？"，再点一次才删
+        if (s_armed_delete) {
+            lv_label_set_text(lv_obj_get_child(s_armed_delete, 0), LV_SYMBOL_CLOSE);
+            set_color(lv_obj_get_child(s_armed_delete, 0), C_MUTED);
+        }
+        s_armed_delete = btn;
+        lv_obj_t *label = lv_obj_get_child(btn, 0);
+        lv_obj_set_style_text_font(label, s_font, 0);
+        lv_label_set_text(label, "删除？");
+        set_color(label, C_DANGER);
+        return;
+    }
+    char name[32];
+    snprintf(name, sizeof(name), "alarm_delete:%d", (int)(intptr_t)lv_obj_get_user_data(btn));
+    s_armed_delete = NULL;
+    action(name);
+    clock_refresh(true);
+}
+
+// 闹钟列表：最多两行，再多就写"还有 n 个"；没有就教一句怎么定
+static void rebuild_alarm_list(const char *alarms)
+{
+    lv_obj_clean(s_alarm_list);
+    s_armed_delete = NULL;
+    if (!alarms[0]) {
+        lv_obj_t *hint = lv_label_create(s_alarm_list);
+        lv_label_set_text(hint, "说「明早 7 点叫我」就能定闹钟");
+        set_color(hint, C_MUTED);
+        lv_obj_set_style_text_opa(hint, LV_OPA_70, 0);
+        return;
+    }
+    char buf[sizeof(s_alarms_shown)];
+    snprintf(buf, sizeof(buf), "%s", alarms);
+    int shown = 0, total = 0;
+    for (char *line = buf; line && *line; total++) {
+        char *nl = strchr(line, '\n');
+        if (nl) *nl = '\0';
+        if (shown < 2) {
+            char *when = strchr(line, '\t');
+            char *what = when ? strchr(when + 1, '\t') : NULL;
+            if (when && what) {
+                *when++ = '\0';
+                *what++ = '\0';
+                lv_obj_t *row = lv_obj_create(s_alarm_list);
+                lv_obj_remove_style_all(row);
+                lv_obj_set_size(row, LV_PCT(100), 30);
+                lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+                lv_obj_set_flex_align(row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+                lv_obj_set_style_pad_column(row, 10, 0);
+                lv_obj_remove_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+                lv_obj_t *bell = lv_label_create(row);
+                lv_obj_set_style_text_font(bell, &lv_font_montserrat_14, 0);
+                lv_label_set_text(bell, LV_SYMBOL_BELL);
+                set_color(bell, C_WARM);
+                lv_obj_t *label = lv_label_create(row);
+                lv_obj_set_flex_grow(label, 1);
+                lv_label_set_long_mode(label, LV_LABEL_LONG_MODE_DOTS);
+                lv_label_set_text_fmt(label, "%s%s%s", when, what[0] ? "  " : "", what);
+                set_color(label, C_TEXT);
+                lv_obj_t *del = lv_button_create(row);
+                lv_obj_remove_style_all(del);
+                lv_obj_set_size(del, 64, 30);
+                lv_obj_set_user_data(del, (void *)(intptr_t)atoi(line));
+                lv_obj_add_event_cb(del, on_alarm_delete, LV_EVENT_CLICKED, NULL);
+                lv_obj_t *x = lv_label_create(del);
+                lv_obj_set_style_text_font(x, &lv_font_montserrat_14, 0);
+                lv_label_set_text(x, LV_SYMBOL_CLOSE);
+                set_color(x, C_MUTED);
+                lv_obj_align(x, LV_ALIGN_RIGHT_MID, -4, 0);
+                shown++;
+            }
+        }
+        line = nl ? nl + 1 : NULL;
+    }
+    if (total > shown) {
+        lv_obj_t *more = lv_label_create(s_alarm_list);
+        lv_label_set_text_fmt(more, "还有 %d 个", total - shown);
+        set_color(more, C_MUTED);
+    }
+}
+
+// 对一次时钟页：时间、日期、天气、闹钟。force 时不管闹钟列表有没有变都重建
+static void clock_refresh(bool force)
+{
+    if (!s_clock_tile) return;
+    const char *t = get_text("clock_time");
+    if (t[0]) {
+        // 一个字一个格子，等宽排：比例字体的 1 比 0 窄，整串居中的话时间一变就左右晃
+        for (int i = 0; i < 5; i++) {
+            char ch[2] = {t[i] ? t[i] : ' ', 0};
+            set_text_if_changed(s_clock_digit[i], ch);
+            lv_obj_set_style_text_opa(s_clock_digit[i], LV_OPA_COVER, 0);
+        }
+        set_text_if_changed(s_clock_date, get_text("clock_date"));
+    } else {
+        static const char *const blank[] = {"0", "0", ":", "0", "0"};
+        for (int i = 0; i < 5; i++) {
+            set_text_if_changed(s_clock_digit[i], blank[i]);
+            lv_obj_set_style_text_opa(s_clock_digit[i], LV_OPA_20, 0);
+        }
+        set_text_if_changed(s_clock_date, "还没对上时间 · 联网后自动对时");
+    }
+
+    int code = get_int("weather_code", -1);
+    // get_text 的返回值只到下一次调用前有效（设备上是同一个 std::string），先拷出来
+    char wx_text[96];
+    snprintf(wx_text, sizeof(wx_text), "%s", get_text("weather_text"));
+    bool has_wx = code >= 0 || wx_text[0];
+    if (lv_obj_has_flag(s_wx_row, LV_OBJ_FLAG_HIDDEN) == has_wx) lv_obj_set_flag(s_wx_row, LV_OBJ_FLAG_HIDDEN, !has_wx);
+    if (code >= 0) {
+        uint32_t color;
+        set_text_if_changed(s_wx_icon, weather_icon(code, &color));
+        set_color(s_wx_icon, color);
+        set_text_if_changed(s_wx_temp, get_text("weather_temp"));
+    } else {
+        set_text_if_changed(s_wx_icon, "");
+        set_text_if_changed(s_wx_temp, "");
+    }
+    set_text_if_changed(s_wx_text, wx_text);
+
+    const char *alarms = get_text("alarms");
+    if (force || strncmp(alarms, s_alarms_shown, sizeof(s_alarms_shown) - 1) != 0 || !lv_obj_get_child_count(s_alarm_list)) {
+        // 正在确认删除时别重建（重建会把"删除？"复原）
+        if (!s_armed_delete || force) {
+            snprintf(s_alarms_shown, sizeof(s_alarms_shown), "%s", alarms);
+            rebuild_alarm_list(alarms);
+        }
+    }
+}
+
+static lv_obj_t *add_label(lv_obj_t *parent, const lv_font_t *font, uint32_t color)
+{
+    lv_obj_t *label = lv_label_create(parent);
+    if (font) lv_obj_set_style_text_font(label, font, 0);
+    set_color(label, color);
+    lv_label_set_text(label, "");
+    return label;
+}
+
+static void build_clock_page(void)
+{
+    // 大数字：四个数字格 80 宽、冒号格 34 宽，整排居中
+    const int digit_w = 80, colon_w = 34, y = 34;
+    int x = (FACE_W - digit_w * 4 - colon_w) / 2;
+    for (int i = 0; i < 5; i++) {
+        int w = i == 2 ? colon_w : digit_w;
+        s_clock_digit[i] = add_label(s_clock_tile, &nomi_font_clock_120, C_TEXT);
+        lv_obj_set_width(s_clock_digit[i], w);
+        lv_obj_set_style_text_align(s_clock_digit[i], LV_TEXT_ALIGN_CENTER, 0);
+        lv_obj_set_pos(s_clock_digit[i], x, y);
+        x += w;
+    }
+    s_clock_date = add_label(s_clock_tile, NULL, C_MUTED);
+    lv_obj_set_width(s_clock_date, FACE_W);
+    lv_obj_set_style_text_align(s_clock_date, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_pos(s_clock_date, 0, y + 94);
+
+    // 天气一行：图标、温度、说明
+    s_wx_row = lv_obj_create(s_clock_tile);
+    lv_obj_remove_style_all(s_wx_row);
+    lv_obj_set_size(s_wx_row, LV_SIZE_CONTENT, 44);
+    lv_obj_set_flex_flow(s_wx_row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(s_wx_row, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(s_wx_row, 12, 0);
+    lv_obj_remove_flag(s_wx_row, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_align(s_wx_row, LV_ALIGN_TOP_MID, 0, y + 128);
+    s_wx_icon = add_label(s_wx_row, &nomi_font_weather_36, C_TEXT);
+    s_wx_temp = add_label(s_wx_row, &nomi_font_weather_36, C_TEXT);
+    s_wx_text = add_label(s_wx_row, NULL, C_MUTED);
+    lv_obj_add_flag(s_wx_row, LV_OBJ_FLAG_HIDDEN);
+
+    // 闹钟列表
+    s_alarm_list = lv_obj_create(s_clock_tile);
+    lv_obj_remove_style_all(s_alarm_list);
+    lv_obj_set_size(s_alarm_list, 380, LV_SIZE_CONTENT);
+    lv_obj_set_flex_flow(s_alarm_list, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(s_alarm_list, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_row(s_alarm_list, 2, 0);
+    lv_obj_remove_flag(s_alarm_list, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_align(s_alarm_list, LV_ALIGN_TOP_MID, 0, y + 180);
+
+    lv_obj_add_flag(s_clock_tile, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(s_clock_tile, on_face_pressed, LV_EVENT_PRESSED, NULL);
+}
+
+/* ---------- 响铃 ---------- */
+
+static void on_alarm_button(lv_event_t *e)
+{
+    user_activity();
+    action((const char *)lv_event_get_user_data(e));
+}
+
+static void bell_wobble(void *obj, int32_t v) { lv_obj_set_style_translate_x(obj, v, 0); }
+
+static lv_obj_t *add_alarm_button(lv_obj_t *parent, const char *text, const char *name, bool primary)
+{
+    lv_obj_t *btn = lv_button_create(parent);
+    lv_obj_set_size(btn, 170, 56);
+    lv_obj_set_style_radius(btn, 28, 0);
+    lv_obj_set_style_shadow_width(btn, 0, 0);
+    lv_obj_set_style_bg_color(btn, lv_color_hex(primary ? C_ACCENT : C_CONTROL), 0);
+    lv_obj_add_event_cb(btn, on_alarm_button, LV_EVENT_CLICKED, (void *)name);
+    lv_obj_t *label = lv_label_create(btn);
+    lv_label_set_text(label, text);
+    set_color(label, primary ? 0x0b1220 : C_TEXT);
+    lv_obj_center(label);
+    return btn;
+}
+
+static void create_alarm_layer(void)
+{
+    s_alarm_layer = lv_obj_create(lv_screen_active());
+    lv_obj_remove_style_all(s_alarm_layer);
+    lv_obj_set_size(s_alarm_layer, LV_PCT(100), LV_PCT(100));
+    lv_obj_set_style_bg_color(s_alarm_layer, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(s_alarm_layer, LV_OPA_COVER, 0);
+    lv_obj_set_style_text_font(s_alarm_layer, s_font, 0);
+    lv_obj_add_flag(s_alarm_layer, LV_OBJ_FLAG_CLICKABLE);  // 挡住下面的页面
+    lv_obj_remove_flag(s_alarm_layer, LV_OBJ_FLAG_SCROLLABLE);
+
+    s_alarm_bell = add_label(s_alarm_layer, &nomi_font_weather_36, C_WARM);
+    lv_label_set_text(s_alarm_bell, "\xEF\x83\xB3");  // 铃铛
+    lv_obj_align(s_alarm_bell, LV_ALIGN_TOP_MID, 0, 22);
+    s_alarm_time = add_label(s_alarm_layer, &nomi_font_clock_120, C_TEXT);
+    lv_obj_align(s_alarm_time, LV_ALIGN_TOP_MID, 0, 66);
+    s_alarm_label = add_label(s_alarm_layer, NULL, C_TEXT);
+    lv_obj_set_width(s_alarm_label, FACE_W - 60);
+    lv_obj_set_style_text_align(s_alarm_label, LV_TEXT_ALIGN_CENTER, 0);
+    lv_label_set_long_mode(s_alarm_label, LV_LABEL_LONG_MODE_DOTS);
+    lv_obj_set_height(s_alarm_label, 52);
+    lv_obj_align(s_alarm_label, LV_ALIGN_TOP_MID, 0, 170);
+
+    lv_obj_t *row = lv_obj_create(s_alarm_layer);
+    lv_obj_remove_style_all(row);
+    lv_obj_set_size(row, LV_PCT(100), 56);
+    lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(row, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(row, 24, 0);
+    lv_obj_align(row, LV_ALIGN_BOTTOM_MID, 0, -24);
+    add_alarm_button(row, "稍后提醒", "alarm_snooze", false);
+    add_alarm_button(row, "知道了", "alarm_stop", true);
+}
+
+void nomi_ui_alarm_show(const char *time, const char *label)
+{
+    if (!s_alarm_layer) create_alarm_layer();
+    lv_label_set_text(s_alarm_time, time ? time : "");
+    lv_label_set_text(s_alarm_label, label && label[0] ? label : "闹钟");
+    lv_obj_remove_flag(s_alarm_layer, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_move_foreground(s_alarm_layer);
+
+    // 铃铛左右晃
+    lv_anim_t a;
+    lv_anim_init(&a);
+    lv_anim_set_var(&a, s_alarm_bell);
+    lv_anim_set_exec_cb(&a, bell_wobble);
+    lv_anim_set_values(&a, -6, 6);
+    lv_anim_set_duration(&a, 120);
+    lv_anim_set_reverse_duration(&a, 120);
+    lv_anim_set_repeat_count(&a, LV_ANIM_REPEAT_INFINITE);
+    lv_anim_set_path_cb(&a, lv_anim_path_ease_in_out);
+    lv_anim_start(&a);
+}
+
+void nomi_ui_alarm_hide(void)
+{
+    if (!s_alarm_layer) return;
+    lv_anim_delete(s_alarm_bell, bell_wobble);
+    lv_obj_set_style_translate_x(s_alarm_bell, 0, 0);
+    lv_obj_add_flag(s_alarm_layer, LV_OBJ_FLAG_HIDDEN);
+    clock_refresh(true);  // 一次性的闹钟响完就没了
 }
 
 // 外层开始上下翻：从主界面往下拉时，设置页上的值有变化才重建；没变只刷新一下信号强度
@@ -947,10 +1363,11 @@ void nomi_ui_create(lv_obj_t *screen, uint16_t *face_buf, const lv_font_t *font,
     lv_obj_add_event_cb(s_outer, on_outer_scroll, LV_EVENT_SCROLL_BEGIN, NULL);
     lv_obj_add_event_cb(s_outer, on_outer_scroll_end, LV_EVENT_SCROLL_END, NULL);
 
-    // 主界面里：表情在左，历史对话在右
+    // 主界面里从左到右：历史对话、表情（首页）、时钟
     s_modes = add_tileview(s_main_tile);
-    s_chat_tile = add_tile(s_modes, 0, 0, LV_DIR_RIGHT, 0x000000);
-    s_hist_tile = add_tile(s_modes, 1, 0, LV_DIR_LEFT, C_PAGE);
+    s_hist_tile = add_tile(s_modes, PAGE_HIST, 0, LV_DIR_RIGHT, C_PAGE);
+    s_chat_tile = add_tile(s_modes, PAGE_FACE, 0, LV_DIR_HOR, 0x000000);
+    s_clock_tile = add_tile(s_modes, PAGE_CLOCK, 0, LV_DIR_LEFT, 0x000000);
     lv_obj_add_event_cb(s_modes, on_page_changed, LV_EVENT_VALUE_CHANGED, NULL);
     lv_obj_add_event_cb(s_modes, on_modes_scroll, LV_EVENT_SCROLL_BEGIN, NULL);
 
@@ -973,6 +1390,8 @@ void nomi_ui_create(lv_obj_t *screen, uint16_t *face_buf, const lv_font_t *font,
     lv_obj_set_scrollbar_mode(s_hist_list, LV_SCROLLBAR_MODE_AUTO);
     lv_obj_add_flag(s_hist_list, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_add_event_cb(s_hist_list, on_face_pressed, LV_EVENT_PRESSED, NULL);
+
+    build_clock_page();
 
     // 以下浮在主界面上，左右切模式时不动
     lv_obj_t *grip = lv_obj_create(s_main_tile);  // 顶部小横条：提示往下拉打开设置
@@ -1004,9 +1423,12 @@ void nomi_ui_create(lv_obj_t *screen, uint16_t *face_buf, const lv_font_t *font,
     lv_obj_align(s_subtitle, LV_ALIGN_BOTTOM_MID, 0, -10);
     lv_obj_add_flag(s_subtitle, LV_OBJ_FLAG_HIDDEN);
 
+    create_dots();
+
     build_settings();
     show_main(false);
-    show_page(0, false);  // 让左右翻页的 tileview 也有"当前页"（不设的话一直是 NULL，直到第一次滑动）
+    show_page(PAGE_FACE, false);  // 让左右翻页的 tileview 也有"当前页"（不设的话一直是 NULL，直到第一次滑动）
+    s_dots_until = lv_tick_get() + 4000;  // 开机时亮一会儿，告诉人左右还有页面
 
     // 通知条在最上层，翻到哪一页都看得到
     s_toast = lv_label_create(screen);

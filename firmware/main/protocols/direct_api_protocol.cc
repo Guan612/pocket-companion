@@ -721,6 +721,10 @@ std::string DirectApiProtocol::Chat(const DirectApiConfig& cfg, const std::strin
             sys += "\n\n[主人的长期记忆]（回答时自然运用，不要整段复述）\n" + memory;
         }
         if (!face_prompt.empty()) sys += "\n\n" + face_prompt;
+        if (context_provider) {
+            std::string ctx = context_provider();
+            if (!ctx.empty()) sys += "\n\n" + ctx;
+        }
         if (with_tools) {
             sys +=
                 "\n\n你可以调用设备工具：调音量 / 亮度、查设备状态用对应工具；"
@@ -1156,6 +1160,7 @@ static int PostStatus(Http& http, const std::string& url) {
 std::string DirectApiProtocol::face_prompt;
 std::atomic<bool> DirectApiProtocol::thinking_{false};
 std::function<bool(const std::string&, std::string&)> DirectApiProtocol::face_handler;
+std::function<std::string()> DirectApiProtocol::context_provider;
 
 void DirectApiProtocol::AttachImage(std::string jpeg) {
     std::lock_guard<std::mutex> lock(g_image_mutex);
