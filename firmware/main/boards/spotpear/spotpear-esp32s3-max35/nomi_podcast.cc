@@ -533,13 +533,16 @@ std::string NomiPodcast::DeleteJson(const std::string& body) {
     cJSON* index = cJSON_GetObjectItem(req, "index");
     int i = cJSON_IsNumber(index) ? index->valueint : -1;
     cJSON_Delete(req);
+    Podcast removed;
     {
         std::lock_guard<std::mutex> lock(mutex_);
         if (i < 0 || i >= static_cast<int>(subs_.size())) return "!没有这个订阅";
+        removed = subs_[i];
         subs_.erase(subs_.begin() + i);
         opened_ = -1;
     }
     SaveSubs();
+    Settings(kNs, true).EraseKey(ProgressKey(removed.feed));  // 播放进度没人管了，跟着订阅一起清掉
     return "{\"ok\":true}";
 }
 
