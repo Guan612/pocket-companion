@@ -29,6 +29,8 @@ typedef enum {
 #define NOMI_KEY_AEC "aec"                // 随时插话打断（设备端回声消除）
 #define NOMI_KEY_AEC_SUPPORTED "aec_ok"   // 只读：硬件有没有喇叭回采
 #define NOMI_KEY_SUBTITLES "subtitles"    // 显示字幕
+#define NOMI_KEY_TTS_SPEAK "tts_speak"    // 语音播报（静音模式）：0 关——只出字幕，不调合成。
+                                          // 存在 directapi 命名空间，网页设置页 / self.voice.set_speak 共用
 #define NOMI_KEY_PERSONA "persona"        // personas 列表里的下标，-1 为自定义
 #define NOMI_KEY_VOICE "voice"            // voices 列表里的下标，-1 为自定义
 #define NOMI_KEY_DIM "dim"                // NOMI_DIM_SECONDS 的下标
@@ -46,7 +48,8 @@ typedef struct {
     void (*set_int)(const char *key, int value, bool final);
     // 只读文字：personas、voices（'\n' 分隔）、wifi、ip、config_url、version
     const char *(*get_text)(const char *key);
-    // 动作：test_api、reconfigure_wifi、factory_reset
+    // 动作：test_api、reconfigure_wifi、factory_reset、toggle_listen（连续聆听开关：
+    // 开 = 待机时开始连续对话，关 = 退出对话回待机）
     void (*action)(const char *name);
     // 聊天历史（第二页）：下标 0 最旧；role 为 "user" / "assistant"，文本只需在下一次调用前有效
     int (*history_count)(void);

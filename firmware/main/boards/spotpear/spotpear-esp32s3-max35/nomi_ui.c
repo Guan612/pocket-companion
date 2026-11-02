@@ -31,6 +31,7 @@ static lv_obj_t *s_outer, *s_settings_tile, *s_main_tile;
 static lv_obj_t *s_modes, *s_chat_tile, *s_hist_tile;
 static lv_obj_t *s_canvas, *s_hist_list;
 static lv_obj_t *s_status, *s_battery, *s_subtitle, *s_toast;
+static lv_obj_t *s_listen_sw;  // 连续聆听开关（设置 → 对话，跟着设备状态亮灭）
 static lv_timer_t *s_toast_timer;
 static uint32_t s_last_ms, s_emotion_until;
 static float s_acc;
@@ -41,6 +42,7 @@ static bool s_hist_was_open;  // 睡着前停在历史页的话，醒来回那�
 static bool s_hist_dirty;     // 有新消息，历史页可见时要重建列表
 static nomi_state_t s_last_state = NOMI_STATE_IDLE;
 static uint32_t s_subtitle_hide_at;  // 到这个时刻收起字幕，0 表示不收
+static bool s_sw_syncing;            // 状态同步改开关时不算用户操作
 
 static int get_int(const char *key, int def) { return s_cb.get_int ? s_cb.get_int(key, def) : def; }
 static void set_int(const char *key, int value, bool final)
@@ -65,6 +67,7 @@ static void show_main(bool anim);
 static void show_page(int page, bool anim);
 static void on_face_pressed(lv_event_t *e);
 static void rebuild_history(bool to_bottom);
+static void sync_listen_switch(nomi_state_t state);
 
 // 二维码用 Nayuki 的 qrcodegen：设备上由小智依赖的 esp_emote_gfx 带进来，模拟器里由 LVGL 带进来。
 // 两份同名，不能同时链接，所以不打开 LVGL 的 qrcode 控件，只声明这里用到的三个函数。
@@ -134,6 +137,9 @@ static void face_tick(lv_timer_t *timer)
         s_subtitle_hide_at = 0;
     }
     s_last_state = state;
+
+    // 连续聆听开关跟着设备状态走
+    sync_listen_switch(state);
 
     // 来了新消息且正停在历史页：把列表重建一遍（说话时逐句更新，一次重建就几毫秒）
     if (s_hist_dirty && hist_page_active()) {
@@ -409,6 +415,43 @@ static lv_obj_t *add_switch(lv_obj_t *page, const char *title, const char *hint,
     return sw;
 }
 
+/* ---------- 连续聆听开关（设置 → 对话）：不是存的设置，就是"现在在不在连续对话" ---------- */
+
+// 开关亮灭跟着设备状态走：聆听 / 说话中就是开。设置页开着时 face_tick 每帧对一次，
+// 对话自动结束（没人说话回待机）开关也会自己灭
+static void sync_listen_switch(nomi_state_t state)
+{
+    if (!s_listen_sw) return;
+    bool on = state == NOMI_STATE_LISTENING || state == NOMI_STATE_SPEAKING;
+    if (lv_obj_has_state(s_listen_sw, LV_STATE_CHECKED) == on) return;
+    s_sw_syncing = true;  // 程序改状态也可能触发事件，别当成用户点了一下
+    if (on) lv_obj_add_state(s_listen_sw, LV_STATE_CHECKED);
+    else lv_obj_remove_state(s_listen_sw, LV_STATE_CHECKED);
+    s_sw_syncing = false;
+}
+
+static void on_listen_switch(lv_event_t *e)
+{
+    (void)e;
+    if (s_sw_syncing) return;
+    user_activity();
+    action("toggle_listen");  // 开：待机进连续聆听；关：退出对话回待机
+}
+
+static void add_listen_switch(lv_obj_t *page)
+{
+    lv_obj_t *item = add_item(page, "连续聆听",
+                              "打开就开始连续对话，关闭退出回待机；BOOT 键和唤醒词都不用");
+    s_listen_sw = lv_switch_create(item);
+    lv_obj_add_flag(s_listen_sw, LV_OBJ_FLAG_IGNORE_LAYOUT);
+    lv_obj_align(s_listen_sw, LV_ALIGN_TOP_RIGHT, 0, -2);
+    lv_obj_set_style_bg_color(s_listen_sw, lv_color_hex(C_CONTROL), LV_PART_MAIN);
+    lv_obj_set_style_bg_color(s_listen_sw, lv_color_hex(C_ACCENT), LV_PART_INDICATOR | LV_STATE_CHECKED);
+    lv_obj_set_style_bg_color(s_listen_sw, lv_color_hex(C_TEXT), LV_PART_KNOB);
+    lv_obj_add_event_cb(s_listen_sw, on_listen_switch, LV_EVENT_VALUE_CHANGED, NULL);
+    sync_listen_switch(s_cb.get_state ? s_cb.get_state() : NOMI_STATE_IDLE);  // 建出来就是当前状态
+}
+
 static void on_choice(lv_event_t *e)
 {
     lv_obj_t *btnm = lv_event_get_target(e);
@@ -556,6 +599,7 @@ static void build_chat_page(lv_obj_t *page)
 {
     static const char *const talk[] = {"按住说话", "点一下开始", ""};
     add_choice(page, "BOOT 键", "也可以直接喊「你好小智」", NOMI_KEY_TALK_KEY, talk, 1);
+    add_listen_switch(page);
     bool aec_ok = get_int(NOMI_KEY_AEC_SUPPORTED, 0);
     add_switch(page, "随时插话打断",
                aec_ok ? "它说话时直接开口就能打断" : "这块板没有喇叭回采，不支持", NOMI_KEY_AEC,
@@ -658,6 +702,9 @@ static void build_settings(void)
     build_display_page(add_page(tv, "显示"));
     lv_obj_t *sound = add_page(tv, "声音");
     add_slider(sound, "音量", NOMI_KEY_VOLUME, 0, 70);
+    // 静音模式：关了语音播报，回复只显示文字，不念出来也不调合成接口
+    add_switch(sound, "语音播报", "关掉就是静音模式：回复只显示文字，不念出来", NOMI_KEY_TTS_SPEAK,
+               true);
     build_network_page(add_page(tv, "网络"));
     build_system_page(add_page(tv, "系统"));
 
