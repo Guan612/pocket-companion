@@ -87,6 +87,7 @@ private:
     std::vector<std::vector<uint8_t>> packets_;  // 本轮录音的 Opus 包（16k，60ms）
     bool heard_voice_ = false;
     int silence_ms_ = 0;
+    int voice_ms_ = 0;    // 本轮里 VAD 连续听到声音多久了（要够 kMinVoiceMs 才算有人说话）
     int recorded_ms_ = 0;
     int barge_in_ms_ = 0;  // 它说话时用户连续开口多久了（随时打断模式）
 

@@ -76,3 +76,7 @@ CONFIG_LV_USE_WIN=n
 
 CONFIG_LV_BUILD_EXAMPLES=n
 CONFIG_LV_BUILD_DEMOS=n
+
+# 连续对话时音频管线常驻吃掉大半内部 RAM，硬件 AES 的 DMA 缓冲分不到
+# （esp-aes: Failed to allocate memory → 语音识别连接失败）；软件 AES 走 PSRAM，每请求多十几毫秒
+CONFIG_MBEDTLS_HARDWARE_AES=n

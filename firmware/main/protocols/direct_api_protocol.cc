@@ -32,6 +32,8 @@ constexpr int kMicSampleRate = 16000;      // 小智上行 Opus 的采样率
 constexpr int kMicFrameMs = 60;            // 小智上行 Opus 的帧长
 constexpr int kEndSilenceMs = 900;         // 说完后静音多久算一句结束
 constexpr int kNoSpeechMs = 5000;          // 自动聆听一直没人开口，多久放弃、回待机
+constexpr int kMinVoiceMs = 240;           // 连续开口多久才算真的有人说话：环境噪声让 VAD 闪一下不算，
+                                           // 不然没人说话的 5 秒退出被拖成 15 秒录满、空跑一次语音识别
 constexpr int kBargeInMs = 300;            // 它说话时用户开口多久算打断
 constexpr int kMaxRecordMs = 15000;
 constexpr size_t kHistoryLimit = 12;
@@ -368,10 +370,14 @@ bool DirectApiProtocol::SendAudio(std::unique_ptr<AudioStreamPacket> packet) {
         // 手动模式靠松键结束；自动模式用设备端 VAD 判断说完了没有
         if (mode_ != kListeningModeManualStop) {
             if (Application::GetInstance().GetAudioService().IsVoiceDetected()) {
-                heard_voice_ = true;
-                silence_ms_ = 0;
-            } else if (heard_voice_) {
-                silence_ms_ += kMicFrameMs;
+                voice_ms_ += kMicFrameMs;
+                if (voice_ms_ >= kMinVoiceMs) {
+                    heard_voice_ = true;
+                    silence_ms_ = 0;
+                }
+            } else {
+                voice_ms_ = 0;
+                if (heard_voice_) silence_ms_ += kMicFrameMs;
             }
             done = heard_voice_ && silence_ms_ >= kEndSilenceMs;
             // 一直没人开口就别傻等满 15 秒：结束这轮，RunTurn 会回待机
@@ -393,6 +399,7 @@ void DirectApiProtocol::SendStartListening(ListeningMode mode) {
     packets_.clear();
     heard_voice_ = false;
     silence_ms_ = 0;
+    voice_ms_ = 0;
     recorded_ms_ = 0;
     if (!busy_) {
         cancel_ = false;
@@ -579,7 +586,14 @@ std::string DirectApiProtocol::Transcribe(const DirectApiConfig& cfg,
     auto http = NewHttp(cfg.asr.key);
     http->SetHeader("Content-Type", "multipart/form-data; boundary=" + boundary);
     http->SetContent(std::move(body));
-    if (!http->Open("POST", cfg.asr.url + "/audio/transcriptions")) {
+    // TLS 握手要一大块连续内存，唤醒词 + AFE 常驻后堆很紧，第一次可能分不到
+    // （串口里是 create_ssl_handle failed）；缓一下再试一次，多数就过了
+    auto opened = http->Open("POST", cfg.asr.url + "/audio/transcriptions");
+    if (!opened && !Aborted()) {
+        vTaskDelay(pdMS_TO_TICKS(400));
+        opened = http->Open("POST", cfg.asr.url + "/audio/transcriptions");
+    }
+    if (!opened) {
         if (!Aborted()) SetError("语音识别连接失败");  // 用户已退出聆听时晚到的失败不弹
         return "";
     }
@@ -704,7 +718,13 @@ std::string DirectApiProtocol::Chat(const DirectApiConfig& cfg, const std::strin
         http->SetHeader("Content-Type", "application/json");
         http->SetContent(std::string(json));
         cJSON_free(json);
-        if (!http->Open("POST", ep->url + "/chat/completions")) {
+        // TLS 握手的内存紧张时第一次会失败，缓一下再试一次（见 Transcribe 里的说明）
+        auto opened = http->Open("POST", ep->url + "/chat/completions");
+        if (!opened && !Aborted()) {
+            vTaskDelay(pdMS_TO_TICKS(400));
+            opened = http->Open("POST", ep->url + "/chat/completions");
+        }
+        if (!opened) {
             cJSON_Delete(req);
             history_.pop_back();
             if (!Aborted()) SetError("大模型连接失败");
@@ -853,7 +873,11 @@ std::unique_ptr<Http> RequestSpeech(const DirectApiConfig& cfg, const std::strin
     http->SetContent(std::string(json));
     cJSON_free(json);
     status = 0;
-    if (!http->Open("POST", cfg.tts.url + "/audio/speech")) return nullptr;
+    // TLS 握手的内存紧张时第一次会失败，缓一下再试一次（见 Transcribe 里的说明）
+    if (!http->Open("POST", cfg.tts.url + "/audio/speech")) {
+        vTaskDelay(pdMS_TO_TICKS(400));
+        if (!http->Open("POST", cfg.tts.url + "/audio/speech")) return nullptr;
+    }
     auto s = http->GetStatusCode();
     status = s ? *s : 0;
     return http;

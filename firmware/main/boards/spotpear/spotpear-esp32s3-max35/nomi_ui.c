@@ -43,6 +43,7 @@ static bool s_hist_dirty;     // 有新消息，历史页可见时要重建列�
 static nomi_state_t s_last_state = NOMI_STATE_IDLE;
 static uint32_t s_subtitle_hide_at;  // 到这个时刻收起字幕，0 表示不收
 static bool s_sw_syncing;            // 状态同步改开关时不算用户操作
+static uint32_t s_listen_hold_until; // 用户刚点过连续聆听开关：这段时间状态同步别把开关扳回去
 
 static int get_int(const char *key, int def) { return s_cb.get_int ? s_cb.get_int(key, def) : def; }
 static void set_int(const char *key, int value, bool final)
@@ -418,10 +419,12 @@ static lv_obj_t *add_switch(lv_obj_t *page, const char *title, const char *hint,
 /* ---------- 连续聆听开关（设置 → 对话）：不是存的设置，就是"现在在不在连续对话" ---------- */
 
 // 开关亮灭跟着设备状态走：聆听 / 说话中就是开。设置页开着时 face_tick 每帧对一次，
-// 对话自动结束（没人说话回待机）开关也会自己灭
+// 对话自动结束（没人说话回待机）开关也会自己灭。
+// 开 / 关是异步生效的（要排进主任务开通道），用户刚点过的几秒里别把开关扳回去，等状态落定再说
 static void sync_listen_switch(nomi_state_t state)
 {
     if (!s_listen_sw) return;
+    if ((int32_t)(s_listen_hold_until - lv_tick_get()) > 0) return;  // 用户刚点过，先别抢
     bool on = state == NOMI_STATE_LISTENING || state == NOMI_STATE_SPEAKING;
     if (lv_obj_has_state(s_listen_sw, LV_STATE_CHECKED) == on) return;
     s_sw_syncing = true;  // 程序改状态也可能触发事件，别当成用户点了一下
@@ -435,6 +438,7 @@ static void on_listen_switch(lv_event_t *e)
     (void)e;
     if (s_sw_syncing) return;
     user_activity();
+    s_listen_hold_until = lv_tick_get() + 3000;
     action("toggle_listen");  // 开：待机进连续聆听；关：退出对话回待机
 }
 
