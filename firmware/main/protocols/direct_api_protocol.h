@@ -74,8 +74,14 @@ private:
     std::atomic<bool> recording_{false};
     std::atomic<bool> cancel_{false};
     std::atomic<bool> busy_{false};
+    // self.chat.end 置位：这一轮说完就退出聆听回待机，而不是接着听
+    std::atomic<bool> exit_after_reply_{false};
     ListeningMode mode_ = kListeningModeAutoStop;
     std::string config_url_;  // 网页设置页地址
+
+    // 这一轮已作废：被用户打断，或音频通道已关闭（退出聆听 / 断网）。
+    // 作废的轮次不再发请求，晚到的失败也不弹错误提示
+    bool Aborted() const { return cancel_ || !opened_; }
 
     std::mutex mutex_;
     std::vector<std::vector<uint8_t>> packets_;  // 本轮录音的 Opus 包（16k，60ms）

@@ -296,6 +296,19 @@ bool DirectApiProtocol::Start() {
                            : std::string("语音播报已关闭，这句起回复只用文字显示");
         });
 
+    McpServer::GetInstance().AddTool(
+        "self.chat.end",
+        "结束这轮对话并退出聆听，设备回到待机，直到主人再叫你。主人说\"退下吧\"\"你可以退下了\""
+        "\"今天就聊到这儿\"\"先这样吧\"之类要结束对话时调用；主人只是让你别说话（\"别说了\"\"闭嘴\"）"
+        "时不要调用这个工具，那用 self.voice.set_speak 关掉语音播报就行。调用后你仍要把这句回"
+        "答说完，说完设备才安静下来。",
+        PropertyList(),
+        [this](const PropertyList& properties) -> ToolResult {
+            (void)properties;
+            exit_after_reply_ = true;
+            return std::string("好的，这句说完就退出聆听");
+        });
+
     // TLS 握手和 JSON 解析比较吃栈
     xTaskCreate(WorkerEntry, "direct_api", 12 * 1024, this, 4, &worker_);
     config_url_ = DirectApiConfigServer::Start();
@@ -322,7 +335,12 @@ void DirectApiProtocol::CloseAudioChannel(bool send_goodbye) {
     (void)send_goodbye;
     cancel_ = true;
     recording_ = false;
+    exit_after_reply_ = false;  // 对话都没了，别把"说完退出"带进下一场
     bool was_opened = opened_.exchange(false);
+    // 丢掉已排队还没开始的轮次：不然它们会带着旧录音跑识别，
+    // 甚至被下一场对话的 SendStartListening 唤醒后立刻把新对话顶回待机
+    while (xSemaphoreTake(turn_sem_, 0) == pdTRUE) {
+    }
     if (was_opened && on_audio_channel_closed_) on_audio_channel_closed_();
 }
 
@@ -417,6 +435,11 @@ void DirectApiProtocol::WorkerEntry(void* arg) {
 void DirectApiProtocol::WorkerLoop() {
     while (true) {
         xSemaphoreTake(turn_sem_, portMAX_DELAY);
+        // 通道已关闭还排着队（关闭瞬间 FinishRecording 刚给过信号量）：这轮作废。
+        // 不拦的话 cancel_ 会在下面被清掉，退出聆听后还会偷偷跑一轮识别
+        if (!opened_) {
+            continue;
+        }
         std::vector<std::vector<uint8_t>> packets;
         {
             std::lock_guard<std::mutex> lock(mutex_);
@@ -467,7 +490,7 @@ void DirectApiProtocol::RunTurn(std::vector<std::vector<uint8_t>> packets) {
     EmitJson("llm", "emotion", "thinking");
     std::string text = Transcribe(cfg, packets);
     packets.clear();
-    if (cancel_) return;
+    if (Aborted()) return;
     // 上一轮拍的照片现在才编完、而这轮又没说话：就当在问照片的事，不然照片会一直挂着
     if (text.empty() && HasPendingImage()) {
         text = kDefaultImageQuestion;
@@ -480,7 +503,7 @@ void DirectApiProtocol::RunTurn(std::vector<std::vector<uint8_t>> packets) {
     EmitJson("stt", "text", text.c_str());
 
     std::string reply = Chat(cfg, text);
-    if (cancel_) return;
+    if (Aborted()) return;
     cfg = DirectApiConfig::Load();  // 工具可能刚改了播报开关，这句回复就要用上新状态
     if (reply.empty() && pending_face_.empty()) {  // 只做了表情、没说话也算正常
         SetError("大模型没有返回内容");
@@ -496,36 +519,42 @@ void DirectApiProtocol::RunTurn(std::vector<std::vector<uint8_t>> packets) {
 
     EmitJson("tts", "state", "start");
     // 等 Application 切到 Speaking，否则送进去的音频会被丢掉
-    for (int i = 0; i < 50 && app.GetDeviceState() != kDeviceStateSpeaking && !cancel_; i++) {
+    for (int i = 0; i < 50 && app.GetDeviceState() != kDeviceStateSpeaking && !Aborted(); i++) {
         vTaskDelay(pdMS_TO_TICKS(20));
     }
     if (cfg.tts_speak) {
         for (const auto& sentence : SplitSentences(body)) {
-            if (cancel_) break;
+            if (Aborted()) break;
             EmitJson("tts", "state", "sentence_start", "text", sentence.c_str());
             if (!Speak(cfg, sentence)) break;
         }
         // 等本轮语音播完再结束，否则自动模式会边放边开始录音
-        while (!cancel_ && !app.GetAudioService().IsPlaybackIdle()) {
+        while (!Aborted() && !app.GetAudioService().IsPlaybackIdle()) {
             vTaskDelay(pdMS_TO_TICKS(50));
         }
     } else {
         // 关了播报就只出字幕不调合成；按阅读速度给每句留一点显示时间
         for (const auto& sentence : SplitSentences(body)) {
-            if (cancel_) break;
+            if (Aborted()) break;
             EmitJson("tts", "state", "sentence_start", "text", sentence.c_str());
             int read_ms = 400 + sentence.size() * 60;  // UTF-8 中文 3 字节/字 ≈ 180ms/字
             if (read_ms > 4000) read_ms = 4000;
-            for (int waited = 0; !cancel_ && waited < read_ms; waited += 100) {
+            for (int waited = 0; !Aborted() && waited < read_ms; waited += 100) {
                 vTaskDelay(pdMS_TO_TICKS(100));
             }
         }
     }
     EmitJson("tts", "state", "stop");
+    // "退下吧"：这轮说完就退出聆听回待机。tts stop 已排进主任务（先切回聆听），
+    // EndConversation 排在它后面，看到的正是聆听状态
+    if (exit_after_reply_.exchange(false) && opened_) {
+        app.EndConversation();
+    }
 }
 
 std::string DirectApiProtocol::Transcribe(const DirectApiConfig& cfg,
                                           const std::vector<std::vector<uint8_t>>& packets) {
+    if (Aborted()) return "";  // 轮次已作废就别再发请求
     auto pcm = DecodeOpus(packets);
     if (pcm.size() < kMicSampleRate / 3) {  // 不到 0.3 秒，多半是误触
         return "";
@@ -551,14 +580,14 @@ std::string DirectApiProtocol::Transcribe(const DirectApiConfig& cfg,
     http->SetHeader("Content-Type", "multipart/form-data; boundary=" + boundary);
     http->SetContent(std::move(body));
     if (!http->Open("POST", cfg.asr.url + "/audio/transcriptions")) {
-        SetError("语音识别连接失败");
+        if (!Aborted()) SetError("语音识别连接失败");  // 用户已退出聆听时晚到的失败不弹
         return "";
     }
     auto status = http->GetStatusCode();
     std::string resp = http->ReadAll();
     if (!status || *status >= 400) {
         ESP_LOGE(TAG, "ASR failed: %d %s", status ? *status : -1, resp.substr(0, 200).c_str());
-        SetError("语音识别失败（HTTP " + std::to_string(status ? *status : 0) + "）");
+        if (!Aborted()) SetError("语音识别失败（HTTP " + std::to_string(status ? *status : 0) + "）");
         return "";
     }
 
@@ -592,7 +621,8 @@ std::string DirectApiProtocol::Chat(const DirectApiConfig& cfg, const std::strin
             sys +=
                 "\n\n你可以调用设备工具：调音量 / 亮度、查设备状态用对应工具；"
                 "主人说了值得长期记住的信息（称呼、喜好、安排，或明确说\"记住\"）时，"
-                "调用 self.memory.remember，一次一条简短事实。";
+                "调用 self.memory.remember，一次一条简短事实；"
+                "主人要结束对话（\"退下吧\"\"今天就聊到这儿\"）时调用 self.chat.end 退出聆听。";
         }
         return sys;
     };
@@ -677,7 +707,7 @@ std::string DirectApiProtocol::Chat(const DirectApiConfig& cfg, const std::strin
         if (!http->Open("POST", ep->url + "/chat/completions")) {
             cJSON_Delete(req);
             history_.pop_back();
-            SetError("大模型连接失败");
+            if (!Aborted()) SetError("大模型连接失败");
             return "";
         }
         auto status = http->GetStatusCode();
@@ -696,7 +726,7 @@ std::string DirectApiProtocol::Chat(const DirectApiConfig& cfg, const std::strin
             ESP_LOGE(TAG, "LLM failed: %d %s", status ? *status : -1, resp.substr(0, 200).c_str());
             cJSON_Delete(req);
             history_.pop_back();
-            SetError("大模型请求失败（HTTP " + std::to_string(status ? *status : 0) + "）");
+            if (!Aborted()) SetError("大模型请求失败（HTTP " + std::to_string(status ? *status : 0) + "）");
             return "";
         }
 
@@ -846,15 +876,16 @@ std::unique_ptr<Http> RequestSpeechWithFallback(const DirectApiConfig& cfg, cons
 // 语音合成，边下载边播：Ogg Opus 拆包进解码队列（和小智服务器下发的一样）；
 // mp3 / wav 在这里用乐鑫音频库解成 PCM，直接进播放队列
 bool DirectApiProtocol::Speak(const DirectApiConfig& cfg, const std::string& sentence) {
+    if (Aborted()) return false;
     int status = 0;
     auto http = RequestSpeechWithFallback(cfg, sentence, status);
     if (!http) {
-        SetError("语音合成连接失败");
+        if (!Aborted()) SetError("语音合成连接失败");
         return false;
     }
     if (status < 200 || status >= 300) {
         ESP_LOGE(TAG, "TTS failed: %d %s", status, http->ReadAll().substr(0, 200).c_str());
-        SetError("语音合成失败（HTTP " + std::to_string(status) + "）");
+        if (!Aborted()) SetError("语音合成失败（HTTP " + std::to_string(status) + "）");
         return false;
     }
 
@@ -873,7 +904,7 @@ bool DirectApiProtocol::Speak(const DirectApiConfig& cfg, const std::string& sen
     if (format == SpeechFormat::kUnknown) {
         ESP_LOGE(TAG, "TTS response format unknown: %02x %02x %02x %02x", h[0], head.size() > 1 ? h[1] : 0,
                  head.size() > 2 ? h[2] : 0, head.size() > 3 ? h[3] : 0);
-        SetError("语音合成返回的格式认不出（要 opus / mp3 / wav）");
+        if (!Aborted()) SetError("语音合成返回的格式认不出（要 opus / mp3 / wav）");
         return false;
     }
 
@@ -914,7 +945,7 @@ bool DirectApiProtocol::Speak(const DirectApiConfig& cfg, const std::string& sen
         });
         if (bad) {
             ESP_LOGE(TAG, "TTS Ogg stream is not Opus");
-            SetError("语音合成返回的 Ogg 不是 opus");
+            if (!Aborted()) SetError("语音合成返回的 Ogg 不是 opus");
             return false;
         }
         return !cancel_;
@@ -930,7 +961,7 @@ bool DirectApiProtocol::Speak(const DirectApiConfig& cfg, const std::string& sen
     esp_audio_simple_dec_handle_t dec = nullptr;
     if (esp_audio_simple_dec_open(&dec_cfg, &dec) != ESP_AUDIO_ERR_OK || dec == nullptr) {
         ESP_LOGE(TAG, "Failed to open %s decoder", format == SpeechFormat::kWav ? "wav" : "mp3");
-        SetError("语音合成解码器打不开");
+        if (!Aborted()) SetError("语音合成解码器打不开");
         return false;
     }
     std::vector<uint8_t> out(4608);  // 一帧 mp3 最多 1152 个采样 × 双声道 × 16 位
@@ -1001,7 +1032,7 @@ bool DirectApiProtocol::Speak(const DirectApiConfig& cfg, const std::string& sen
     if (!failed && !cancel_) flush(true);
     esp_audio_simple_dec_close(dec);
     if (failed) {
-        SetError("语音合成解码失败");
+        if (!Aborted()) SetError("语音合成解码失败");
         return false;
     }
     return !cancel_ && !aborted;

@@ -108,6 +108,13 @@ public:
      */
     void StopListening();
 
+    /**
+     * End the current conversation and return to idle (thread-safe).
+     * Aborts speaking if needed and closes the audio channel; used by the
+     * on-screen listening toggle and the self.chat.end device tool.
+     */
+    void EndConversation();
+
     void Reboot();
     void WakeWordInvoke(const std::string& wake_word);
     bool UpgradeFirmware(const std::string& url, const std::string& version = "");

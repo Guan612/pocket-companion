@@ -792,6 +792,24 @@ void Application::StartListening() { xEventGroupSetBits(event_group_, MAIN_EVENT
 
 void Application::StopListening() { xEventGroupSetBits(event_group_, MAIN_EVENT_STOP_LISTENING); }
 
+void Application::EndConversation() {
+    // 排进主任务按序执行：跟在 tts stop 的状态切换之后调用时，看到的就是聆听状态
+    Schedule([this]() {
+        if (!protocol_) {
+            return;
+        }
+        auto state = GetDeviceState();
+        if (state == kDeviceStateNotifying) {
+            StopNotification();
+        } else if (state == kDeviceStateConnecting) {
+            // 还在连接：直接回待机，排在后面的 ContinueOpenAudioChannel 会因状态不符放弃
+            SetDeviceState(kDeviceStateIdle);
+        } else if (state == kDeviceStateSpeaking || state == kDeviceStateListening) {
+            protocol_->CloseAudioChannel();  // 说话中会顺带打断（协议置 cancel_）
+        }
+    });
+}
+
 void Application::HandleToggleChatEvent() {
     auto state = GetDeviceState();
 
