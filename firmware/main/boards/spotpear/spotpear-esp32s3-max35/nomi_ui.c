@@ -761,7 +761,10 @@ static void add_saved_wifi(lv_obj_t *page)
 static void build_network_page(lv_obj_t *page)
 {
     // 配网模式：先告诉人怎么加网络——扫码连上热点（手机一般会自动弹出配网页）
-    const char *hotspot = get_text("hotspot");
+    // get_text 的返回值只到下一次调用前有效（设备上是同一个 std::string），热点名先拷出来，
+    // 不然下面再取网址时会被覆盖，提示里热点名的位置也显示成网址
+    char hotspot[40];
+    snprintf(hotspot, sizeof(hotspot), "%s", get_text("hotspot"));
     if (hotspot[0]) {
         char wifi_qr[64], hint[160];
         snprintf(wifi_qr, sizeof(wifi_qr), "WIFI:T:nopass;S:%s;;", hotspot);
