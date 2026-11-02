@@ -102,6 +102,7 @@ static void set_recording(bool on)
 // 设置项存在内存里，刷新页面就没了
 static int s_talk_key, s_aec, s_subtitles = 1, s_persona, s_voice = 4, s_dim = 1, s_off = 1;
 static int s_volume = 70, s_brightness = 80;
+static int s_one_shot;  // 一问一答
 static int s_speak = 1;  // 语音播报（静音模式）：真值在 serve.py 的设备存储里，改了经 JS 写回去
 
 /* ---------- 聊天历史（对应 NomiDisplay::AddChatMessage） ---------- */
@@ -513,6 +514,7 @@ static int get_int(const char *key, int def)
     if (!strcmp(key, NOMI_KEY_VOICE)) return s_voice;
     if (!strcmp(key, NOMI_KEY_DIM)) return s_dim;
     if (!strcmp(key, NOMI_KEY_OFF)) return s_off;
+    if (!strcmp(key, NOMI_KEY_ONE_SHOT)) return s_one_shot;
     return def;
 }
 
@@ -532,6 +534,7 @@ static void set_int(const char *key, int value, bool final)
     else if (!strcmp(key, NOMI_KEY_VOICE)) s_voice = value;
     else if (!strcmp(key, NOMI_KEY_DIM)) s_dim = value;
     else if (!strcmp(key, NOMI_KEY_OFF)) s_off = value;
+    else if (!strcmp(key, NOMI_KEY_ONE_SHOT)) s_one_shot = value;
 }
 
 // GetText：没连上路由器时 Wi-Fi、IP 都是空的；设置页地址协议启动后才有
@@ -806,6 +809,8 @@ void sim_tts_stop(void)
 {
     if (s_chat != CHAT_SPEAKING) return;
     set_chat(auto_mode() ? CHAT_LISTENING : CHAT_IDLE);
+    // 一问一答：DirectApiProtocol 说完这轮就 EndConversation
+    if (s_one_shot && auto_mode()) close_channel("one shot");
 }
 
 void sim_turn_error(void) { s_thinking = false; chat_error(s_str); }

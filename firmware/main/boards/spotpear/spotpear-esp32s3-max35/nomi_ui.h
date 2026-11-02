@@ -37,6 +37,7 @@ typedef enum {
 #define NOMI_KEY_VOICE "voice"            // voices 列表里的下标，-1 为自定义
 #define NOMI_KEY_DIM "dim"                // NOMI_DIM_SECONDS 的下标
 #define NOMI_KEY_OFF "off"                // NOMI_OFF_SECONDS 的下标
+#define NOMI_KEY_ONE_SHOT "one_shot"      // 一问一答：1 = 回答完一句就回待机，0 = 连续对话（默认）
 
 // 多久后调暗 / 息屏，-1 表示从不；设置页的选项和这里一一对应
 #define NOMI_DIM_SECONDS {30, 60, 120, 300, -1}
@@ -52,8 +53,7 @@ typedef struct {
     // saved_wifi（已存的 Wi-Fi，'\n' 分隔）、hotspot / hotspot_url（配网热点名和网址，不在配网模式时为空）。
     // 不认识的 key 返回空串
     const char *(*get_text)(const char *key);
-    // 动作：test_api、reconfigure_wifi、factory_reset、toggle_listen（连续聆听开关：
-    // 开 = 待机时开始连续对话，关 = 退出对话回待机）
+    // 动作：test_api、reconfigure_wifi、factory_reset
     void (*action)(const char *name);
     // 聊天历史（第二页）：下标 0 最旧；role 为 "user" / "assistant"，文本只需在下一次调用前有效
     int (*history_count)(void);

@@ -160,6 +160,10 @@ int GetInt(const char* key, int def) {
         // 静音模式开关：读写直连 API 的配置（网页设置页和 self.voice.set_speak 也是这一份）
         return Settings(kDirectApiNs).GetString("tts_speak") != "0";  // 没存过就是开
     }
+    if (!strcmp(key, NOMI_KEY_ONE_SHOT)) {
+        // 一问一答由直连协议在每轮说完时读，存在它的命名空间里
+        return Settings(kDirectApiNs).GetString("one_shot") == "1";
+    }
     if (!strcmp(key, NOMI_KEY_PERSONA)) {
         // 按当前提示词反查是哪个预设；网页里改过就算自定义
         std::string prompt = Settings(kDirectApiNs).GetString("prompt");
@@ -190,6 +194,10 @@ void SetInt(const char* key, int value, bool final) {
     if (!strcmp(key, NOMI_KEY_TTS_SPEAK)) {
         // 格式和网页设置页 / self.voice.set_speak 一致："1" 开 "0" 关
         Settings(kDirectApiNs, true).SetString("tts_speak", value ? "1" : "0");
+        return;
+    }
+    if (!strcmp(key, NOMI_KEY_ONE_SHOT)) {
+        Settings(kDirectApiNs, true).SetString("one_shot", value ? "1" : "0");
         return;
     }
     if (!strcmp(key, NOMI_KEY_BRIGHTNESS)) {
@@ -272,19 +280,7 @@ const char* GetText(const char* key) {
 
 void Action(const char* name) {
     auto& app = Application::GetInstance();
-    if (!strcmp(name, "toggle_listen")) {
-        // 屏幕上的“连续聆听”开关：待机点开 = 进连续对话；聆听 / 说话中点关 = 退出回待机
-        app.Schedule([]() {
-            auto& app = Application::GetInstance();
-            auto state = app.GetDeviceState();
-            if (state == kDeviceStateIdle) {
-                app.ToggleChatState();
-            } else if (state == kDeviceStateListening || state == kDeviceStateSpeaking ||
-                       state == kDeviceStateConnecting) {
-                app.EndConversation();
-            }
-        });
-    } else if (!strcmp(name, "reconfigure_wifi")) {
+    if (!strcmp(name, "reconfigure_wifi")) {
         app.Schedule([]() { static_cast<WifiBoard&>(Board::GetInstance()).EnterWifiConfigMode(); });
     } else if (!strcmp(name, "factory_reset")) {
         app.Schedule([]() {

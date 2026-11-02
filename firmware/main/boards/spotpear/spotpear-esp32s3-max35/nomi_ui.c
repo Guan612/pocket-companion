@@ -31,7 +31,6 @@ static lv_obj_t *s_outer, *s_settings_tile, *s_main_tile;
 static lv_obj_t *s_modes, *s_chat_tile, *s_hist_tile;
 static lv_obj_t *s_canvas, *s_hist_list;
 static lv_obj_t *s_status, *s_battery, *s_subtitle, *s_toast;
-static lv_obj_t *s_listen_sw;  // 连续聆听开关（设置 → 对话，跟着设备状态亮灭）
 static lv_timer_t *s_toast_timer;
 static uint32_t s_last_ms, s_emotion_until;
 static float s_acc;
@@ -42,8 +41,6 @@ static bool s_hist_was_open;  // 睡着前停在历史页的话，醒来回那�
 static bool s_hist_dirty;     // 有新消息，历史页可见时要重建列表
 static nomi_state_t s_last_state = NOMI_STATE_IDLE;
 static uint32_t s_subtitle_hide_at;  // 到这个时刻收起字幕，0 表示不收
-static bool s_sw_syncing;            // 状态同步改开关时不算用户操作
-static uint32_t s_listen_hold_until; // 用户刚点过连续聆听开关：这段时间状态同步别把开关扳回去
 // 历史页增量更新：列表里的标签和记录一一对应，只追加新消息、改最后一条、删掉记录头上丢掉的
 static int s_hist_shown;        // 列表里已有几条消息
 static int s_hist_base;         // 上次同步时记录已经从头上丢掉了几条
@@ -78,7 +75,6 @@ static void show_main(bool anim);
 static void show_page(int page, bool anim);
 static void on_face_pressed(lv_event_t *e);
 static void sync_history(bool to_bottom);
-static void sync_listen_switch(nomi_state_t state);
 
 // 二维码用 Nayuki 的 qrcodegen：设备上由小智依赖的 esp_emote_gfx 带进来，模拟器里由 LVGL 带进来。
 // 两份同名，不能同时链接，所以不打开 LVGL 的 qrcode 控件，只声明这里用到的三个函数。
@@ -166,8 +162,6 @@ static void face_tick(lv_timer_t *timer)
     }
     s_last_state = state;
 
-    // 连续聆听开关跟着设备状态走
-    sync_listen_switch(state);
 
     // 来了新消息且正停在历史页：只把新句子补上去（不在拖动列表时做，免得滚动中跳一下）
     if (s_hist_dirty && hist_page_active() && !lv_obj_is_scrolling(s_hist_list)) {
@@ -486,46 +480,6 @@ static lv_obj_t *add_switch(lv_obj_t *page, const char *title, const char *hint,
     return sw;
 }
 
-/* ---------- 连续聆听开关（设置 → 对话）：不是存的设置，就是"现在在不在连续对话" ---------- */
-
-// 开关亮灭跟着设备状态走：聆听 / 说话中就是开。设置页开着时 face_tick 每帧对一次，
-// 对话自动结束（没人说话回待机）开关也会自己灭。
-// 开 / 关是异步生效的（要排进主任务开通道），用户刚点过的几秒里别把开关扳回去，等状态落定再说
-static void sync_listen_switch(nomi_state_t state)
-{
-    if (!s_listen_sw) return;
-    if ((int32_t)(s_listen_hold_until - lv_tick_get()) > 0) return;  // 用户刚点过，先别抢
-    bool on = state == NOMI_STATE_LISTENING || state == NOMI_STATE_THINKING || state == NOMI_STATE_SPEAKING;
-    if (lv_obj_has_state(s_listen_sw, LV_STATE_CHECKED) == on) return;
-    s_sw_syncing = true;  // 程序改状态也可能触发事件，别当成用户点了一下
-    if (on) lv_obj_add_state(s_listen_sw, LV_STATE_CHECKED);
-    else lv_obj_remove_state(s_listen_sw, LV_STATE_CHECKED);
-    s_sw_syncing = false;
-}
-
-static void on_listen_switch(lv_event_t *e)
-{
-    (void)e;
-    if (s_sw_syncing) return;
-    user_activity();
-    s_listen_hold_until = lv_tick_get() + 3000;
-    action("toggle_listen");  // 开：待机进连续聆听；关：退出对话回待机
-}
-
-static void add_listen_switch(lv_obj_t *page)
-{
-    lv_obj_t *item = add_item(page, "连续聆听",
-                              "打开就开始连续对话，关闭退出回待机；BOOT 键和唤醒词都不用");
-    s_listen_sw = lv_switch_create(item);
-    lv_obj_add_flag(s_listen_sw, LV_OBJ_FLAG_IGNORE_LAYOUT);
-    lv_obj_align(s_listen_sw, LV_ALIGN_TOP_RIGHT, 0, -2);
-    lv_obj_set_style_bg_color(s_listen_sw, lv_color_hex(C_CONTROL), LV_PART_MAIN);
-    lv_obj_set_style_bg_color(s_listen_sw, lv_color_hex(C_ACCENT), LV_PART_INDICATOR | LV_STATE_CHECKED);
-    lv_obj_set_style_bg_color(s_listen_sw, lv_color_hex(C_TEXT), LV_PART_KNOB);
-    lv_obj_add_event_cb(s_listen_sw, on_listen_switch, LV_EVENT_VALUE_CHANGED, NULL);
-    sync_listen_switch(s_cb.get_state ? s_cb.get_state() : NOMI_STATE_IDLE);  // 建出来就是当前状态
-}
-
 static void on_choice(lv_event_t *e)
 {
     lv_obj_t *btnm = lv_event_get_target(e);
@@ -696,7 +650,9 @@ static void build_chat_page(lv_obj_t *page)
 {
     static const char *const talk[] = {"按住说话", "点一下开始", ""};
     add_choice(page, "BOOT 键", "也可以直接喊「你好小智」", NOMI_KEY_TALK_KEY, talk, 1);
-    add_listen_switch(page);
+    // 不开时是连续对话：回答完接着听，5 秒没人开口自己回待机，说"退下吧"马上回
+    add_switch(page, "一问一答", "回答完一句就回待机，下次说话要再叫它；不开就是连续对话", NOMI_KEY_ONE_SHOT,
+               true);
     bool aec_ok = get_int(NOMI_KEY_AEC_SUPPORTED, 0);
     add_switch(page, "随时插话打断",
                aec_ok ? "它说话时直接开口就能打断" : "这块板没有喇叭回采，不支持", NOMI_KEY_AEC,
@@ -837,7 +793,7 @@ static void settings_signature(char *out, size_t size)
     static const char *const keys[] = {NOMI_KEY_TALK_KEY, NOMI_KEY_AEC,     NOMI_KEY_AEC_SUPPORTED,
                                        NOMI_KEY_SUBTITLES, NOMI_KEY_PERSONA, NOMI_KEY_VOICE,
                                        NOMI_KEY_BRIGHTNESS, NOMI_KEY_DIM,    NOMI_KEY_OFF,
-                                       NOMI_KEY_VOLUME,    NOMI_KEY_TTS_SPEAK};
+                                       NOMI_KEY_VOLUME,    NOMI_KEY_TTS_SPEAK, NOMI_KEY_ONE_SHOT};
     static const char *const texts[] = {"voices", "wifi_ssid", "ip", "config_url", "hotspot", "saved_wifi"};
     size_t len = 0;
     out[0] = '\0';
@@ -854,7 +810,6 @@ static void build_settings(void)
 {
     settings_signature(s_settings_sig, sizeof(s_settings_sig));
     lv_obj_clean(s_settings_tile);
-    s_listen_sw = NULL;
     s_wifi_label = NULL;
 
     lv_obj_t *tv = lv_tabview_create(s_settings_tile);

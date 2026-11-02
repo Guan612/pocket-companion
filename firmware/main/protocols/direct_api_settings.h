@@ -25,6 +25,7 @@ constexpr const char* kAsrLang = "asr_lang";
 constexpr const char* kTtsVoice = "tts_voice";
 constexpr const char* kTtsVoices = "tts_voices";  // 合成供应商的音色列表（一行一个），给屏幕上的音色选择用
 constexpr const char* kTtsSpeak = "tts_speak";    // 语音播报开关，"0" 关；没存过按开算
+constexpr const char* kOneShot = "one_shot";      // 一问一答："1" 回答完一句就回待机；没存过是连续对话
 constexpr const char* kPrompt = "prompt";
 
 struct Provider {

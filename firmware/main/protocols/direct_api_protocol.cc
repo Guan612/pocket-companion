@@ -292,6 +292,7 @@ DirectApiConfig DirectApiConfig::Load() {
     c.asr_language = s.GetString(kAsrLang);
     c.system_prompt = s.GetString(kPrompt);
     c.tts_speak = s.GetString(kTtsSpeak) != "0";  // 没存过就是开
+    c.one_shot = s.GetString(kOneShot) == "1";
     if (c.tts_voice.empty()) c.tts_voice = "alloy";
     if (c.asr_language.empty()) c.asr_language = "zh";
     if (c.system_prompt.empty()) c.system_prompt = kDefaultPrompt;
@@ -618,9 +619,10 @@ void DirectApiProtocol::RunTurn(std::string packets) {
         }
     }
     EmitJson("tts", "state", "stop");
-    // "退下吧"：这轮说完就退出聆听回待机。tts stop 已排进主任务（先切回聆听），
-    // EndConversation 排在它后面，看到的正是聆听状态
-    if (exit_after_reply_.exchange(false) && opened_) {
+    // "退下吧"或一问一答：这轮说完就退出聆听回待机。tts stop 已排进主任务（先切回聆听），
+    // EndConversation 排在它后面，看到的正是聆听状态。按住说话松手后本来就回待机，不用管
+    bool one_shot = cfg.one_shot && mode_ != kListeningModeManualStop;
+    if ((exit_after_reply_.exchange(false) || one_shot) && opened_) {
         app.EndConversation();
     }
 }

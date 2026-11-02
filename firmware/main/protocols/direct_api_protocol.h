@@ -35,6 +35,7 @@ struct DirectApiConfig {
     std::string asr_language;
     std::string system_prompt;
     bool tts_speak = true;  // 语音播报：关了只出字幕，不调合成接口
+    bool one_shot = false;  // 一问一答：自动聆听时回答完一句就回待机，不接着听
 
     static DirectApiConfig Load();
     bool IsComplete() const;
