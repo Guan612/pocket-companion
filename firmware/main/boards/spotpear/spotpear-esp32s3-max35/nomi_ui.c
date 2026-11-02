@@ -1391,45 +1391,58 @@ static lv_obj_t *add_label(lv_obj_t *parent, const lv_font_t *font, uint32_t col
 
 static void build_clock_page(void)
 {
-    // 大数字：四个数字格 80 宽、冒号格 34 宽，整排居中
-    const int digit_w = 80, colon_w = 34, y = 34;
-    int x = (FACE_W - digit_w * 4 - colon_w) / 2;
-    for (int i = 0; i < 5; i++) {
+    // 整页一列、上下居中：闹钟多一行少一行，空白都均匀分到上下，不全堆在底下
+    lv_obj_t *col = lv_obj_create(s_clock_tile);
+    lv_obj_remove_style_all(col);
+    lv_obj_set_size(col, FACE_W, FACE_H);
+    lv_obj_set_flex_flow(col, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(col, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_top(col, 20, 0);  // 顶上有状态文字和电量
+    lv_obj_set_style_pad_row(col, 8, 0);
+    lv_obj_remove_flag(col, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_remove_flag(col, LV_OBJ_FLAG_CLICKABLE);  // 点到空白处交给整页（叫醒）
+
+    // 大数字：四个数字格 80 宽、冒号格 34 宽
+    const int digit_w = 80, colon_w = 34;
+    lv_obj_t *digits = lv_obj_create(col);
+    lv_obj_remove_style_all(digits);
+    lv_obj_set_size(digits, digit_w * 4 + colon_w, 86);
+    lv_obj_remove_flag(digits, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_remove_flag(digits, LV_OBJ_FLAG_CLICKABLE);
+    for (int i = 0, x = 0; i < 5; i++) {
         int w = i == 2 ? colon_w : digit_w;
-        s_clock_digit[i] = add_label(s_clock_tile, &nomi_font_clock_120, C_TEXT);
+        s_clock_digit[i] = add_label(digits, &nomi_font_clock_120, C_TEXT);
         lv_obj_set_width(s_clock_digit[i], w);
         lv_obj_set_style_text_align(s_clock_digit[i], LV_TEXT_ALIGN_CENTER, 0);
-        lv_obj_set_pos(s_clock_digit[i], x, y);
+        lv_obj_set_pos(s_clock_digit[i], x, 0);
         x += w;
     }
-    s_clock_date = add_label(s_clock_tile, NULL, C_MUTED);
+    s_clock_date = add_label(col, NULL, C_MUTED);
     lv_obj_set_width(s_clock_date, FACE_W);
     lv_obj_set_style_text_align(s_clock_date, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_set_pos(s_clock_date, 0, y + 94);
 
-    // 天气一行：图标、温度、说明
-    s_wx_row = lv_obj_create(s_clock_tile);
+    // 天气一行：图标、温度、说明（没有天气时隐藏，不占位置）
+    s_wx_row = lv_obj_create(col);
     lv_obj_remove_style_all(s_wx_row);
     lv_obj_set_size(s_wx_row, LV_SIZE_CONTENT, 44);
     lv_obj_set_flex_flow(s_wx_row, LV_FLEX_FLOW_ROW);
     lv_obj_set_flex_align(s_wx_row, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
     lv_obj_set_style_pad_column(s_wx_row, 12, 0);
     lv_obj_remove_flag(s_wx_row, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_align(s_wx_row, LV_ALIGN_TOP_MID, 0, y + 128);
     s_wx_icon = add_label(s_wx_row, &nomi_font_icon_36, C_TEXT);
     s_wx_temp = add_label(s_wx_row, &nomi_font_icon_36, C_TEXT);
     s_wx_text = add_label(s_wx_row, NULL, C_MUTED);
     lv_obj_add_flag(s_wx_row, LV_OBJ_FLAG_HIDDEN);
 
     // 闹钟列表
-    s_alarm_list = lv_obj_create(s_clock_tile);
+    s_alarm_list = lv_obj_create(col);
     lv_obj_remove_style_all(s_alarm_list);
     lv_obj_set_size(s_alarm_list, 380, LV_SIZE_CONTENT);
     lv_obj_set_flex_flow(s_alarm_list, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_flex_align(s_alarm_list, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
     lv_obj_set_style_pad_row(s_alarm_list, 2, 0);
     lv_obj_remove_flag(s_alarm_list, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_align(s_alarm_list, LV_ALIGN_TOP_MID, 0, y + 180);
+    lv_obj_remove_flag(s_alarm_list, LV_OBJ_FLAG_CLICKABLE);
 
     lv_obj_add_flag(s_clock_tile, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_add_event_cb(s_clock_tile, on_face_pressed, LV_EVENT_PRESSED, NULL);
