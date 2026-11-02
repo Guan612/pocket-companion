@@ -33,6 +33,9 @@ EXPORTS = [
     "sim_face_play",
     # 时钟页：本地时间、闹钟调试
     "sim_set_time", "sim_alarm_demo", "sim_alarm_ring",
+    # 电台：<audio> 跟着设备状态放 / 停
+    "sim_radio_audible", "sim_radio_wanted", "sim_radio_index", "sim_radio_set_state", "sim_radio_stop",
+    "sim_radio_play", "sim_radio_step",
 ]
 
 
@@ -72,7 +75,7 @@ def main():
     lvgl = lvgl_dir()
     sources = sorted(str(p) for p in (lvgl / "src").rglob("*.c"))
     sources += [str(HERE / "sim_main.c"), *(str(BOARD / f) for f in ("nomi_ui.c", "face.c", "face_script.c", "raster.c",
-                                                                    "nomi_font_clock_120.c", "nomi_font_weather_36.c"))]
+                                                                    "nomi_font_clock_120.c", "nomi_font_icon_36.c"))]
     sources.append(str(CJSON / "cJSON.c"))
     sources.append(str(FONTS / "src" / "cbin_font.c"))
     shutil.copyfile(FONTS / "cbin" / FONT_BIN, HERE / FONT_BIN)

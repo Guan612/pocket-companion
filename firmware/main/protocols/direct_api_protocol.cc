@@ -391,6 +391,7 @@ void DirectApiProtocol::CloseAudioChannel(bool send_goodbye) {
     recording_ = false;
     thinking_ = false;
     exit_after_reply_ = false;  // 对话都没了，别把"说完退出"带进下一场
+    exit_requested_ = false;
     bool was_opened = opened_.exchange(false);
     // 丢掉已排队还没开始的轮次：不然它们会带着旧录音跑识别，
     // 甚至被下一场对话的 SendStartListening 唤醒后立刻把新对话顶回待机
@@ -622,7 +623,9 @@ void DirectApiProtocol::RunTurn(std::string packets) {
     // "退下吧"或一问一答：这轮说完就退出聆听回待机。tts stop 已排进主任务（先切回聆听），
     // EndConversation 排在它后面，看到的正是聆听状态。按住说话松手后本来就回待机，不用管
     bool one_shot = cfg.one_shot && mode_ != kListeningModeManualStop;
-    if ((exit_after_reply_.exchange(false) || one_shot) && opened_) {
+    bool leave = exit_after_reply_.exchange(false);
+    leave = exit_requested_.exchange(false) || leave;
+    if ((leave || one_shot) && opened_) {
         app.EndConversation();
     }
 }
@@ -1159,6 +1162,7 @@ static int PostStatus(Http& http, const std::string& url) {
 
 std::string DirectApiProtocol::face_prompt;
 std::atomic<bool> DirectApiProtocol::thinking_{false};
+std::atomic<bool> DirectApiProtocol::exit_requested_{false};
 std::function<bool(const std::string&, std::string&)> DirectApiProtocol::face_handler;
 std::function<std::string()> DirectApiProtocol::context_provider;
 

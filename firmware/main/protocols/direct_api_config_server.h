@@ -20,6 +20,11 @@ void Stop();
 // 保存时天气城市变了（板子用它马上重新查天气）
 extern std::function<void()> on_city_changed;
 
+// 板子挂自己的接口（比如电台台单）：handler 收请求体（GET 时为空），返回 JSON；
+// 返回 "!原因" 时回 {"ok":false,"error":原因}。要在 Start() 之前加
+using JsonHandler = std::function<std::string(const std::string& body)>;
+void AddJsonHandler(const char* uri, bool post, JsonHandler handler);
+
 }  // namespace DirectApiConfigServer
 
 #endif  // DIRECT_API_CONFIG_SERVER_H

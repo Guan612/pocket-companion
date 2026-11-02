@@ -13,6 +13,7 @@
 #endif
 #include "nomi_clock.h"
 #include "nomi_display.h"
+#include "nomi_radio.h"
 #include "nomi_ui.h"
 #include "power_save_timer.h"
 #include "wifi_board.h"
@@ -358,15 +359,35 @@ private:
         auto& clock = NomiClock::GetInstance();
         clock.RegisterTools();
         clock.on_ring_start = [this](const std::string& time, const std::string& label) {
+            NomiRadio::GetInstance().SetAlarmHold(true);  // 电台先停，别和铃声混在一起
             power_save_timer_->WakeUp();  // 睡着 / 息屏也要亮起来
             GetBacklight()->RestoreBrightness();
             display_->ShowAlarm(time, label);
         };
-        clock.on_ring_stop = [this]() { display_->HideAlarm(); };
+        clock.on_ring_stop = [this]() {
+            display_->HideAlarm();
+            NomiRadio::GetInstance().SetAlarmHold(false);
+        };
+        // 电台：放、停、换台、收藏
+        NomiRadio::GetInstance().RegisterTools();
 #if CONFIG_DIRECT_API
-        // 每轮对话的系统提示词里带上现在几点、天气、已设的闹钟（设"明早 7 点"要知道今天是哪天）
-        DirectApiProtocol::context_provider = []() { return NomiClock::GetInstance().PromptContext(); };
+        // 每轮对话的系统提示词里带上现在几点、天气、已设的闹钟、电台（设"明早 7 点"要知道今天是哪天）
+        DirectApiProtocol::context_provider = []() {
+            return NomiClock::GetInstance().PromptContext() + "\n" + NomiRadio::GetInstance().PromptContext();
+        };
         DirectApiConfigServer::on_city_changed = []() { NomiClock::GetInstance().RefreshWeather(); };
+        // 网页设置页的「电台」卡片
+        DirectApiConfigServer::AddJsonHandler("/radio.json", false,
+                                              [](const std::string&) { return NomiRadio::GetInstance().ListJson(); });
+        DirectApiConfigServer::AddJsonHandler("/radio/add", true, [](const std::string& body) {
+            return NomiRadio::GetInstance().AddFromJson(body);
+        });
+        DirectApiConfigServer::AddJsonHandler("/radio/delete", true, [](const std::string& body) {
+            return NomiRadio::GetInstance().DeleteFromJson(body);
+        });
+        DirectApiConfigServer::AddJsonHandler("/radio/play", true, [](const std::string& body) {
+            return NomiRadio::GetInstance().PlayFromJson(body);
+        });
         DirectApiProtocol::face_prompt = NomiDisplay::FacePrompt();
         DirectApiProtocol::face_handler = [this](const std::string& json, std::string& error) {
             return display_->PlayFace(json, error);
@@ -408,6 +429,7 @@ public:
         InitializeButtons();
         InitializeTools();
         NomiClock::GetInstance().Start();  // 时区、闹钟；联网后自己对时、拉天气
+        NomiRadio::GetInstance().Start();  // 台单、收流 / 解码任务（平时睡着）
         GetBacklight()->RestoreBrightness();
     }
 

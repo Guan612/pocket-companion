@@ -277,6 +277,9 @@ button{font:inherit;color:var(--fg)}
     for(const a of res.actions||[]){
       if(a.type==='face')playFace(a.script);
       else if(a.type==='exit_chat')exitAfter=true;
+      else if(a.type==='radio'){if(a.index<0){radioTemp={name:a.name,url:a.url};setStr(a.name)}x.sim_radio_play(a.index)}
+      else if(a.type==='radio_step')x.sim_radio_step(a.delta);
+      else if(a.type==='radio_stop')x.sim_radio_stop();
       else x.sim_apply(a.type==='volume'?0:1,a.value);
     }
     if(res.error){setStr(res.error);x.sim_turn_error();return}
@@ -349,6 +352,7 @@ button{font:inherit;color:var(--fg)}
     setText(0,cfg.wifi_ssid);setText(1,cfg.settings_url.shown);setText(2,cfg.device_ip);
     setText(3,cfg.ap_url.shown);setText(4,cfg.ap_ssid);setText(5,cfg.voices.join(String.fromCharCode(10)));setText(6,(cfg.saved_wifi||[]).join(String.fromCharCode(10)));
     setText(7,cfg.city||'');
+    radioStations=cfg.radio||[];radioTemp=null;setText(8,radioStations.map(s=>s.name).join(String.fromCharCode(10)));
     seq=(await (await fetch('/sim/events?since=0')).json()).seq;  // 开机前的旧事件不再处理
     lastNet=-1;lastStage=-1;
     log(`--- ${why}：${cfg.wifi_ssid?'存过 Wi-Fi「'+cfg.wifi_ssid+'」':'没存 Wi-Fi'}，API ${cfg.api_ok?'已配好':'未配置'} ---`,'S');
@@ -369,6 +373,9 @@ button{font:inherit;color:var(--fg)}
         else if(ev.type==='wifi_list'){setText(6,(ev.saved||[]).join(String.fromCharCode(10)))}
         else if(ev.type==='ap_exit')e.sim_ap_exit();
         else if(ev.type==='settings_saved'){apiOk=ev.api_ok;setText(5,(ev.voices||[]).join(String.fromCharCode(10)));setText(7,ev.city||'');e.sim_settings_saved(ev.api_ok?1:0)}
+        else if(ev.type==='radio_list'){radioStations=ev.stations||[];setText(8,radioStations.map(s=>s.name).join(String.fromCharCode(10)))}
+        else if(ev.type==='radio_play')e.sim_radio_play(ev.index);
+        else if(ev.type==='radio_stop')e.sim_radio_stop();
       }
       seq=r.seq;
     }catch{}finally{polling=false}
@@ -444,11 +451,35 @@ button{font:inherit;color:var(--fg)}
 
   // ---------- 每帧 ----------
   let frames=0,area=0;
+  // ---------- 电台：设备说该出声就用 <audio> 放（浏览器能直接放 MP3 / AAC 直播流） ----------
+  const radio=new Audio();
+  let radioStations=[],radioTemp=null,radioKey='',radioReport='';
+  radio.addEventListener('playing',()=>e&&radioKey&&e.sim_radio_set_state(2));
+  radio.addEventListener('waiting',()=>e&&radioKey&&e.sim_radio_set_state(1));
+  radio.addEventListener('error',()=>{if(e&&radioKey){e.sim_radio_set_state(4);log('W (radio) 浏览器放不了这个流：'+radioKey,'W')}});
+  const radioTick=()=>{
+    const idx=e.sim_radio_index(),st=idx>=0?radioStations[idx]:radioTemp;
+    const key=e.sim_radio_audible()&&st?st.url:'';
+    if(key!==radioKey){
+      radioKey=key;
+      if(key){radio.src=key;radio.play().catch(()=>e.sim_radio_set_state(4))}
+      else{radio.pause();radio.removeAttribute('src');radio.load()}
+    }
+    radio.volume=Math.min(1,e.sim_volume()/100);
+    const rep=e.sim_radio_wanted()?idx+'|'+(st?st.name:''):'-2|';  // 报给 serve.py：网页上的播放按钮、系统提示里的"正在放"
+    if(rep!==radioReport){
+      radioReport=rep;
+      const [i,name]=rep.split('|');
+      fetch('/sim/radio',{method:'POST',body:JSON.stringify({index:+i,name})}).catch(()=>{});
+    }
+  };
+
   const loop=()=>{
     requestAnimationFrame(loop);
     if(!e)return;
     e.sim_set_time(Date.now()/1000-new Date().getTimezoneOffset()*60);  // 本地时间，给时钟页
     area+=e.sim_frame(now())/(W*H);frames++;
+    radioTick();
     const x0=e.sim_dirty_x0(),y0=e.sim_dirty_y0(),x1=e.sim_dirty_x1(),y1=e.sim_dirty_y1();
     if(x1>x0&&y1>y0){
       const lcd=new Uint16Array(e.memory.buffer,e.sim_lcd(),W*H);

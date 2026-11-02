@@ -51,6 +51,46 @@ MAX_PROVIDERS, MAX_MODELS, MAX_PROVIDER_BYTES = 8, 30, 3800
 ROLES = ("chat", "vision", "asr", "tts")
 MEMORY_MAX_BYTES = 2000  # LongTermMemory::kMaxBytes
 MAX_SAVED_WIFI = 10  # esp-wifi-connect SsidManager 的 MAX_WIFI_SSID_COUNT
+MAX_STATIONS = 20  # NomiRadio 的 kMaxStations
+# NomiRadio 的默认台单（设备上没改过台单时用这份）
+RADIO_DEFAULTS = [
+    {"name": "华语经典", "url": "http://lhttp.qingting.fm/live/5022308/64k.mp3"},
+    {"name": "AsiaFM 高清", "url": "http://asiafm.hk:8000/asiahd"},
+    {"name": "怀集音乐", "url": "http://lhttp.qingting.fm/live/4804/64k.mp3"},
+    {"name": "两广音乐", "url": "http://lhttp.qingting.fm/live/20500149/64k.mp3"},
+    {"name": "中国之声", "url": "http://lhttp.qingting.fm/live/15318317/64k.mp3"},
+    {"name": "第一财经", "url": "http://lhttp.qingting.fm/live/276/64k.mp3"},
+    {"name": "故事广播", "url": "http://lhttp.qingting.fm/live/20500182/64k.mp3"},
+    {"name": "评书", "url": "http://lhttp.qingting.fm/live/1951/64k.mp3"},
+]
+radio_now = {"index": -2, "name": ""}  # 设备上正在放哪个（sim.html 报上来）；-2 没在放，-1 搜来的台
+
+
+def radio_list():
+    """台单：设备存储里没有就是默认的（和 NomiRadio::LoadList 一样）。调用方持有 lock。"""
+    if nvs.get("radio") is None:
+        nvs["radio"] = [dict(s) for s in RADIO_DEFAULTS]
+    return nvs["radio"]
+
+
+def radio_search(query):
+    """NomiRadio::Search：电台目录按名字搜，取票数最高的一个能直接放的（MP3 / AAC，不要 m3u8）。"""
+    url = ("http://all.api.radio-browser.info/json/stations/search?hidebroken=true&order=votes&reverse=true&limit=8&name="
+           + quote(query))
+    try:
+        with urllib.request.urlopen(urllib.request.Request(url, headers={"User-Agent": "PocketCompanion/1.0"}), timeout=8) as r:
+            items = json.loads(r.read())
+    except Exception:
+        return None
+    for s in items:
+        u = s.get("url_resolved") or ""
+        if s.get("hls") or not u or ".m3u8" in u or s.get("codec") not in ("MP3", "AAC", "AAC+"):
+            continue
+        for host in ("https://lhttp.qtfm.cn/", "https://lhttp.qingting.fm/"):
+            if u.startswith(host):
+                u = "http://lhttp.qingting.fm/" + u[len(host):]
+        return {"name": (s.get("name") or query)[:20], "url": u}
+    return None
 
 
 def empty_settings():
@@ -189,6 +229,11 @@ TOOLS = [
     {"type": "function", "function": {"name": "self.chat.end",
      "description": "结束这轮对话并退出聆听，设备回到待机，直到主人再叫你。主人说\"退下吧\"\"你可以退下了\"\"今天就聊到这儿\"\"先这样吧\"之类要结束对话时调用；主人只是让你别说话（\"别说了\"\"闭嘴\"）时不要调用这个工具。调用后你仍要把这句回答说完，说完设备才安静下来。",
      "parameters": {"type": "object", "properties": {}}}},
+    {"type": "function", "function": {"name": "self.radio.play",
+     "description": "放网络电台 / 音乐。主人说\"放点音乐\"\"来点轻音乐\"\"听新闻\"\"放中国之声\"\"换个台\"时调用。station：台名（收藏的台见系统提示），也可以是想听的类型或别的台名（会去网上的电台目录搜）；\"下一个\"\"上一个\"换台；空字符串接着放上次的台。调用后把这句回答说完，设备就安静下来开始放。",
+     "parameters": {"type": "object", "properties": {"station": {"type": "string", "maxLength": 60}}}}},
+    {"type": "function", "function": {"name": "self.radio.stop", "description": "停掉电台 / 音乐。主人说\"关掉音乐\"\"别放了\"\"停\"时调用。",
+     "parameters": {"type": "object", "properties": {}}}},
     {"type": "function", "function": {"name": "self.camera.look",
      "description": "看一眼摄像头拍到的画面并说出看到了什么。主人让你看东西、认东西、读画面上的文字、描述眼前的场景时调用；question 写上你想从画面里知道的问题。",
      "parameters": {"type": "object", "properties": {"question": {"type": "string"}}, "required": ["question"]}}},
@@ -293,6 +338,33 @@ def call_tool(name, args, device, actions):
         return "好的，这句说完就退出聆听"
     if name == "self.camera.look":  # 模拟器没有摄像头，按固件"没拍到"的分支走
         return "已拍下画面，照片随后作为用户消息发给你"
+    if name == "self.radio.play":  # NomiRadio：台单里找，找不到去目录搜；说完这句就回待机开始放
+        q = str(a.get("station", "")).strip()
+        with lock:
+            names = [s["name"] for s in radio_list()]
+        actions.append({"type": "exit_chat"})
+        if not q:
+            actions.append({"type": "radio", "index": max(radio_now["index"], 0)})
+            return "好的，接着放"
+        if q in ("下一个", "next", "上一个", "prev"):
+            actions.append({"type": "radio_step", "delta": 1 if q in ("下一个", "next") else -1})
+            return "换台了"
+        lq = q.lower()
+        match = next((i for i, n in enumerate(names) if n.lower() == lq), None)
+        if match is None:
+            match = next((i for i, n in enumerate(names) if n.lower() in lq or lq in n.lower()), None)
+        if match is not None:
+            actions.append({"type": "radio", "index": match})
+            return f"好的，放「{names[match]}」"
+        found = radio_search(q)
+        if not found:
+            actions.pop()
+            return f"收藏里没有，网上的电台目录也没搜到「{q}」；可以换个说法，或在网页设置页添加电台地址"
+        actions.append({"type": "radio", "index": -1, **found})
+        return f"搜到「{found['name']}」，马上放；主人想以后还听可以说\"收藏这个台\""
+    if name == "self.radio.stop":
+        actions.append({"type": "radio_stop"})
+        return "已停止"
     return f"Unknown tool: {name}"
 
 
@@ -332,6 +404,10 @@ def chat(cfg, user_text, device, actions, log):
         if nvs["memory"]:
             system += "\n\n[主人的长期记忆]（回答时自然运用，不要整段复述）\n" + nvs["memory"]
         system += "\n\n" + FACE_PROMPT
+        with lock:  # NomiRadio::PromptContext
+            names = "、".join(s["name"] for s in radio_list())
+        system += ("\n\n电台：" + (f"正在放「{radio_now['name']}」" if radio_now["index"] > -2 else "没在放") +
+                   f"。收藏的台：{names}。")
         if with_tools:
             system += TOOLS_HINT
         req = {"model": llm["model"],
@@ -596,8 +672,11 @@ class SimHandler(Handler):
                 net["ssid"] = wifi  # 模拟器开机连存储里第一个
                 speak = bool(nvs["directapi"].get("tts_speak", True))
                 city = nvs["directapi"].get("city", "")
+                radio = [dict(s) for s in radio_list()]
+            radio_now.update(index=-2, name="")
             return self.send(200, {"wifi_ssid": wifi, "saved_wifi": saved, "api_ok": api_complete(), "ap_ssid": AP_SSID,
-                                   "env": env, "voices": voice_labels(), "speak": speak, "city": city, **urls})
+                                   "env": env, "voices": voice_labels(), "speak": speak, "city": city, "radio": radio,
+                                   **urls})
         if u.path == "/sim/events":
             since = int(parse_qs(u.query).get("since", ["0"])[0])
             with lock:
@@ -613,6 +692,11 @@ class SimHandler(Handler):
                        "sta": "设备连上 Wi-Fi"}.get(mode, mode))
             net["mode"] = mode
             return self.send(200, {})
+        if u.path == "/sim/radio":
+            req = json.loads(self.body() or b"{}")
+            with lock:
+                radio_now.update(index=int(req.get("index", -2)), name=str(req.get("name", "")))
+            return self.send(200, {})
         if u.path == "/sim/reset":
             what = parse_qs(u.query).get("what", ["all"])[0]
             with lock:
@@ -620,6 +704,7 @@ class SimHandler(Handler):
                 if what == "all":
                     nvs["directapi"] = empty_settings()
                     nvs["memory"] = ""
+                    nvs.pop("radio", None)
                 save_nvs()
             print("清除 Wi-Fi" if what == "wifi" else "恢复出厂：设备存储已清空")
             return self.send(200, {})
@@ -778,6 +863,9 @@ class StaHandler(Handler):
             with lock:
                 current = net["ssid"] if net["mode"] == "sta" and env["router"] else ""
                 return self.send(200, {"current": current, "saved": list(nvs["wifi"]), "max": MAX_SAVED_WIFI})
+        if u.path == "/radio.json":  # NomiRadio::ListJson
+            with lock:
+                return self.send(200, {"stations": list(radio_list()), "max": MAX_STATIONS, "playing": radio_now["index"]})
         self.send(404, "not found", "text/plain")
 
     def do_POST(self):
@@ -794,7 +882,50 @@ class StaHandler(Handler):
             return self.models(req)
         if path in ("/wifi/add", "/wifi/delete"):
             return self.wifi(path, req)
+        if path in ("/radio/add", "/radio/delete", "/radio/play"):
+            return self.radio(path, req)
         self.send(404, "not found", "text/plain")
+
+    def radio(self, path, req):
+        """和 NomiRadio::AddFromJson / DeleteFromJson / PlayFromJson 一致。"""
+        err = lambda msg: self.send(200, {"ok": False, "error": msg})
+        with lock:
+            stations = radio_list()
+            if path == "/radio/play":
+                if req.get("stop") is True:
+                    push_event("radio_stop")
+                    radio_now.update(index=-2)
+                    return self.send(200, {"ok": True})
+                i = req.get("index")
+                if not isinstance(i, int) or not 0 <= i < len(stations):
+                    return err("没有这个台")
+                push_event("radio_play", index=i)
+                radio_now.update(index=i, name=stations[i]["name"])
+                return self.send(200, {"ok": True})
+            if path == "/radio/add":
+                name, url = str(req.get("name") or "").strip(), str(req.get("url") or "").strip()
+                if not name or len(name.encode()) > 60:
+                    return err("台名要填，最多 20 个字")
+                if not url.startswith(("http://", "https://")) or len(url) > 300:
+                    return err("地址要以 http:// 或 https:// 开头")
+                if ".m3u8" in url:
+                    return err("不支持 m3u8 分段流，要 MP3 / AAC 直播地址")
+                same = next((s for s in stations if s["name"] == name), None)
+                if same:
+                    same["url"] = url
+                elif len(stations) >= MAX_STATIONS:
+                    return err("最多存 20 个台，先删掉几个")
+                else:
+                    stations.append({"name": name, "url": url})
+            else:
+                i = req.get("index")
+                if not isinstance(i, int) or not 0 <= i < len(stations):
+                    return err("没有这个台")
+                stations.pop(i)
+            snapshot = [dict(s) for s in stations]
+        save_nvs()
+        push_event("radio_list", stations=snapshot)
+        self.send(200, {"ok": True})
 
     def wifi(self, path, req):
         """和 direct_api_config_server.cc 的 /wifi/add、/wifi/delete 一致：只改存储，不当场连。"""

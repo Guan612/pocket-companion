@@ -16,6 +16,7 @@
 #include <array>
 #include <cstring>
 #include <set>
+#include <vector>
 
 #define TAG "DirectApiCfg"
 
@@ -356,17 +357,43 @@ std::string DeviceIp() {
     return buf;
 }
 
+struct ExtraHandler {
+    std::string uri;
+    bool post;
+    DirectApiConfigServer::JsonHandler handler;
+};
+std::vector<ExtraHandler>& ExtraHandlers() {
+    static std::vector<ExtraHandler> handlers;
+    return handlers;
+}
+
+// 板子挂上来的接口：拿到请求体交给它，返回的 JSON 原样回去；以 "!" 开头的是出错提示
+esp_err_t HandleExtra(httpd_req_t* req) {
+    auto* extra = static_cast<ExtraHandler*>(req->user_ctx);
+    std::string body;
+    if (extra->post && !ReadBody(req, body)) return SendError(req, "提交的内容太大或没收全");
+    std::string out = extra->handler(body);
+    if (!out.empty() && out[0] == '!') return SendError(req, out.substr(1));
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    return httpd_resp_send(req, out.data(), out.size());
+}
+
 }  // namespace
 
 namespace DirectApiConfigServer {
 
 std::function<void()> on_city_changed;
 
+void AddJsonHandler(const char* uri, bool post, JsonHandler handler) {
+    ExtraHandlers().push_back({uri, post, std::move(handler)});
+}
+
 std::string Start() {
     if (s_server == nullptr) {
         httpd_config_t config = HTTPD_DEFAULT_CONFIG();
         config.stack_size = 12288;  // /models 里有 HTTPS 请求
-        config.max_uri_handlers = 12;
+        config.max_uri_handlers = 7 + 8;  // 自己的 7 个 + 板子挂的
         if (httpd_start(&s_server, &config) != ESP_OK) {
             ESP_LOGE(TAG, "Failed to start config server");
             return "";
@@ -381,6 +408,11 @@ std::string Start() {
             {.uri = "/wifi/delete", .method = HTTP_POST, .handler = HandleWifiDelete, .user_ctx = nullptr},
         };
         for (const auto& u : uris) httpd_register_uri_handler(s_server, &u);
+        for (auto& extra : ExtraHandlers()) {
+            httpd_uri_t u = {.uri = extra.uri.c_str(), .method = extra.post ? HTTP_POST : HTTP_GET,
+                             .handler = HandleExtra, .user_ctx = &extra};
+            httpd_register_uri_handler(s_server, &u);
+        }
     }
     std::string ip = DeviceIp();
     s_url = ip.empty() ? "" : "http://" + ip + "/";

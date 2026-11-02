@@ -73,11 +73,15 @@ public:
     // 设备状态这时仍是聆听（自动模式）或待机（松键后），屏幕靠它显示"思考中"
     static bool IsThinking() { return thinking_; }
 
+    // 这句回答说完就回待机（和 self.chat.end 一样）。设备端工具用：比如放电台，回到待机才开始放
+    static void ExitAfterReply() { exit_requested_ = true; }
+
 protected:
     bool SendText(const std::string& text) override;
 
 private:
     static std::atomic<bool> thinking_;
+    static std::atomic<bool> exit_requested_;
     std::atomic<bool> opened_{false};
     std::atomic<bool> recording_{false};
     std::atomic<bool> cancel_{false};

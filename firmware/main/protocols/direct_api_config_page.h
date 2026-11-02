@@ -96,6 +96,17 @@ button:disabled{opacity:.5}
   <p class="hint">时钟页显示这个城市的天气，问它天气也按这里。也可以直接跟它说「我在深圳」。</p>
 </div>
 
+<div id="radioCard" hidden>
+<h2>电台</h2>
+<div class="card">
+  <p class="hint">改了立即生效。也可以跟它说「放点音乐」「收藏这个台」。</p>
+  <div id="radioList"></div>
+  <label>台名<input id="radioName" maxlength="20" autocomplete="off" placeholder="比如：轻音乐"></label>
+  <label>地址<input id="radioUrl" autocomplete="off" placeholder="MP3 / AAC 直播流地址"></label>
+  <div class="row"><button id="radioAdd">添加 / 改地址</button><span id="radioMsg" class="hint"></span></div>
+</div>
+</div>
+
 <h2>人设提示词</h2>
 <textarea id="prompt" rows="4" placeholder="留空用默认提示词"></textarea>
 
@@ -385,6 +396,47 @@ $('#wifiAdd').onclick = async () => {
   $('#wifiAdd').disabled = false;
 };
 loadWifi();
+
+// 电台台单：板子没挂 /radio.json（没有电台功能）时整块不显示
+const radioMsg = (text, cls) => { $('#radioMsg').textContent = text; $('#radioMsg').className = 'hint ' + (cls || ''); };
+async function loadRadio() {
+  let r;
+  try {
+    const res = await fetch('/radio.json', {cache: 'no-store'});
+    if (!res.ok) return;
+    r = await res.json();
+  } catch (e) { return; }
+  $('#radioCard').hidden = false;
+  const box = $('#radioList');
+  box.innerHTML = r.stations.length ? '' : '<p class="hint">台单是空的。</p>';
+  r.stations.forEach((s, index) => {
+    const on = index === r.playing;
+    const row = document.createElement('div');
+    row.className = 'row';
+    row.innerHTML = `<span style="flex:1;overflow-wrap:anywhere">${esc(s.name)}<br><span class="hint">${esc(s.url)}</span></span><button>${on ? '停止' : '播放'}</button><button class="danger">删除</button>`;
+    const [play, del] = row.querySelectorAll('button');
+    play.onclick = () => radioPost('/radio/play', on ? {stop: true} : {index});
+    del.onclick = async () => { if (confirm(`删除「${s.name}」？`)) await radioPost('/radio/delete', {index}); };
+    box.appendChild(row);
+  });
+  $('#radioAdd').title = `已存 ${r.stations.length} / ${r.max} 个`;
+}
+async function radioPost(path, body) {
+  try {
+    const r = await (await fetch(path, {method: 'POST', body: JSON.stringify(body)})).json();
+    radioMsg(r.ok ? '' : r.error, r.ok ? 'ok' : 'err');
+    if (r.ok) await loadRadio();
+    return r.ok;
+  } catch (e) { radioMsg('请求失败：' + e.message, 'err'); return false; }
+}
+$('#radioAdd').onclick = async () => {
+  const name = $('#radioName').value.trim(), url = $('#radioUrl').value.trim();
+  if (!name || !url) return radioMsg('台名和地址都要填', 'err');
+  $('#radioAdd').disabled = true;
+  if (await radioPost('/radio/add', {name, url})) { $('#radioName').value = ''; $('#radioUrl').value = ''; }
+  $('#radioAdd').disabled = false;
+};
+loadRadio();
 
 // 读到当前设置之前不让保存，免得空页面把已有设置冲掉
 async function load() {

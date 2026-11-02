@@ -1,4 +1,4 @@
-// Nomi 界面：三页（历史对话 / 表情 / 时钟）左右滑切换，顶部下拉打开设置。
+// Nomi 界面：四页（历史对话 / 表情 / 电台 / 时钟）左右滑切换，顶部下拉打开设置。
 //
 // 说话靠 BOOT 键和唤醒词，触摸只负责切模式、开设置和叫醒。
 // 只依赖 LVGL 和 face.c，设备（NomiDisplay）和浏览器模拟器（tools/device-sim）共用同一份代码。
@@ -56,10 +56,14 @@ typedef struct {
     // weather_text（"多云 · 深圳  23~32°"，城市没找到时是提示）、weather_city（设的城市，空 = 自动）、
     // alarms（接下来要响的闹钟，按时间排，一行一个 "编号\t什么时候\t事由"）。
     // get_int("weather_code") 是 WMO 天气代码，夜里加 1000，没有天气时 -1。
+    // 电台页：radio_name（当前台名）、radio_title（流里带的歌名，没有为空）、radio_list（台名，'\n' 分隔）；
+    // get_int("radio_state") 0 没在放 / 1 连接中 / 2 在放 / 3 对话中暂停 / 4 连不上，
+    // get_int("radio_index") 当前台在台单里的下标（搜来没收藏的台为 -1）。
     // 不认识的 key 返回空串
     const char *(*get_text)(const char *key);
     // 动作：test_api、reconfigure_wifi、factory_reset、alarm_stop / alarm_snooze（响铃时"知道了" /
-    // "稍后提醒"）、alarm_delete:<编号>（时钟页上删闹钟）
+    // "稍后提醒"）、alarm_delete:<编号>（时钟页上删闹钟）、radio_toggle / radio_next / radio_prev、
+    // radio_play:<下标>（电台页）
     void (*action)(const char *name);
     // 聊天历史（第二页）：下标 0 最旧；role 为 "user" / "assistant"，文本只需在下一次调用前有效
     int (*history_count)(void);

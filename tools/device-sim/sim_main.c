@@ -54,9 +54,9 @@ static void dev_log(char level, const char *tag, const char *fmt, ...)
 
 /* ---------- 网页那一面传进来的文字 ---------- */
 
-enum { TEXT_WIFI_SSID, TEXT_CONFIG_URL, TEXT_IP, TEXT_AP_URL, TEXT_AP_SSID, TEXT_VOICES, TEXT_SAVED_WIFI, TEXT_CITY, TEXT_COUNT };
+enum { TEXT_WIFI_SSID, TEXT_CONFIG_URL, TEXT_IP, TEXT_AP_URL, TEXT_AP_SSID, TEXT_VOICES, TEXT_SAVED_WIFI, TEXT_CITY, TEXT_RADIO_LIST, TEXT_COUNT };
 static char s_str[4096];  // JS 先把 UTF-8 写进这里，再调 sim_set_text / sim_turn_* / sim_face_play 等
-static char s_text[TEXT_COUNT][400];  // 已存 Wi-Fi 列表最长 10 × 33 字节
+static char s_text[TEXT_COUNT][640];  // 已存 Wi-Fi 列表最长 10 × 33 字节，台单 20 个台名
 
 /* ---------- 设备状态 ---------- */
 
@@ -626,6 +626,64 @@ void sim_alarm_demo(void)
 
 void sim_alarm_ring(void) { alarm_add(2, "开会", -1); }
 
+/* ---------- 电台（对应 NomiRadio）：真正出声的是 sim.html 里的 <audio> ---------- */
+
+static int s_radio_wanted, s_radio_index, s_radio_state = 1;  // state 由 JS 报：1 连接中 2 在放 4 连不上
+static char s_radio_temp[64];  // 搜来还没收藏的台名（index 为 -1）
+
+static int radio_count(void)
+{
+    const char *p = s_text[TEXT_RADIO_LIST];
+    if (!*p) return 0;
+    int n = 1;
+    for (; *p; p++) n += *p == '\n';
+    return n;
+}
+
+static const char *radio_name(int index)
+{
+    static char buf[64];
+    if (index < 0) return s_radio_temp;
+    const char *p = s_text[TEXT_RADIO_LIST];
+    for (int i = 0; i < index && p; i++) {
+        p = strchr(p, '\n');
+        if (p) p++;
+    }
+    if (!p) return "";
+    size_t n = strcspn(p, "\n");
+    snprintf(buf, sizeof(buf), "%.*s", (int)(n < sizeof(buf) - 1 ? n : sizeof(buf) - 1), p);
+    return buf;
+}
+
+static void radio_select(int index)
+{
+    s_radio_index = index;
+    s_radio_wanted = 1;
+    s_radio_state = 1;
+    dev_log('I', "NomiRadio", "Play %s", radio_name(index));
+}
+
+// sim.html 每帧问：现在该不该出声（在放、而且没在对话）
+int sim_radio_audible(void) { return s_radio_wanted && s_chat == CHAT_IDLE && !s_thinking && s_stage == STAGE_READY; }
+int sim_radio_wanted(void) { return s_radio_wanted; }
+int sim_radio_index(void) { return s_radio_index; }
+void sim_radio_set_state(int state) { s_radio_state = state; }
+void sim_radio_stop(void) { s_radio_wanted = 0; }
+
+// 网页设置页 / 大模型工具让它放：index 为 -1 时台名在 s_str（搜来的台）
+void sim_radio_play(int index)
+{
+    if (index < 0) snprintf(s_radio_temp, sizeof(s_radio_temp), "%s", s_str);
+    if (index >= radio_count()) return;
+    radio_select(index);
+}
+
+void sim_radio_step(int delta)
+{
+    int n = radio_count();
+    if (n) radio_select(((s_radio_index < 0 ? 0 : s_radio_index) + delta + n) % n);
+}
+
 /* ---------- nomi_ui 回调（对应 NomiDisplay） ---------- */
 
 static nomi_state_t get_state(void)
@@ -654,6 +712,11 @@ static int get_int(const char *key, int def)
     if (!strcmp(key, NOMI_KEY_ONE_SHOT)) return s_one_shot;
     if (!strcmp(key, NOMI_KEY_SLEEP_SHOW)) return s_sleep_show;
     if (!strcmp(key, "weather_code")) return s_local_time > 0 ? 2 : -1;  // 假天气：多云
+    if (!strcmp(key, "radio_state")) {
+        if (!s_radio_wanted) return 0;
+        return s_chat != CHAT_IDLE || s_thinking ? 3 : s_radio_state;
+    }
+    if (!strcmp(key, "radio_index")) return s_radio_index;
     return def;
 }
 
@@ -697,6 +760,9 @@ static const char *get_text(const char *key)
     if (!strcmp(key, "config_url")) return online && s_stage == STAGE_READY ? s_text[TEXT_CONFIG_URL] : "";
     if (!strcmp(key, "version")) return "Pocket Companion " FW_VERSION "（模拟器）";
     if (!strcmp(key, "weather_city")) return s_text[TEXT_CITY];
+    if (!strcmp(key, "radio_name")) return radio_name(s_radio_index);
+    if (!strcmp(key, "radio_title")) return "";  // 浏览器拿不到流里的歌名
+    if (!strcmp(key, "radio_list")) return s_text[TEXT_RADIO_LIST];
     return clock_text(key);
 }
 
@@ -709,6 +775,14 @@ static void action(const char *name)
         nomi_ui_alarm_hide();
     } else if (!strncmp(name, "alarm_delete:", 13)) {
         alarm_delete(atoi(name + 13));
+    } else if (!strcmp(name, "radio_toggle")) {
+        if (s_radio_wanted) s_radio_wanted = 0;
+        else if (s_radio_index >= 0 || s_radio_temp[0]) radio_select(s_radio_index);
+        else radio_select(0);
+    } else if (!strcmp(name, "radio_next") || !strcmp(name, "radio_prev")) {
+        sim_radio_step(!strcmp(name, "radio_next") ? 1 : -1);
+    } else if (!strncmp(name, "radio_play:", 11)) {
+        sim_radio_play(atoi(name + 11));
     } else if (!strcmp(name, "toggle_listen")) {
         // 屏幕上的“连续聆听”开关：待机点开 = 点一下 BOOT 开始；聆听 / 说话中点关 = 退出对话
         if (s_stage != STAGE_READY) return;

@@ -6,6 +6,7 @@
 #include "display/lvgl_display/lvgl_theme.h"
 #include "face_script.h"
 #include "nomi_clock.h"
+#include "nomi_radio.h"
 #include "nomi_ui.h"
 #include "settings.h"
 #include "wifi_board.h"
@@ -167,6 +168,8 @@ int GetInt(const char* key, int def) {
         return Settings(kDirectApiNs).GetString("one_shot") == "1";
     }
     if (!strcmp(key, "weather_code")) return NomiClock::GetInstance().WeatherCode();
+    if (!strcmp(key, "radio_state")) return NomiRadio::GetInstance().GetState();
+    if (!strcmp(key, "radio_index")) return NomiRadio::GetInstance().CurrentIndex();
     if (!strcmp(key, NOMI_KEY_PERSONA)) {
         // 按当前提示词反查是哪个预设；网页里改过就算自定义
         std::string prompt = Settings(kDirectApiNs).GetString("prompt");
@@ -289,6 +292,12 @@ const char* GetText(const char* key) {
         text = NomiClock::GetInstance().WeatherCity();
     } else if (!strcmp(key, "alarms")) {
         text = NomiClock::GetInstance().AlarmsText();
+    } else if (!strcmp(key, "radio_name")) {
+        text = NomiRadio::GetInstance().StationName();
+    } else if (!strcmp(key, "radio_title")) {
+        text = NomiRadio::GetInstance().Title();
+    } else if (!strcmp(key, "radio_list")) {
+        text = NomiRadio::GetInstance().ListText();
     }
     return text.c_str();
 }
@@ -301,6 +310,12 @@ void Action(const char* name) {
         NomiClock::GetInstance().Snooze();
     } else if (!strncmp(name, "alarm_delete:", 13)) {
         NomiClock::GetInstance().DeleteAlarm(atoi(name + 13));
+    } else if (!strcmp(name, "radio_toggle")) {
+        NomiRadio::GetInstance().Toggle();
+    } else if (!strcmp(name, "radio_next") || !strcmp(name, "radio_prev")) {
+        NomiRadio::GetInstance().Step(!strcmp(name, "radio_next") ? 1 : -1);
+    } else if (!strncmp(name, "radio_play:", 11)) {
+        NomiRadio::GetInstance().Play(atoi(name + 11));
     } else if (!strcmp(name, "reconfigure_wifi")) {
         app.Schedule([]() { static_cast<WifiBoard&>(Board::GetInstance()).EnterWifiConfigMode(); });
     } else if (!strcmp(name, "factory_reset")) {

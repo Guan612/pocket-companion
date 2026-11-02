@@ -24,21 +24,32 @@
 #define C_WARM 0xffc857  // 太阳、闪电、闹钟铃铛
 
 #define CLOCK_REFRESH_MS 1000  // 时钟页多久对一次时间、天气、闹钟（文字没变就不重画）
+#define RADIO_REFRESH_MS 400   // 电台页、左上角电台小条多久对一次状态
 #define DOTS_SHOW_MS 2500      // 翻页后页码小圆点留多久
 
-// 时钟页的大数字和天气图标（lv_font_conv 从 LVGL 自带的 Montserrat / FontAwesome 生成，见文件头）
+// 时钟页的大数字、天气和播放控制图标（lv_font_conv 从 LVGL 自带的 Montserrat / FontAwesome 生成，见文件头）
 LV_FONT_DECLARE(nomi_font_clock_120);
-LV_FONT_DECLARE(nomi_font_weather_36);
+LV_FONT_DECLARE(nomi_font_icon_36);
+#define ICON_PLAY "\xEF\x81\x8B"
+#define ICON_PAUSE "\xEF\x81\x8C"
+#define ICON_PREV "\xEF\x81\x88"
+#define ICON_NEXT "\xEF\x81\x91"
 
 static nomi_ui_callbacks_t s_cb;
 static const lv_font_t *s_font;
 static uint16_t *s_buf;
 
-// 页面结构：外层上下翻（设置 / 主界面），主界面里左右翻（历史对话 / 表情 / 时钟），
-// 状态栏、字幕和页码小圆点浮在主界面上
-enum { PAGE_HIST, PAGE_FACE, PAGE_CLOCK, PAGE_COUNT };
+// 页面结构：外层上下翻（设置 / 主界面），主界面里左右翻（历史对话 / 表情 / 电台 / 时钟），
+// 状态栏、字幕、页码小圆点和电台小条浮在主界面上
+enum { PAGE_HIST, PAGE_FACE, PAGE_MUSIC, PAGE_CLOCK, PAGE_COUNT };
 static lv_obj_t *s_outer, *s_settings_tile, *s_main_tile;
-static lv_obj_t *s_modes, *s_chat_tile, *s_hist_tile, *s_clock_tile;
+static lv_obj_t *s_modes, *s_chat_tile, *s_hist_tile, *s_music_tile, *s_clock_tile;
+// 电台页
+static lv_obj_t *s_radio_name, *s_radio_status, *s_radio_play, *s_radio_list, *s_radio_volume;
+static lv_obj_t *s_radio_mini, *s_radio_mini_label;  // 表情页左上角"♪ 台名"小条
+static char s_radio_list_shown[512];                 // 电台页台单对应的文字，变了才重建
+static int s_radio_index_shown = -2;
+static uint32_t s_radio_next;
 static lv_obj_t *s_canvas, *s_hist_list;
 static lv_obj_t *s_status, *s_battery, *s_subtitle, *s_toast, *s_dots;
 static lv_timer_t *s_toast_timer;
@@ -95,6 +106,8 @@ static int current_page(void);
 static void on_face_pressed(lv_event_t *e);
 static void sync_history(bool to_bottom);
 static void clock_refresh(bool force);
+static void radio_refresh(bool force);
+static void set_text_if_changed(lv_obj_t *label, const char *text);
 static void update_dots(void);
 
 // 二维码用 Nayuki 的 qrcodegen：设备上由小智依赖的 esp_emote_gfx 带进来，模拟器里由 LVGL 带进来。
@@ -149,7 +162,7 @@ static bool face_visible(void)
 {
     if (lv_tileview_get_tile_active(s_outer) == s_settings_tile) return false;
     lv_obj_t *tile = lv_tileview_get_tile_active(s_modes);
-    if (tile == s_hist_tile || tile == s_clock_tile) return false;
+    if (tile == s_hist_tile || tile == s_music_tile || tile == s_clock_tile) return false;
     if (s_alarm_layer && !lv_obj_has_flag(s_alarm_layer, LV_OBJ_FLAG_HIDDEN)) return false;
     return !lv_obj_is_scrolling(s_outer) && !lv_obj_is_scrolling(s_modes);
 }
@@ -189,8 +202,9 @@ static void face_tick(lv_timer_t *timer)
         lv_obj_add_flag(s_subtitle, LV_OBJ_FLAG_HIDDEN);
         s_subtitle_hide_at = 0;
     }
-    // 停在时钟页时叫它说话：翻回表情页（听、想、说的样子都在脸上）
-    if (in_conversation(state) && !in_conversation(s_last_state) && current_page() == PAGE_CLOCK) {
+    // 停在时钟 / 电台页时叫它说话：翻回表情页（听、想、说的样子都在脸上）
+    int page = current_page();
+    if (in_conversation(state) && !in_conversation(s_last_state) && (page == PAGE_CLOCK || page == PAGE_MUSIC)) {
         show_page(PAGE_FACE, !s_sleeping);
     }
     s_last_state = state;
@@ -199,6 +213,10 @@ static void face_tick(lv_timer_t *timer)
     if ((int32_t)(now - s_clock_next) >= 0) {
         s_clock_next = now + CLOCK_REFRESH_MS;
         clock_refresh(false);
+    }
+    if ((int32_t)(now - s_radio_next) >= 0) {
+        s_radio_next = now + RADIO_REFRESH_MS;
+        radio_refresh(false);
     }
 
     // 页码小圆点：翻页时和翻完后一小会儿显示；有字幕时让开
@@ -250,7 +268,8 @@ void nomi_ui_set_font(const lv_font_t *font)
     if (!font) return;
     if (font != s_font) s_settings_sig[0] = '\0';  // 设置页里有几层显式设了字体，下次下拉时重建
     s_font = font;
-    lv_obj_t *roots[] = {s_status, s_subtitle, s_toast, s_settings_tile, s_hist_tile, s_clock_tile, s_alarm_layer};
+    lv_obj_t *roots[] = {s_status,     s_subtitle,   s_toast,       s_settings_tile, s_hist_tile,
+                         s_music_tile, s_clock_tile, s_alarm_layer, s_radio_mini};
     for (size_t i = 0; i < sizeof(roots) / sizeof(roots[0]); i++) {
         if (roots[i]) lv_obj_set_style_text_font(roots[i], font, 0);
     }
@@ -453,7 +472,8 @@ static void on_modes_scroll(lv_event_t *e)
 {
     (void)e;
     user_activity();
-    clock_refresh(false);  // 往时钟页翻时上面已经是对的
+    clock_refresh(false);  // 往时钟 / 电台页翻时上面已经是对的
+    radio_refresh(false);
 }
 
 /* ---------- 设置页的小部件 ---------- */
@@ -937,13 +957,21 @@ static void show_main(bool anim)
 
 static lv_obj_t *page_tile(int page)
 {
-    return page == PAGE_HIST ? s_hist_tile : page == PAGE_CLOCK ? s_clock_tile : s_chat_tile;
+    switch (page) {
+    case PAGE_HIST: return s_hist_tile;
+    case PAGE_MUSIC: return s_music_tile;
+    case PAGE_CLOCK: return s_clock_tile;
+    default: return s_chat_tile;
+    }
 }
 
 static int current_page(void)
 {
     lv_obj_t *tile = lv_tileview_get_tile_active(s_modes);
-    return tile == s_hist_tile ? PAGE_HIST : tile == s_clock_tile ? PAGE_CLOCK : PAGE_FACE;
+    for (int page = 0; page < PAGE_COUNT; page++) {
+        if (tile == page_tile(page)) return page;
+    }
+    return PAGE_FACE;
 }
 
 // 代码切页面（PAGE_*）
@@ -954,6 +982,7 @@ static void show_page(int page, bool anim)
     s_page_by_code = false;
     update_dots();
     if (page == PAGE_CLOCK) clock_refresh(true);
+    radio_refresh(page == PAGE_MUSIC);
 }
 
 /* ---------- 页码小圆点 ---------- */
@@ -986,7 +1015,205 @@ static void create_dots(void)
     lv_obj_align(s_dots, LV_ALIGN_BOTTOM_MID, 0, -6);
 }
 
-/* ---------- 第三页：时钟 ---------- */
+/* ---------- 第三页：电台 ---------- */
+
+enum { RADIO_OFF, RADIO_CONNECTING, RADIO_PLAYING, RADIO_HELD, RADIO_ERROR };  // 同 NomiRadio::State
+
+static void on_radio_button(lv_event_t *e)
+{
+    user_activity();
+    action((const char *)lv_event_get_user_data(e));
+    radio_refresh(false);
+}
+
+static void on_station(lv_event_t *e)
+{
+    char name[24];
+    snprintf(name, sizeof(name), "radio_play:%d", (int)(intptr_t)lv_obj_get_user_data(lv_event_get_target(e)));
+    user_activity();
+    action(name);
+    radio_refresh(true);
+}
+
+static lv_obj_t *add_round_button(lv_obj_t *parent, int size, const char *icon, const char *name, bool primary)
+{
+    lv_obj_t *btn = lv_button_create(parent);
+    lv_obj_set_size(btn, size, size);
+    lv_obj_set_style_radius(btn, size / 2, 0);
+    lv_obj_set_style_shadow_width(btn, 0, 0);
+    lv_obj_set_style_bg_color(btn, lv_color_hex(primary ? C_ACCENT : C_CONTROL), 0);
+    lv_obj_add_event_cb(btn, on_radio_button, LV_EVENT_CLICKED, (void *)name);
+    lv_obj_t *label = lv_label_create(btn);
+    lv_obj_set_style_text_font(label, &nomi_font_icon_36, 0);
+    lv_label_set_text(label, icon);
+    set_color(label, primary ? 0x0b1220 : C_TEXT);
+    lv_obj_center(label);
+    return btn;
+}
+
+// 台单：一行一个按钮，正在放的那个高亮
+static void rebuild_station_list(const char *list, int current)
+{
+    lv_obj_clean(s_radio_list);
+    if (!list[0]) {
+        lv_obj_t *hint = lv_label_create(s_radio_list);
+        lv_obj_set_width(hint, LV_PCT(100));
+        lv_label_set_text(hint, "台单是空的，在网页设置页添加");
+        set_color(hint, C_MUTED);
+        return;
+    }
+    char buf[sizeof(s_radio_list_shown)];
+    snprintf(buf, sizeof(buf), "%s", list);
+    int index = 0;
+    for (char *p = buf; p && *p; index++) {
+        char *nl = strchr(p, '\n');
+        if (nl) *nl = '\0';
+        bool on = index == current;
+        lv_obj_t *btn = lv_button_create(s_radio_list);
+        lv_obj_set_size(btn, LV_PCT(100), 42);
+        lv_obj_set_style_radius(btn, 10, 0);
+        lv_obj_set_style_shadow_width(btn, 0, 0);
+        lv_obj_set_style_bg_color(btn, lv_color_hex(on ? C_ACCENT : C_CONTROL), 0);
+        lv_obj_set_user_data(btn, (void *)(intptr_t)index);
+        lv_obj_add_event_cb(btn, on_station, LV_EVENT_CLICKED, NULL);
+        lv_obj_add_flag(btn, LV_OBJ_FLAG_SCROLL_ON_FOCUS);
+        lv_obj_t *label = lv_label_create(btn);
+        lv_obj_set_width(label, LV_PCT(100));
+        lv_label_set_long_mode(label, LV_LABEL_LONG_MODE_DOTS);
+        lv_label_set_text(label, p);
+        set_color(label, on ? 0x0b1220 : C_TEXT);
+        lv_obj_center(label);
+        p = nl ? nl + 1 : NULL;
+    }
+}
+
+// 对一次电台页和左上角小条。force 时台单也重建、音量条也对一下
+static void radio_refresh(bool force)
+{
+    if (!s_music_tile) return;
+    int state = get_int("radio_state", RADIO_OFF);
+    char name[64], title[128];
+    snprintf(name, sizeof(name), "%s", get_text("radio_name"));
+    snprintf(title, sizeof(title), "%s", get_text("radio_title"));
+
+    // 左上角小条：在放（或对话时暂停着）、而且停在表情页时显示，点一下去电台页
+    bool mini = state != RADIO_OFF && current_page() == PAGE_FACE && !s_sleeping;
+    if (lv_obj_has_flag(s_radio_mini, LV_OBJ_FLAG_HIDDEN) == mini) lv_obj_set_flag(s_radio_mini, LV_OBJ_FLAG_HIDDEN, !mini);
+    if (mini) set_text_if_changed(s_radio_mini_label, name);
+
+    set_text_if_changed(s_radio_name, name[0] ? name : "电台");
+    const char *status = state == RADIO_CONNECTING ? "连接中…"
+                       : state == RADIO_PLAYING    ? (title[0] ? title : "直播中")
+                       : state == RADIO_HELD       ? "说完话接着放"
+                       : state == RADIO_ERROR      ? "连不上，稍后再试"
+                                                   : "没在放";
+    set_text_if_changed(s_radio_status, status);
+    set_text_if_changed(lv_obj_get_child(s_radio_play, 0), state == RADIO_OFF || state == RADIO_ERROR ? ICON_PLAY : ICON_PAUSE);
+
+    char list[sizeof(s_radio_list_shown)];
+    snprintf(list, sizeof(list), "%s", get_text("radio_list"));
+    int index = get_int("radio_index", -1);
+    if (force || index != s_radio_index_shown || strcmp(list, s_radio_list_shown) != 0) {
+        if (!lv_obj_is_scrolling(s_radio_list)) {
+            snprintf(s_radio_list_shown, sizeof(s_radio_list_shown), "%s", list);
+            s_radio_index_shown = index;
+            rebuild_station_list(list, index);
+        }
+    }
+    if (force && !lv_obj_has_state(s_radio_volume, LV_STATE_PRESSED)) {
+        lv_slider_set_value(s_radio_volume, get_int(NOMI_KEY_VOLUME, 70), LV_ANIM_OFF);  // 设置页 / 语音也能改音量
+    }
+}
+
+static void on_radio_mini(lv_event_t *e)
+{
+    (void)e;
+    user_activity();
+    show_page(PAGE_MUSIC, true);
+}
+
+static void build_music_page(void)
+{
+    // 左半边：台名、歌名 / 状态、播放控制、音量
+    s_radio_name = lv_label_create(s_music_tile);
+    lv_obj_set_width(s_radio_name, 226);
+    lv_label_set_long_mode(s_radio_name, LV_LABEL_LONG_MODE_DOTS);
+    set_color(s_radio_name, C_TEXT);
+    lv_obj_set_pos(s_radio_name, 18, 44);
+    s_radio_status = lv_label_create(s_music_tile);
+    lv_obj_set_size(s_radio_status, 226, 52);
+    lv_label_set_long_mode(s_radio_status, LV_LABEL_LONG_MODE_DOTS);
+    set_color(s_radio_status, C_MUTED);
+    lv_obj_set_pos(s_radio_status, 18, 74);
+
+    lv_obj_t *row = lv_obj_create(s_music_tile);
+    lv_obj_remove_style_all(row);
+    lv_obj_set_size(row, 226, 80);
+    lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(row, LV_FLEX_ALIGN_SPACE_EVENLY, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_remove_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_pos(row, 18, 140);
+    add_round_button(row, 56, ICON_PREV, "radio_prev", false);
+    s_radio_play = add_round_button(row, 76, ICON_PLAY, "radio_toggle", true);
+    add_round_button(row, 56, ICON_NEXT, "radio_next", false);
+
+    lv_obj_t *vol = lv_label_create(s_music_tile);
+    lv_obj_set_style_text_font(vol, &lv_font_montserrat_14, 0);
+    lv_label_set_text(vol, LV_SYMBOL_VOLUME_MID);
+    set_color(vol, C_MUTED);
+    lv_obj_set_pos(vol, 22, 249);
+    s_radio_volume = lv_slider_create(s_music_tile);
+    lv_obj_set_size(s_radio_volume, 180, 8);
+    lv_obj_set_pos(s_radio_volume, 54, 254);
+    lv_slider_set_range(s_radio_volume, 0, 100);
+    lv_slider_set_value(s_radio_volume, get_int(NOMI_KEY_VOLUME, 70), LV_ANIM_OFF);
+    lv_obj_set_style_bg_color(s_radio_volume, lv_color_hex(C_CONTROL), LV_PART_MAIN);
+    lv_obj_set_style_bg_color(s_radio_volume, lv_color_hex(C_ACCENT), LV_PART_INDICATOR);
+    lv_obj_set_style_bg_color(s_radio_volume, lv_color_hex(C_TEXT), LV_PART_KNOB);
+    lv_obj_add_event_cb(s_radio_volume, on_slider, LV_EVENT_VALUE_CHANGED, (void *)NOMI_KEY_VOLUME);
+    lv_obj_add_event_cb(s_radio_volume, on_slider, LV_EVENT_RELEASED, (void *)NOMI_KEY_VOLUME);
+
+    // 右半边：台单，上下滑（左右滑还是翻页）
+    s_radio_list = lv_obj_create(s_music_tile);
+    lv_obj_remove_style_all(s_radio_list);
+    lv_obj_set_size(s_radio_list, 206, 262);
+    lv_obj_set_pos(s_radio_list, 260, 34);
+    lv_obj_set_flex_flow(s_radio_list, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_row(s_radio_list, 6, 0);
+    lv_obj_set_style_pad_bottom(s_radio_list, 12, 0);
+    lv_obj_set_scroll_dir(s_radio_list, LV_DIR_VER);
+    lv_obj_set_scrollbar_mode(s_radio_list, LV_SCROLLBAR_MODE_ACTIVE);
+
+    lv_obj_add_flag(s_music_tile, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(s_music_tile, on_face_pressed, LV_EVENT_PRESSED, NULL);
+
+    // 表情页左上角的小条（浮在主界面上，只在表情页显示）
+    s_radio_mini = lv_obj_create(s_main_tile);
+    lv_obj_remove_style_all(s_radio_mini);
+    lv_obj_set_size(s_radio_mini, LV_SIZE_CONTENT, 30);
+    lv_obj_set_flex_flow(s_radio_mini, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(s_radio_mini, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(s_radio_mini, 6, 0);
+    lv_obj_set_style_pad_hor(s_radio_mini, 10, 0);
+    lv_obj_set_style_radius(s_radio_mini, 15, 0);
+    lv_obj_set_style_bg_color(s_radio_mini, lv_color_hex(C_PANEL), 0);
+    lv_obj_set_style_bg_opa(s_radio_mini, LV_OPA_80, 0);
+    lv_obj_add_flag(s_radio_mini, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(s_radio_mini, on_radio_mini, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *note = lv_label_create(s_radio_mini);
+    lv_obj_set_style_text_font(note, &lv_font_montserrat_14, 0);
+    lv_label_set_text(note, LV_SYMBOL_AUDIO);
+    set_color(note, C_ACCENT);
+    s_radio_mini_label = lv_label_create(s_radio_mini);
+    lv_obj_set_style_max_width(s_radio_mini_label, 150, 0);
+    lv_label_set_long_mode(s_radio_mini_label, LV_LABEL_LONG_MODE_DOTS);
+    set_color(s_radio_mini_label, C_MUTED);
+    lv_label_set_text(s_radio_mini_label, "");
+    lv_obj_set_pos(s_radio_mini, 8, 6);
+    lv_obj_add_flag(s_radio_mini, LV_OBJ_FLAG_HIDDEN);
+}
+
+/* ---------- 第四页：时钟 ---------- */
 
 // 天气图标（FontAwesome，字库里只收了这几个）。code 夜里加了 1000
 static const char *weather_icon(int code, uint32_t *color)
@@ -1189,8 +1416,8 @@ static void build_clock_page(void)
     lv_obj_set_style_pad_column(s_wx_row, 12, 0);
     lv_obj_remove_flag(s_wx_row, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_align(s_wx_row, LV_ALIGN_TOP_MID, 0, y + 128);
-    s_wx_icon = add_label(s_wx_row, &nomi_font_weather_36, C_TEXT);
-    s_wx_temp = add_label(s_wx_row, &nomi_font_weather_36, C_TEXT);
+    s_wx_icon = add_label(s_wx_row, &nomi_font_icon_36, C_TEXT);
+    s_wx_temp = add_label(s_wx_row, &nomi_font_icon_36, C_TEXT);
     s_wx_text = add_label(s_wx_row, NULL, C_MUTED);
     lv_obj_add_flag(s_wx_row, LV_OBJ_FLAG_HIDDEN);
 
@@ -1244,7 +1471,7 @@ static void create_alarm_layer(void)
     lv_obj_add_flag(s_alarm_layer, LV_OBJ_FLAG_CLICKABLE);  // 挡住下面的页面
     lv_obj_remove_flag(s_alarm_layer, LV_OBJ_FLAG_SCROLLABLE);
 
-    s_alarm_bell = add_label(s_alarm_layer, &nomi_font_weather_36, C_WARM);
+    s_alarm_bell = add_label(s_alarm_layer, &nomi_font_icon_36, C_WARM);
     lv_label_set_text(s_alarm_bell, "\xEF\x83\xB3");  // 铃铛
     lv_obj_align(s_alarm_bell, LV_ALIGN_TOP_MID, 0, 22);
     s_alarm_time = add_label(s_alarm_layer, &nomi_font_clock_120, C_TEXT);
@@ -1357,10 +1584,11 @@ void nomi_ui_create(lv_obj_t *screen, uint16_t *face_buf, const lv_font_t *font,
     lv_obj_add_event_cb(s_outer, on_outer_scroll, LV_EVENT_SCROLL_BEGIN, NULL);
     lv_obj_add_event_cb(s_outer, on_outer_scroll_end, LV_EVENT_SCROLL_END, NULL);
 
-    // 主界面里从左到右：历史对话、表情（首页）、时钟
+    // 主界面里从左到右：历史对话、表情（首页）、电台、时钟
     s_modes = add_tileview(s_main_tile);
     s_hist_tile = add_tile(s_modes, PAGE_HIST, 0, LV_DIR_RIGHT, C_PAGE);
     s_chat_tile = add_tile(s_modes, PAGE_FACE, 0, LV_DIR_HOR, 0x000000);
+    s_music_tile = add_tile(s_modes, PAGE_MUSIC, 0, LV_DIR_HOR, 0x000000);
     s_clock_tile = add_tile(s_modes, PAGE_CLOCK, 0, LV_DIR_LEFT, 0x000000);
     lv_obj_add_event_cb(s_modes, on_page_changed, LV_EVENT_VALUE_CHANGED, NULL);
     lv_obj_add_event_cb(s_modes, on_modes_scroll, LV_EVENT_SCROLL_BEGIN, NULL);
@@ -1385,6 +1613,7 @@ void nomi_ui_create(lv_obj_t *screen, uint16_t *face_buf, const lv_font_t *font,
     lv_obj_add_flag(s_hist_list, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_add_event_cb(s_hist_list, on_face_pressed, LV_EVENT_PRESSED, NULL);
 
+    build_music_page();
     build_clock_page();
 
     // 以下浮在主界面上，左右切模式时不动
