@@ -29,7 +29,7 @@
 
 ## 硬件
 
-SpotPear ESP32-S3 3.5 寸 AI 板（ESP32-S3R8，8MB PSRAM，480×320 ST7796S，ES8311 + NS4150B，GT911 触摸）。引脚和注意事项见 [docs/hardware.md](docs/hardware.md)。
+SpotPear ESP32-S3 3.5 寸 AI 板（ESP32-S3R8，8MB PSRAM，480×320 ST7796S，ES8311 + NS4150B，GT911 触摸）。引脚和注意事项见 [docs/hardware.md](docs/hardware.md)；闪存分区、固件余量、哪些操作会清掉数据见 [docs/flash-partitions.md](docs/flash-partitions.md)。
 
 ## 使用
 
