@@ -24,6 +24,7 @@ EXPORTS = [
     # 整机流程：网页那一面（serve.py）发生的事、设备当前网络、串口日志
     "sim_str_buf", "sim_str_size", "sim_set_text", "sim_wifi_saved", "sim_ap_exit", "sim_settings_saved",
     "sim_net", "sim_stage", "sim_chat", "sim_talk_key", "sim_request", "sim_notify", "sim_router",
+    "sim_volume", "sim_speak",
     "sim_log_buf", "sim_log_len", "sim_log_clear",
     # 一轮对话：录音开关、识别 / 情绪 / 逐句合成的结果、出错、工具调用
     "sim_recording", "sim_rec_started", "sim_rec_finished", "sim_turn_id", "sim_vad_end", "sim_turn_thinking", "sim_turn_stt", "sim_turn_empty",

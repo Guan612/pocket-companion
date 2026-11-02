@@ -167,7 +167,8 @@ def extract_face(reply):
 
 TOOLS_HINT = ("\n\n你可以调用设备工具：调音量 / 亮度、查设备状态用对应工具；"
               "主人说了值得长期记住的信息（称呼、喜好、安排，或明确说\"记住\"）时，"
-              "调用 self.memory.remember，一次一条简短事实。")
+              "调用 self.memory.remember，一次一条简短事实；"
+              "主人要结束对话（\"退下吧\"\"今天就聊到这儿\"）时调用 self.chat.end 退出聆听。")
 # 设备端 MCP 工具（模拟器只实现这几个，描述和参数是近似的）
 TOOLS = [
     {"type": "function", "function": {"name": "self.get_device_status",
@@ -184,6 +185,9 @@ TOOLS = [
     {"type": "function", "function": {"name": "self.memory.remember",
      "description": "把主人希望长期记住的事存进设备的长期记忆。适合：主人告诉你名字/称呼、喜好、固定安排，或明确说\"记住\"。一次记一条简短的事实，闲聊内容不要记。",
      "parameters": {"type": "object", "properties": {"fact": {"type": "string", "maxLength": 200}}, "required": ["fact"]}}},
+    {"type": "function", "function": {"name": "self.chat.end",
+     "description": "结束这轮对话并退出聆听，设备回到待机，直到主人再叫你。主人说\"退下吧\"\"你可以退下了\"\"今天就聊到这儿\"\"先这样吧\"之类要结束对话时调用；主人只是让你别说话（\"别说了\"\"闭嘴\"）时不要调用这个工具。调用后你仍要把这句回答说完，说完设备才安静下来。",
+     "parameters": {"type": "object", "properties": {}}}},
     {"type": "function", "function": {"name": "self.camera.look",
      "description": "看一眼摄像头拍到的画面并说出看到了什么。主人让你看东西、认东西、读画面上的文字、描述眼前的场景时调用；question 写上你想从画面里知道的问题。",
      "parameters": {"type": "object", "properties": {"question": {"type": "string"}}, "required": ["question"]}}},
@@ -283,6 +287,9 @@ def call_tool(name, args, device, actions):
         return "正在表演"
     if name == "self.memory.remember":
         return "已记住" if remember(str(a.get("fact", ""))) else "长期记忆已满，请提示主人到网页设置页整理"
+    if name == "self.chat.end":  # 固件里是 exit_after_reply_ 标记，说完这轮由设备退出聆听
+        actions.append({"type": "exit_chat"})
+        return "好的，这句说完就退出聆听"
     if name == "self.camera.look":  # 模拟器没有摄像头，按固件"没拍到"的分支走
         return "已拍下画面，照片随后作为用户消息发给你"
     return f"Unknown tool: {name}"
@@ -584,8 +591,9 @@ class SimHandler(Handler):
             tts_mp3[0] = False
             with lock:
                 wifi = nvs["wifi"][0] if nvs["wifi"] else ""
+                speak = bool(nvs["directapi"].get("tts_speak", True))
             return self.send(200, {"wifi_ssid": wifi, "api_ok": api_complete(), "ap_ssid": AP_SSID,
-                                   "env": env, "voices": voice_labels(), **urls})
+                                   "env": env, "voices": voice_labels(), "speak": speak, **urls})
         if u.path == "/sim/events":
             since = int(parse_qs(u.query).get("since", ["0"])[0])
             with lock:
@@ -621,6 +629,14 @@ class SimHandler(Handler):
             return self.send(200, env)
         if u.path == "/sim/selftest":
             return self.send(200, {"text": self_test()})
+        if u.path == "/sim/speak":
+            # 屏幕上的语音播报开关写回设备存储（真机是 directapi 命名空间的 tts_speak）
+            on = bool(json.loads(self.body() or b"{}").get("on", True))
+            with lock:
+                nvs["directapi"]["tts_speak"] = on
+                save_nvs()
+            print(f"设置页：语音播报{'打开' if on else '关闭（静音模式，回复只显示文字）'}")
+            return self.send(200, {})
         if u.path == "/sim/turn":
             device = json.loads(unquote(self.headers.get("X-Sim-Device") or "{}"))
             typed = unquote(self.headers.get("X-Sim-Typed") or "")

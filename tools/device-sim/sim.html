@@ -271,7 +271,12 @@ button{font:inherit;color:var(--fg)}
       .then(r=>r.json()).catch(err=>({error:'语音识别连接失败',log:['E 模拟器连不上 serve.py：'+err]}));
     if(!alive())return;
     for(const l of res.log||[])log(`${l[0]} (${now()}) DirectApi: ${l.slice(2)}`);
-    for(const a of res.actions||[]){if(a.type==='face')playFace(a.script);else x.sim_apply(a.type==='volume'?0:1,a.value)}
+    let exitAfter=false;  // self.chat.end：说完这轮再退出聆听（对应固件的 exit_after_reply_）
+    for(const a of res.actions||[]){
+      if(a.type==='face')playFace(a.script);
+      else if(a.type==='exit_chat')exitAfter=true;
+      else x.sim_apply(a.type==='volume'?0:1,a.value);
+    }
     if(res.error){setStr(res.error);x.sim_turn_error();return}
     if(!res.stt){x.sim_turn_empty();return}
     setStr(res.stt);x.sim_turn_stt();
@@ -299,6 +304,7 @@ button{font:inherit;color:var(--fg)}
     }
     }
     x.sim_tts_stop();
+    if(exitAfter&&alive()&&e.sim_talk_key()!==0)e.sim_boot_down();  // 自动模式说完退出聆听；手动模式说完本来就在待命
   };
 
   // 输入框：当作对设备说了这句话（按一下 BOOT，"说完"就松开）
@@ -344,7 +350,7 @@ button{font:inherit;color:var(--fg)}
     lastNet=-1;lastStage=-1;
     log(`--- ${why}：${cfg.wifi_ssid?'存过 Wi-Fi「'+cfg.wifi_ssid+'」':'没存 Wi-Fi'}，API ${cfg.api_ok?'已配好':'未配置'} ---`,'S');
     t0=performance.now();
-    e.sim_init(0,cfg.wifi_ssid?1:0,cfg.api_ok?1:0,env.router?1:0);
+    e.sim_init(0,cfg.wifi_ssid?1:0,cfg.api_ok?1:0,env.router?1:0,cfg.speak?1:0);
   };
 
   // 配网页、设置页上发生的事交给设备代码
@@ -465,6 +471,9 @@ button{font:inherit;color:var(--fg)}
     if(req===2){  // 测试 API：serve.py 照 SelfTest 代测
       const x=e;
       fetch('/sim/selftest',{method:'POST'}).then(r=>r.json()).then(r=>{if(e===x){setStr(r.text);x.sim_notify(8000)}});
+    }
+    if(req===3){  // 语音播报开关：写回 serve.py 的设备存储（对应真机的 tts_speak）
+      fetch('/sim/speak',{method:'POST',body:JSON.stringify({on:e.sim_speak()!==0})});
     }
     if(frames%30===0){
       stats.textContent=`音量 ${e.sim_volume()} · 亮度 ${e.sim_brightness()} · 每帧刷新 ${(area/frames*100).toFixed(1)}%`;

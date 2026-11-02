@@ -71,7 +71,7 @@ typedef enum {
 typedef enum { CHAT_IDLE, CHAT_CONNECTING, CHAT_LISTENING, CHAT_SPEAKING } chat_t;
 
 enum { NET_OFF, NET_AP, NET_STA };
-enum { REQ_NONE, REQ_FACTORY_RESET, REQ_SELFTEST };
+enum { REQ_NONE, REQ_FACTORY_RESET, REQ_SELFTEST, REQ_TTS_SPEAK };
 
 #define FW_VERSION "2.5.2"
 
@@ -101,6 +101,7 @@ static void set_recording(bool on)
 // 设置项存在内存里，刷新页面就没了
 static int s_talk_key, s_aec, s_subtitles = 1, s_persona, s_voice = 4, s_dim = 1, s_off = 1;
 static int s_volume = 70, s_brightness = 80;
+static int s_speak = 1;  // 语音播报（静音模式）：真值在 serve.py 的设备存储里，改了经 JS 写回去
 
 /* ---------- 聊天历史（对应 NomiDisplay::AddChatMessage） ---------- */
 
@@ -500,6 +501,7 @@ static int get_int(const char *key, int def)
     if (!strcmp(key, NOMI_KEY_AEC)) return s_aec;
     if (!strcmp(key, NOMI_KEY_AEC_SUPPORTED)) return 1;
     if (!strcmp(key, NOMI_KEY_SUBTITLES)) return s_subtitles;
+    if (!strcmp(key, NOMI_KEY_TTS_SPEAK)) return s_speak;
     if (!strcmp(key, NOMI_KEY_PERSONA)) return s_persona;
     if (!strcmp(key, NOMI_KEY_VOICE)) return s_voice;
     if (!strcmp(key, NOMI_KEY_DIM)) return s_dim;
@@ -515,6 +517,10 @@ static void set_int(const char *key, int value, bool final)
     else if (!strcmp(key, NOMI_KEY_BRIGHTNESS)) s_brightness = value;
     else if (!strcmp(key, NOMI_KEY_AEC)) s_aec = value;
     else if (!strcmp(key, NOMI_KEY_SUBTITLES)) s_subtitles = value;
+    else if (!strcmp(key, NOMI_KEY_TTS_SPEAK)) {
+        s_speak = value;
+        s_request = REQ_TTS_SPEAK;  // JS 轮询到后调 /sim/speak 写进 serve.py 的设备存储
+    }
     else if (!strcmp(key, NOMI_KEY_PERSONA)) s_persona = value;
     else if (!strcmp(key, NOMI_KEY_VOICE)) s_voice = value;
     else if (!strcmp(key, NOMI_KEY_DIM)) s_dim = value;
@@ -541,7 +547,12 @@ static const char *get_text(const char *key)
 
 static void action(const char *name)
 {
-    if (!strcmp(name, "test_api")) {
+    if (!strcmp(name, "toggle_listen")) {
+        // 屏幕上的“连续聆听”开关：待机点开 = 点一下 BOOT 开始；聆听 / 说话中点关 = 退出对话
+        if (s_stage != STAGE_READY) return;
+        if (s_chat == CHAT_IDLE) start_chat();
+        else if (s_chat == CHAT_LISTENING || s_chat == CHAT_SPEAKING) close_channel("toggle listen");
+    } else if (!strcmp(name, "test_api")) {
         // NomiDisplay：先提示，测完用通知条显示 DirectApiProtocol::SelfTest 的结果（serve.py 代测）
         nomi_ui_notify("正在测试 API…", 15000);
         s_request = REQ_SELFTEST;
@@ -609,13 +620,15 @@ void sim_set_text(int id)
     snprintf(s_text[id], sizeof(s_text[id]), "%s", s_str);
 }
 
-// 上电：has_wifi / api_ok 是"NVS"里有没有存 Wi-Fi、API 设置是否齐全（由 serve.py 保管）；router 是路由器在不在线
-void sim_init(uint32_t ms, int has_wifi, int api_ok, int router)
+// 上电：has_wifi / api_ok 是"NVS"里有没有存 Wi-Fi、API 设置是否齐全（由 serve.py 保管）；router 是路由器在不在线；
+// speak 是语音播报开关（serve.py 的设备存储里有，真机是 directapi 命名空间的 tts_speak）
+void sim_init(uint32_t ms, int has_wifi, int api_ok, int router, int speak)
 {
     s_ms = ms;
     s_has_wifi = has_wifi;
     s_api_ok = api_ok;
     s_router = router;
+    s_speak = speak;
     lv_init();
     lv_tick_set_cb(tick_cb);
     lv_display_t *disp = lv_display_create(LCD_W, LCD_H);
@@ -683,6 +696,7 @@ void sim_force_sleep(void)
     if (s_stage == STAGE_READY && s_chat == CHAT_IDLE) sleep_now();
 }
 int sim_volume(void) { return s_volume; }
+int sim_speak(void) { return s_speak; }
 int sim_net(void) { return s_net; }
 int sim_stage(void) { return s_stage; }
 int sim_chat(void) { return s_chat; }
