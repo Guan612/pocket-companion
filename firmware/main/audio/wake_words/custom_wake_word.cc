@@ -3,6 +3,7 @@
 #include "system_info.h"
 #include "assets.h"
 
+#include <esp_heap_caps.h>
 #include <esp_log.h>
 #include <esp_mn_iface.h>
 #include <esp_mn_models.h>
@@ -117,6 +118,12 @@ bool CustomWakeWord::Initialize(AudioCodec* codec, srmodel_list_t* models_list) 
     }
 
     multinet_ = esp_mn_handle_from_name(mn_name_);
+#if CONFIG_SPIRAM_USE_MALLOC
+    // 建模型、建命令词图时有大量几十到几百字节的 malloc，按默认阈值（SPIRAM_MALLOC_ALWAYSINTERNAL）
+    // 全进内部 RAM，能吃掉 50KB 以上把内部 RAM 耗光；这段时间让小块也去 PSRAM，建完恢复。
+    // 它真正要放内部 RAM 的会自己指明，不受影响
+    heap_caps_malloc_extmem_enable(16);
+#endif
     multinet_model_data_ = multinet_->create(mn_name_, duration_);
     multinet_->set_det_threshold(multinet_model_data_, threshold_);
     input_buffer_.reserve(multinet_->get_samp_chunksize(multinet_model_data_));
@@ -125,6 +132,9 @@ bool CustomWakeWord::Initialize(AudioCodec* codec, srmodel_list_t* models_list) 
         esp_mn_commands_add(i + 1, commands_[i].command.c_str());
     }
     esp_mn_commands_update();
+#if CONFIG_SPIRAM_USE_MALLOC
+    heap_caps_malloc_extmem_enable(CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL);
+#endif
     
     multinet_->print_active_speech_commands(multinet_model_data_);
 #if CONFIG_SEND_WAKE_WORD_DATA
@@ -148,6 +158,14 @@ void CustomWakeWord::Stop() {
 
     std::lock_guard<std::mutex> lock(input_buffer_mutex_);
     input_buffer_.clear();
+}
+
+void CustomWakeWord::ResetState() {
+    std::lock_guard<std::mutex> lock(input_buffer_mutex_);
+    input_buffer_.clear();
+    if (multinet_ != nullptr && multinet_->clean != nullptr && multinet_model_data_ != nullptr) {
+        multinet_->clean(multinet_model_data_);
+    }
 }
 
 void CustomWakeWord::Feed(const std::vector<int16_t>& data) {

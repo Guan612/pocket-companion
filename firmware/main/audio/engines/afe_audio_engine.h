@@ -82,6 +82,16 @@ private:
     WakeDetector wake_detector_ = WakeDetector::kNone;
 
     std::unique_ptr<CustomWakeWord> custom_wake_word_;
+    // MultiNet 当唤醒词每 32ms 要算 11ms，只在 VAD 判定有人说话时才喂：安静时最近一小段音频存在
+    // mn_preroll_（环形），开口时先补进去（VAD 判定要攒一会儿，开头那个字在这里面）；
+    // 说完再多喂一会儿，免得两个字中间停顿一下就断了。这几个只在 ProcessingTask 里用
+    int16_t* mn_preroll_ = nullptr;
+    size_t mn_preroll_size_ = 0;
+    size_t mn_preroll_len_ = 0;
+    size_t mn_preroll_head_ = 0;
+    int mn_hangover_ = 0;
+    bool mn_feeding_ = false;
+    std::atomic<bool> mn_gate_reset_{false};
     std::vector<std::string> wake_words_;
     std::string last_detected_wake_word_;
     std::vector<int16_t> input_buffer_;
@@ -107,6 +117,7 @@ private:
     void ApplyPendingReset();
     void OutputRawAudio(const std::vector<int16_t>& data);
     void HandleWakeWordResult(const afe_fetch_result_t* result);
+    void FeedMultiNet(const afe_fetch_result_t* result);
     void HandleVoiceResult(const afe_fetch_result_t* result);
 };
 

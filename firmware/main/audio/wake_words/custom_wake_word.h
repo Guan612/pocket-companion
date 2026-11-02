@@ -31,6 +31,8 @@ public:
     void OnWakeWordDetected(std::function<void(const std::string& wake_word)> callback);
     void Start();
     void Stop();
+    // 清掉识别到一半的状态和没凑够一块的输入（只在有人说话时才喂时，每次开口前调一下）
+    void ResetState();
     size_t GetFeedSize();
     void EncodeWakeWordData();
     bool GetWakeWordOpus(std::vector<uint8_t>& opus);

@@ -1,5 +1,6 @@
 #include "afe_audio_engine.h"
 
+#include <algorithm>
 #include <cassert>
 #include <cstring>
 #include <sstream>
@@ -21,10 +22,17 @@ static constexpr bool kUseAfeForVoiceProcessing = true;
 static constexpr bool kUseAfeForVoiceProcessing = false;
 #endif
 
+// MultiNet 唤醒词：开口前补喂多长、说完后再喂多长（16kHz 采样数）
+static constexpr size_t kMultiNetPrerollSamples = 16000 * 400 / 1000;
+static constexpr int kMultiNetHangoverSamples = 16000 * 600 / 1000;
+
 AfeAudioEngine::AfeAudioEngine() { event_group_ = xEventGroupCreate(); }
 
 AfeAudioEngine::~AfeAudioEngine() {
     custom_wake_word_.reset();
+    if (mn_preroll_ != nullptr) {
+        heap_caps_free(mn_preroll_);
+    }
     if (afe_data_ != nullptr) {
         afe_iface_->destroy(afe_data_);
     }
@@ -96,6 +104,11 @@ bool AfeAudioEngine::Initialize(AudioCodec* codec, int frame_duration_ms,
             custom_wake_word_.reset();
             wake_detector_ = WakeDetector::kNone;
             return false;
+        }
+        if (kUseAfeForVoiceProcessing) {
+            mn_preroll_ = static_cast<int16_t*>(heap_caps_malloc(
+                kMultiNetPrerollSamples * sizeof(int16_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+            mn_preroll_size_ = mn_preroll_ != nullptr ? kMultiNetPrerollSamples : 0;
         }
     } else if (wakenet_model_name != nullptr) {
         wake_detector_ = WakeDetector::kWakeNet;
@@ -219,14 +232,22 @@ bool AfeAudioEngine::Initialize(AudioCodec* codec, int frame_duration_ms,
         return false;
     }
 
-    processing_task_ = xTaskCreateStatic(
+    // 双核时固定在核 0，和音频输入任务在一起：LVGL 任务在核 1（见 lcd_display.cc），
+    // 用 MultiNet 做唤醒词时这里每 32ms 要算 11ms 左右，不绑核会常跑到核 1 上，翻页时把渲染挤掉
+    processing_task_ = xTaskCreateStaticPinnedToCore(
         [](void* arg) {
             auto* engine = static_cast<AfeAudioEngine*>(arg);
             engine->ProcessingTask();
             vTaskDelete(nullptr);
         },
         "audio_afe", kProcessingTaskStackSize, this, 3, processing_task_stack_,
-        processing_task_buffer_);
+        processing_task_buffer_,
+#if CONFIG_SOC_CPU_CORES_NUM > 1
+        0
+#else
+        tskNO_AFFINITY
+#endif
+    );
     if (processing_task_ == nullptr) {
         ESP_LOGE(TAG, "Failed to create AFE processing task, internal free=%u largest=%u",
                  heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
@@ -280,6 +301,7 @@ void AfeAudioEngine::EnableWakeWordDetection(bool enable) {
     if (enable) {
         if (wake_detector_ == WakeDetector::kMultiNet) {
             custom_wake_word_->Start();
+            mn_gate_reset_ = true;
         }
         xEventGroupSetBits(event_group_, kWakeWordEnabled);
     } else {
@@ -443,7 +465,7 @@ void AfeAudioEngine::ProcessingTask() {
 
 void AfeAudioEngine::HandleWakeWordResult(const afe_fetch_result_t* result) {
     if (wake_detector_ == WakeDetector::kMultiNet) {
-        custom_wake_word_->FeedMono(result->data, result->data_size / sizeof(int16_t));
+        FeedMultiNet(result);
         return;
     }
 
@@ -468,6 +490,63 @@ void AfeAudioEngine::HandleWakeWordResult(const afe_fetch_result_t* result) {
     if (wake_word_detected_callback_) {
         wake_word_detected_callback_(last_detected_wake_word_);
     }
+}
+
+void AfeAudioEngine::FeedMultiNet(const afe_fetch_result_t* result) {
+    const int16_t* data = result->data;
+    const size_t samples = result->data_size / sizeof(int16_t);
+    if (!kUseAfeForVoiceProcessing) {
+        // 没开 VAD，分不出有没有人说话，只能一直喂
+        custom_wake_word_->FeedMono(data, samples);
+        return;
+    }
+    if (mn_gate_reset_.exchange(false)) {
+        mn_feeding_ = false;
+        mn_hangover_ = 0;
+        mn_preroll_len_ = 0;
+    }
+
+    const bool speech = result->vad_state == VAD_SPEECH;
+    if (speech) {
+        mn_hangover_ = kMultiNetHangoverSamples;
+        if (!mn_feeding_) {
+            mn_feeding_ = true;
+            custom_wake_word_->ResetState();
+            if (mn_preroll_len_ > 0) {
+                size_t start = (mn_preroll_head_ + mn_preroll_size_ - mn_preroll_len_) % mn_preroll_size_;
+                size_t first = std::min(mn_preroll_len_, mn_preroll_size_ - start);
+                custom_wake_word_->FeedMono(mn_preroll_ + start, first);
+                if (first < mn_preroll_len_) {
+                    custom_wake_word_->FeedMono(mn_preroll_, mn_preroll_len_ - first);
+                }
+                mn_preroll_len_ = 0;
+            }
+        }
+    }
+
+    if (mn_feeding_) {
+        custom_wake_word_->FeedMono(data, samples);
+        if (!speech) {
+            mn_hangover_ -= static_cast<int>(samples);
+            mn_feeding_ = mn_hangover_ > 0;
+        }
+        return;
+    }
+
+    // 安静：只存进环形缓冲，留着开口时补
+    if (mn_preroll_ == nullptr || samples == 0) {
+        return;
+    }
+    size_t n = samples;
+    if (n > mn_preroll_size_) {
+        data += n - mn_preroll_size_;
+        n = mn_preroll_size_;
+    }
+    size_t first = std::min(n, mn_preroll_size_ - mn_preroll_head_);
+    memcpy(mn_preroll_ + mn_preroll_head_, data, first * sizeof(int16_t));
+    memcpy(mn_preroll_, data + first, (n - first) * sizeof(int16_t));
+    mn_preroll_head_ = (mn_preroll_head_ + n) % mn_preroll_size_;
+    mn_preroll_len_ = std::min(mn_preroll_len_ + n, mn_preroll_size_);
 }
 
 void AfeAudioEngine::HandleVoiceResult(const afe_fetch_result_t* result) {

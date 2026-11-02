@@ -10,7 +10,14 @@
                 "CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y",
                 "CONFIG_LV_USE_TABVIEW=y",
                 "CONFIG_LV_USE_TILEVIEW=y",
-                "CONFIG_LWIP_SNTP_MAX_SERVERS=3"
+                "CONFIG_LWIP_SNTP_MAX_SERVERS=3",
+                "CONFIG_USE_AFE_WAKE_WORD=n",
+                "CONFIG_USE_CUSTOM_WAKE_WORD=y",
+                "CONFIG_CUSTOM_WAKE_WORD=\"nuo mi nuo mi\"",
+                "CONFIG_CUSTOM_WAKE_WORD_DISPLAY=\"糯米糯米\"",
+                "CONFIG_CUSTOM_WAKE_WORD_THRESHOLD=12",
+                "CONFIG_SR_MN_CN_MULTINET7_QUANT=y",
+                "CONFIG_SR_WN_WN9_NIHAOXIAOZHI_TTS=n"
             ]
         }
     ]

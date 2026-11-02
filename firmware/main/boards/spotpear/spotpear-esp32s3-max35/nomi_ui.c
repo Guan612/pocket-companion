@@ -725,7 +725,7 @@ static lv_obj_t *add_page(lv_obj_t *tabview, const char *name)
 static void build_chat_page(lv_obj_t *page)
 {
     static const char *const talk[] = {"按住说话", "点一下开始", ""};
-    add_choice(page, "BOOT 键", "也可以喊「你好小智」", NOMI_KEY_TALK_KEY, talk, 1);
+    add_choice(page, "BOOT 键", "也可以喊「糯米糯米」", NOMI_KEY_TALK_KEY, talk, 1);
     // 不开时是连续对话：回答完接着听，5 秒没人开口自己回待机，说"退下吧"马上回
     add_switch(page, "一问一答", "答完一句就回待机", NOMI_KEY_ONE_SHOT, true);
     bool aec_ok = get_int(NOMI_KEY_AEC_SUPPORTED, 0);
