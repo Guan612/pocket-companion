@@ -257,9 +257,8 @@ private:
         }
     }
 
-    // 取一帧 RGB565。摄像头输出是大端，看图模型 / 编码器要小端，先换字节；
-    // raw=true 直接返回换好字节序的原始帧（设置页 /cam.jpg?raw=1 调试用）
-    std::string CaptureFrame(bool raw) {
+    // 拍一张 JPEG 给看图模型。摄像头输出 RGB565 是大端，编码器要小端，先换字节
+    std::string CaptureJpeg() {
         std::lock_guard<std::mutex> lock(camera_mutex_);
         if (!camera_ready_) return "";
         // 平时采集是停着的：开起来，先丢掉几帧——队列里压着停之前的旧帧，停的那一刻收到一半的帧也作废。
@@ -282,16 +281,12 @@ private:
             if (buf != nullptr) {
                 auto* src = reinterpret_cast<const uint16_t*>(fb->buf);
                 for (size_t i = 0; i < pixels; i++) buf[i] = __builtin_bswap16(src[i]);
-                if (raw) {
-                    out.assign(reinterpret_cast<const char*>(buf), pixels * 2);
-                } else {
-                    uint8_t* jpeg = nullptr;
-                    size_t jpeg_len = 0;
-                    if (image_to_jpeg(reinterpret_cast<uint8_t*>(buf), pixels * 2, fb->width,
-                                      fb->height, V4L2_PIX_FMT_RGB565, 80, &jpeg, &jpeg_len)) {
-                        out.assign(reinterpret_cast<char*>(jpeg), jpeg_len);
-                        free(jpeg);
-                    }
+                uint8_t* jpeg = nullptr;
+                size_t jpeg_len = 0;
+                if (image_to_jpeg(reinterpret_cast<uint8_t*>(buf), pixels * 2, fb->width, fb->height,
+                                  V4L2_PIX_FMT_RGB565, 80, &jpeg, &jpeg_len)) {
+                    out.assign(reinterpret_cast<char*>(jpeg), jpeg_len);
+                    free(jpeg);
                 }
                 heap_caps_free(buf);
             }
@@ -300,8 +295,6 @@ private:
         cam_stop();
         return out;
     }
-
-    std::string CaptureJpeg() { return CaptureFrame(false); }
 
     // BOOT 键说话：默认按住说话（像对讲机），设置里可改成点一下开始、说完自动结束
     bool HoldToTalk() { return NomiDisplay::GetSavedInt(NOMI_KEY_TALK_KEY, 0) == 0; }
@@ -357,8 +350,6 @@ private:
         DirectApiProtocol::face_handler = [this](const std::string& json, std::string& error) {
             return display_->PlayFace(json, error);
         };
-        // 设置页 /cam.jpg：直接拉一张大模型看到的照片（?raw=1 是原始帧），调视觉用
-        DirectApiConfigServer::debug_capture = [this](bool raw) { return CaptureFrame(raw); };
         // 让大模型看一眼摄像头：拍照和编码要一两秒，放到独立任务里做，别卡主循环；
         // 拍好的 JPEG 经 AttachImage 交给直连协议，由它随下一轮请求发给视觉模型（见 Chat()）
         mcp_server.AddTool("self.camera.look",
