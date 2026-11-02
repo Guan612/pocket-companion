@@ -385,14 +385,20 @@ namespace {
 
 SpiLcdDisplay::Options NomiDisplayOptions() {
     SpiLcdDisplay::Options o;
-    // 两条 10 行的缓冲轮流用：和原来单条 20 行占一样多的内部 RAM（内部 RAM 很紧，连续对话要靠它），
-    // 但 LVGL 画一条的同时 SPI 在发另一条，翻页、滚动时整屏刷新快不少
-    o.buffer_lines = 10;
+    // 绘制缓冲放 PSRAM、开大：缓冲只有 10 行时一帧要分 32 块画，每块都把整页控件、文字重新走一遍，
+    // 翻页时收听页、时钟页一帧要 100ms；80 行只分 4 块。两条轮流用，LVGL 画一条的同时 SPI 在发另一条。
+    // 原来那两条 10 行的缓冲在内部 RAM 里，这下也省出来了
+    o.buffer_lines = 80;
     o.double_buffer = true;
+    o.buffers_in_psram = true;
     // LVGL 任务原来是优先级 1，比 AFE / 唤醒词（3）、Opus 编码（2）、每个 HTTPS 连接的接收任务（1）
     // 都低或平级，拖动一卡一卡；触摸也是 LVGL 任务里轮询的，被饿着时点得快了会漏。
     // 提到 2：和 Opus 编码轮流跑，仍让着 AFE 和音频输入输出（串口里 Opus 已经在掉帧，不能再压它）
     o.task_priority = 2;
+    // LVGL 单独 -O2 编译后内联多、栈帧大，默认 7KB 的栈实测最少只剩 1.3KB；加到 9KB 留足余量
+    o.task_stack = 9216;
+    // 不用小智的 PNG 表情，2.5MB 的 LVGL 内存池用不上；PSRAM 留给唤醒词的 MultiNet 和电台、播客的缓冲
+    o.large_image_cache = false;
     return o;
 }
 
@@ -421,6 +427,18 @@ void NomiDisplay::SetupUI() {
     SpiLcdDisplay::SetupUI();
 
     DisplayLockGuard lock(this);
+    // 绘制缓冲在 PSRAM，SPI 直接从那儿 DMA：地址和长度都要按 64 字节对齐，不然驱动每次另申请一块
+    // 再拷一遍。重画区域左右扩到 32 像素（64 字节）的整数倍，每行都对齐，整块就对齐了
+    if (display_ != nullptr) {
+        lv_display_add_event_cb(
+            display_,
+            [](lv_event_t* e) {
+                auto* area = static_cast<lv_area_t*>(lv_event_get_param(e));
+                area->x1 &= ~31;
+                area->x2 |= 31;
+            },
+            LV_EVENT_INVALIDATE_AREA, nullptr);
+    }
     face_buf_ = static_cast<uint16_t*>(heap_caps_malloc(width_ * height_ * sizeof(uint16_t),
                                                         MALLOC_CAP_SPIRAM));
     if (face_buf_ == nullptr) {

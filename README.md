@@ -129,6 +129,7 @@ git subtree pull --prefix=firmware https://github.com/78/xiaozhi-esp32.git <tag>
 - [x] 语音合成支持 mp3 / wav：先要 opus，服务不支持就自动改要 mp3，设备上用乐鑫音频库解码（真机播放待验证）
 - [x] 一问一答开关：设置 → 对话里，打开后回答完一句就回待机；不开是连续对话。说「退下吧」让大模型调 `self.chat.end`，说完那句自动退出聆听（和「闭嘴」区分开——那只是关语音播报）。原来的"连续聆听"开关去掉了：它只是手动开始 / 结束对话，和唤醒词、BOOT 键、5 秒没人说话自动回待机重复
 - [x] 网络电台：http(s) 上的 MP3 / AAC 直播流，收流和解码两个常驻任务（栈在 PSRAM），64KB PSRAM 缓冲、攒 1.5 秒再放；放的时候关掉 Wi-Fi 省电（待机的 MAX_MODEM 收不过来），断了 1 / 3 / 6… 秒重连；对话和闹钟时停、连接断开，把内部 RAM 让给语音识别。工具 `self.radio.play`（台单匹配或去目录搜）/ `stop` / `save` / `remove`，台单存 NVS（最多 20 个）
+- [x] 翻页流畅度：LVGL 绘制缓冲放 PSRAM（两条 80 行，SPI 直接从 PSRAM DMA，重画区域左右对齐到 32 像素），LVGL 单独 -O2 编译（任务栈加到 9KB），不开小智给 PNG 表情用的 2.5MB 内存池。整屏重画从 90～112ms 降到 60～68ms，空闲内部 RAM 从 35～40KB 到 60KB 以上。屏幕 SPI 试过 80MHz（能到 40～58ms），但这块屏收不稳、画面不跟着变，保持 40MHz
 - [x] 播客：订阅（Apple 播客目录搜索或 RSS，存 NVS，最多 10 个）、RSS 只读最新 10 期、每个播客记进度；m4a 自己解析 moov、按时间找帧补 ADTS 头送 AAC 解码器，MP3 按码率算字节位置 Range 跳转；封面（Apple 的小图走 http）JPEG 解码成 88×88。播客的联网全走 esp_http_client（连接、握手有超时，数据在本任务里读，不另开 4KB 内部 RAM 的接收任务），一次只做一件，正在放的若是 https 先让出来（内部 RAM 只够一条 TLS）；栈在 PSRAM 的任务不碰 NVS。工具 `self.podcast.play` / `episodes` / `subscribe` / `unsubscribe` / `seek`
 - [x] 时钟页：SNTP 对时（阿里云 / 腾讯 / pool.ntp.org）、open-meteo 天气（http，不占 TLS 内存）、闹钟和倒计时提醒（`self.alarm.add` / `self.reminder.add` / `self.alarm.list` / `self.alarm.remove`，存 NVS）、天气城市（`self.weather.set_city`，与网页设置页共用）；每轮系统提示词带上当前时间、天气和闹钟
 - [x] 静音模式开关：设置 → 声音里开关语音播报，回复只显示文字；与网页设置页、`self.voice.set_speak` 工具共用同一份配置

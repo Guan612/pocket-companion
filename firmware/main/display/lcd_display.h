@@ -65,6 +65,13 @@ public:
         int buffer_lines = 20;
         bool double_buffer = false;
         int task_priority = 1;
+        int task_stack = 7168;  // LVGL 任务栈（内部 RAM），默认和 esp_lvgl_port 一样
+        // 8MB PSRAM 时默认另给 LVGL 加 2.5MB 内存池、开 2MB 图片缓存（给 PNG 表情用）。
+        // 不用 PNG 表情的界面关掉它，按 2MB PSRAM 的规格只开 512KB 缓存，把 PSRAM 留给别的
+        bool large_image_cache = true;
+        // 绘制缓冲放 PSRAM（要芯片支持 PSRAM DMA，面板 IO 也要开 psram_dma_direct）：
+        // 不占内部 RAM，可以开得很大，一帧分的块少，每块都要重走一遍控件树的开销就少
+        bool buffers_in_psram = false;
     };
 
     SpiLcdDisplay(esp_lcd_panel_io_handle_t panel_io, esp_lcd_panel_handle_t panel, int width,

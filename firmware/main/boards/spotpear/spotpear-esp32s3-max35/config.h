@@ -33,7 +33,7 @@
 #define DISPLAY_CS_PIN      GPIO_NUM_5
 #define DISPLAY_DC_PIN      GPIO_NUM_47
 #define DISPLAY_RST_PIN     GPIO_NUM_NC
-#define DISPLAY_SPI_HZ      (40 * 1000 * 1000)
+#define DISPLAY_SPI_HZ      (40 * 1000 * 1000)  // 试过 80MHz：刷得更快，但这块屏收不稳，画面不跟着变（像触摸失灵），保持 40MHz
 
 // 背光经 APM2307（P 沟道 MOS）驱动，低电平点亮，所以 PWM 要反相
 #define DISPLAY_BACKLIGHT_PIN           GPIO_NUM_42

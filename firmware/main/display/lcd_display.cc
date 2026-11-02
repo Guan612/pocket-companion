@@ -130,7 +130,7 @@ SpiLcdDisplay::SpiLcdDisplay(esp_lcd_panel_io_handle_t panel_io, esp_lcd_panel_h
 #if CONFIG_SPIRAM
     // lv image cache, currently only PNG is supported
     size_t psram_size_mb = esp_psram_get_size() / 1024 / 1024;
-    if (psram_size_mb >= 8) {
+    if (psram_size_mb >= 8 && options.large_image_cache) {
 #if CONFIG_LV_USE_BUILTIN_MALLOC
         // Base TLSF pool is CONFIG_LV_MEM_SIZE_KILOBYTES in PSRAM; grow it so
         // the 2MB decoded-image cache does not exhaust a 2MB-PSRAM-safe pool.
@@ -170,6 +170,7 @@ SpiLcdDisplay::SpiLcdDisplay(esp_lcd_panel_io_handle_t panel_io, esp_lcd_panel_h
     ESP_LOGI(TAG, "Initialize LVGL port");
     lvgl_port_cfg_t port_cfg = ESP_LVGL_PORT_INIT_CONFIG();
     port_cfg.task_priority = options.task_priority;
+    port_cfg.task_stack = options.task_stack;
 #if CONFIG_SOC_CPU_CORES_NUM > 1
     port_cfg.task_affinity = 1;
 #endif
@@ -199,7 +200,7 @@ SpiLcdDisplay::SpiLcdDisplay(esp_lcd_panel_io_handle_t panel_io, esp_lcd_panel_h
         .flags =
             {
                 .buff_dma = 1,
-                .buff_spiram = 0,
+                .buff_spiram = options.buffers_in_psram,
                 .sw_rotate = 0,
                 .swap_bytes = 1,
                 .full_refresh = 0,
