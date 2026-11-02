@@ -701,14 +701,11 @@ static lv_obj_t *add_page(lv_obj_t *tabview, const char *name)
 static void build_chat_page(lv_obj_t *page)
 {
     static const char *const talk[] = {"按住说话", "点一下开始", ""};
-    add_choice(page, "BOOT 键", "也可以直接喊「你好小智」", NOMI_KEY_TALK_KEY, talk, 1);
+    add_choice(page, "BOOT 键", "也可以喊「你好小智」", NOMI_KEY_TALK_KEY, talk, 1);
     // 不开时是连续对话：回答完接着听，5 秒没人开口自己回待机，说"退下吧"马上回
-    add_switch(page, "一问一答", "回答完一句就回待机，下次说话要再叫它；不开就是连续对话", NOMI_KEY_ONE_SHOT,
-               true);
+    add_switch(page, "一问一答", "答完一句就回待机", NOMI_KEY_ONE_SHOT, true);
     bool aec_ok = get_int(NOMI_KEY_AEC_SUPPORTED, 0);
-    add_switch(page, "随时插话打断",
-               aec_ok ? "它说话时直接开口就能打断" : "这块板没有喇叭回采，不支持", NOMI_KEY_AEC,
-               aec_ok);
+    add_switch(page, "随时插话打断", aec_ok ? "它说话时开口就能打断" : "这块板不支持", NOMI_KEY_AEC, aec_ok);
     add_switch(page, "显示字幕", NULL, NOMI_KEY_SUBTITLES, true);
 }
 
@@ -720,10 +717,9 @@ static void build_role_page(lv_obj_t *page)
     if (rows) add_choice(page, "人设", NULL, NOMI_KEY_PERSONA, persona_map, rows);
     rows = build_map(get_text("voices"), voice_buf, sizeof(voice_buf), voice_map, 12, 3);
     if (rows) {
-        add_choice(page, "音色", "OpenAI 的音色名，别家的音色请在网页设置页里填", NOMI_KEY_VOICE,
-                   voice_map, rows);
+        add_choice(page, "音色", NULL, NOMI_KEY_VOICE, voice_map, rows);
     }
-    add_info(page, "自定义", "人设提示词、API 地址和 Key、看图识物的模型，都在网页设置页里改");
+    add_info(page, "更多", "提示词、音色、API 在网页设置页改");
 }
 
 static void build_display_page(lv_obj_t *page)
@@ -732,12 +728,11 @@ static void build_display_page(lv_obj_t *page)
     static const char *const off[] = {"2 分", "5 分", "10 分", "30 分", "从不", ""};
     static const char *const sleep_show[] = {"时钟", "表情", ""};
     add_slider(page, "亮度", NOMI_KEY_BRIGHTNESS, MIN_BRIGHTNESS, 80);
-    add_choice(page, "多久后睡着", "睡着后过 30 秒屏幕再调暗", NOMI_KEY_DIM, dim, 1);
-    add_choice(page, "睡着时显示", "时钟页有时间、天气和闹钟；还没对上时间时显示表情", NOMI_KEY_SLEEP_SHOW,
-               sleep_show, 1);
+    add_choice(page, "多久后睡着", "睡着 30 秒后调暗", NOMI_KEY_DIM, dim, 1);
+    add_choice(page, "睡着时显示", NULL, NOMI_KEY_SLEEP_SHOW, sleep_show, 1);
     add_choice(page, "多久后息屏", NULL, NOMI_KEY_OFF, off, 1);
     const char *city = get_text("weather_city");
-    lv_obj_t *item = add_item(page, "天气城市", "网页设置页里能改，也可以直接跟它说「我在深圳」");
+    lv_obj_t *item = add_item(page, "天气城市", "跟它说「我在深圳」也能改");
     lv_obj_t *label = lv_label_create(item);
     lv_label_set_text(label, city[0] ? city : "自动（按网络位置）");
     set_color(label, C_MUTED);
@@ -755,7 +750,7 @@ static void add_saved_wifi(lv_obj_t *page)
     if (buf[0]) count++;
     char title[48];
     snprintf(title, sizeof(title), "已存的 Wi-Fi（%d / 10）", count);
-    lv_obj_t *item = add_item(page, title, "在哪个网络附近就自动连哪个；网页设置页里能添加和删除，不在身边的也能先存");
+    lv_obj_t *item = add_item(page, title, "自动连附近的，网页设置页可增删");
     if (!count) {
         lv_obj_t *label = lv_label_create(item);
         lv_label_set_text(label, "还没有");
@@ -784,7 +779,7 @@ static void build_network_page(lv_obj_t *page)
     if (hotspot[0]) {
         char wifi_qr[64], hint[160];
         snprintf(wifi_qr, sizeof(wifi_qr), "WIFI:T:nopass;S:%s;;", hotspot);
-        snprintf(hint, sizeof(hint), "手机扫码连上热点 %s，浏览器打开 %s 添加 Wi-Fi", hotspot, get_text("hotspot_url"));
+        snprintf(hint, sizeof(hint), "手机扫码连热点 %s，打开 %s 添加 Wi-Fi", hotspot, get_text("hotspot_url"));
         lv_obj_t *item = add_item(page, "配网中", hint);
         add_qrcode(item, wifi_qr);
         add_saved_wifi(page);
@@ -800,14 +795,14 @@ static void build_network_page(lv_obj_t *page)
     }
     const char *url = get_text("config_url");
     if (url[0]) {
-        lv_obj_t *item = add_item(page, "网页设置页", "手机扫码打开，填写 API 地址和 Key、管理 Wi-Fi");
+        lv_obj_t *item = add_item(page, "网页设置页", "手机扫码打开");
         add_qrcode(item, url);
         lv_obj_t *label = lv_label_create(item);
         lv_label_set_text(label, url);
         set_color(label, C_MUTED);
     }
     add_saved_wifi(page);
-    add_item(page, "添加 Wi-Fi", "开配网热点，用手机连上它添加新网络；已存的都保留。会先断开现在的网络");
+    add_item(page, "添加 Wi-Fi", "会先断开当前网络，已存的都保留");
     add_action(add_button_row(page), "开配网热点", "reconfigure_wifi", true);
 }
 
@@ -895,8 +890,7 @@ static void build_settings(void)
     lv_obj_t *sound = add_page(tv, "声音");
     add_slider(sound, "音量", NOMI_KEY_VOLUME, 0, 70);
     // 静音模式：关了语音播报，回复只显示文字，不念出来也不调合成接口
-    add_switch(sound, "语音播报", "关掉就是静音模式：回复只显示文字，不念出来", NOMI_KEY_TTS_SPEAK,
-               true);
+    add_switch(sound, "语音播报", "关掉只显示文字", NOMI_KEY_TTS_SPEAK, true);
     build_network_page(add_page(tv, "网络"));
     build_system_page(add_page(tv, "系统"));
 
