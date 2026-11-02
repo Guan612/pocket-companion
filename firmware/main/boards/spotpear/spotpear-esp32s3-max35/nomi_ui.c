@@ -1315,6 +1315,22 @@ static void radio_refresh(bool force)
         }
     }
 
+    // 在放、待机、停在表情页：Nomi 手放耳边、眯着眼跟着晃，头上飘音符（循环播一小段表演）；
+    // 一开口说话就停下，换回听人说话的样子
+    static bool music_face;
+    nomi_state_t dev = s_cb.get_state ? s_cb.get_state() : NOMI_STATE_IDLE;
+    bool music = state == RADIO_PLAYING && dev == NOMI_STATE_IDLE && !s_sleeping && current_page() == PAGE_FACE;
+    if (music && !face_is_playing()) {
+        static const char *const kMusicFace =
+            "[{\"eyes\":\"arc\",\"hands\":\"ear\",\"motion\":\"sway\",\"prop\":{\"icon\":\"note\",\"anim\":\"float\",\"at\":\"top\"},\"dur\":4},"
+            "{\"eyes\":\"arc\",\"hands\":\"ear\",\"motion\":\"sway\",\"prop\":{\"icon\":\"music\",\"anim\":\"float\",\"at\":\"top\"},\"dur\":4}]";
+        char err[80];
+        music_face = nomi_ui_play_face(kMusicFace, err, sizeof(err));
+    } else if (!music && music_face) {
+        music_face = false;
+        if (face_is_playing()) face_stop();
+    }
+
     // 表情页左上角小条：在放（或对话时暂停着）、而且停在表情页时显示，点一下来收听页
     bool mini = state != RADIO_OFF && current_page() == PAGE_FACE && !s_sleeping;
     if (lv_obj_has_flag(s_radio_mini, LV_OBJ_FLAG_HIDDEN) == mini) lv_obj_set_flag(s_radio_mini, LV_OBJ_FLAG_HIDDEN, !mini);
