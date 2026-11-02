@@ -85,6 +85,7 @@ static bool s_error_shown;   // Application 的 last_error_message_ 非空：待
 static chat_t s_chat = CHAT_IDLE;
 static uint32_t s_chat_at;
 static bool s_recording;     // DirectApiProtocol::recording_：麦克风在收音，sim.html 跟着开关录音
+static bool s_thinking;      // DirectApiProtocol::thinking_：录完一句到开口之间
 static bool s_holding;       // BOOT 键按住说话中
 static bool s_channel_open;  // Protocol::IsAudioChannelOpened
 static int s_turn_id;        // 对话被打断 / 关闭时加一，sim.html 丢掉这一轮还没回来的结果
@@ -229,6 +230,7 @@ static void close_channel(const char *why)
     if (s_chat == CHAT_IDLE && !s_channel_open) return;
     dev_log('I', "Application", "Closing audio channel (%s)", why);
     s_turn_id++;
+    s_thinking = false;
     s_channel_open = false;
     s_holding = false;
     set_chat(CHAT_IDLE);
@@ -493,6 +495,7 @@ static nomi_state_t get_state(void)
     if (s_stage == STAGE_ACTIVATING || s_chat == CHAT_CONNECTING) return NOMI_STATE_CONNECTING;
     if (s_chat == CHAT_LISTENING) return NOMI_STATE_LISTENING;
     if (s_chat == CHAT_SPEAKING) return NOMI_STATE_SPEAKING;
+    if (s_thinking) return NOMI_STATE_THINKING;
     if (s_stage == STAGE_WIFI_CONFIG) return NOMI_STATE_WIFI_SETUP;
     return NOMI_STATE_IDLE;
 }
@@ -765,10 +768,10 @@ int sim_rec_finished(void) { return s_rec_finished; }
 int sim_turn_id(void) { return s_turn_id; }
 
 // 自动模式下设备端 VAD 判断说完了（或录满 15 秒）：FinishRecording，状态仍是聆听
-void sim_vad_end(void) { set_recording(false); }
+void sim_vad_end(void) { set_recording(false); }  // 思考从 sim_turn_thinking 开始（没人说话的结束不算）
 
 // RunTurn 一开始：EmitJson("llm", "emotion", "thinking")
-void sim_turn_thinking(void) { nomi_ui_set_emotion("thinking"); }
+void sim_turn_thinking(void) { s_thinking = true; nomi_ui_set_emotion("thinking"); }
 
 // "stt"：识别出的文字作为用户字幕，记进聊天历史
 void sim_turn_stt(void)
@@ -781,6 +784,7 @@ void sim_turn_stt(void)
 // 没识别出内容：自动模式回到聆听，手动模式已经在待命
 void sim_turn_empty(void)
 {
+    s_thinking = false;
     nomi_ui_set_emotion("neutral");  // RunTurn：没听清时结束"思考中"
     if (auto_mode() && s_channel_open && s_chat == CHAT_LISTENING) set_recording(true);
 }
@@ -789,7 +793,7 @@ void sim_turn_empty(void)
 void sim_turn_emotion(void) { nomi_ui_set_emotion(s_str); }
 
 // "tts" start / sentence_start / stop
-void sim_tts_start(void) { set_chat(CHAT_SPEAKING); }
+void sim_tts_start(void) { s_thinking = false; set_chat(CHAT_SPEAKING); }
 
 void sim_tts_sentence(void)
 {
@@ -804,7 +808,7 @@ void sim_tts_stop(void)
     set_chat(auto_mode() ? CHAT_LISTENING : CHAT_IDLE);
 }
 
-void sim_turn_error(void) { chat_error(s_str); }
+void sim_turn_error(void) { s_thinking = false; chat_error(s_str); }
 
 // 大模型调用了设备工具：0 音量，1 亮度
 void sim_apply(int kind, int value)

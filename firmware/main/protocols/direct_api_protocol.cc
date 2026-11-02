@@ -388,6 +388,7 @@ void DirectApiProtocol::CloseAudioChannel(bool send_goodbye) {
     (void)send_goodbye;
     cancel_ = true;
     recording_ = false;
+    thinking_ = false;
     exit_after_reply_ = false;  // 对话都没了，别把"说完退出"带进下一场
     bool was_opened = opened_.exchange(false);
     // 丢掉已排队还没开始的轮次：不然它们会带着旧录音跑识别，
@@ -489,6 +490,11 @@ void DirectApiProtocol::FinishRecording() {
     if (!recording_.exchange(false) || busy_) {
         return;
     }
+    // 真说了话（或手动松键）才算开始思考；没人开口的那种结束马上回待机，别闪一下"思考中"
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        thinking_ = heard_voice_ || mode_ == kListeningModeManualStop;
+    }
     xSemaphoreGive(turn_sem_);
 }
 
@@ -502,6 +508,7 @@ void DirectApiProtocol::WorkerLoop() {
         // 通道已关闭还排着队（关闭瞬间 FinishRecording 刚给过信号量）：这轮作废。
         // 不拦的话 cancel_ 会在下面被清掉，退出聆听后还会偷偷跑一轮识别
         if (!opened_) {
+            thinking_ = false;
             continue;
         }
         std::string packets;
@@ -513,6 +520,7 @@ void DirectApiProtocol::WorkerLoop() {
         cancel_ = false;
         barge_in_ms_ = 0;
         RunTurn(std::move(packets));
+        thinking_ = false;  // 出错、被打断、没听清回去聆听：这一轮的思考都结束了
         busy_ = false;
     }
 }
@@ -534,6 +542,7 @@ void DirectApiProtocol::RunTurn(std::string packets) {
     auto& app = Application::GetInstance();
     // 没识别出内容时回到聆听；手动模式下 Application 会自己回到待机
     auto resume = [this]() {
+        thinking_ = false;
         if (mode_ != kListeningModeManualStop && opened_) {
             SendStartListening(mode_);
         }
@@ -580,6 +589,7 @@ void DirectApiProtocol::RunTurn(std::string packets) {
         pending_face_.clear();
     }
 
+    thinking_ = false;  // 想好了，开口
     EmitJson("tts", "state", "start");
     // 等 Application 切到 Speaking，否则送进去的音频会被丢掉
     for (int i = 0; i < 50 && app.GetDeviceState() != kDeviceStateSpeaking && !Aborted(); i++) {
@@ -1142,6 +1152,7 @@ static int PostStatus(Http& http, const std::string& url) {
 }
 
 std::string DirectApiProtocol::face_prompt;
+std::atomic<bool> DirectApiProtocol::thinking_{false};
 std::function<bool(const std::string&, std::string&)> DirectApiProtocol::face_handler;
 
 void DirectApiProtocol::AttachImage(std::string jpeg) {

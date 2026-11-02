@@ -21,6 +21,7 @@ typedef enum {
     NOMI_STATE_SPEAKING,
     NOMI_STATE_ERROR,
     NOMI_STATE_WIFI_SETUP,  // 配网模式（开着配网热点）：状态文字常显
+    NOMI_STATE_THINKING,    // 一句话录完、还没开口：识别 / 大模型 / 工具调用中，已经不在收音
 } nomi_state_t;
 
 // 设置项（get_int / set_int 的 key）

@@ -51,6 +51,7 @@ static size_t s_hist_last_len;  // 最后一条显示时的长度（回答是逐
 static lv_obj_t *s_hist_hint;   // "还没有对话"提示
 static char s_settings_sig[768];  // 设置页建好时各项的值；下拉时没变就不重建
 static lv_obj_t *s_wifi_label;  // 设置 → 网络里"当前 Wi-Fi"那行（信号强度每次打开都刷新）
+static char s_status_text[64];  // 小智设的状态文字（思考中时显示"思考中…"，结束后换回它）
 static int s_battery_level = -2;
 static bool s_battery_charging;
 
@@ -109,6 +110,7 @@ static face_mode_t pick_mode(uint32_t now)
 {
     nomi_state_t state = s_cb.get_state ? s_cb.get_state() : NOMI_STATE_IDLE;
     if (state == NOMI_STATE_SPEAKING) return FACE_SPEAK;
+    if (state == NOMI_STATE_THINKING) return FACE_THINK;  // 录完到开口：一直是思考的样子
     if (s_emotion_mode != FACE_IDLE && (int32_t)(s_emotion_until - now) > 0) return s_emotion_mode;
     switch (state) {
     case NOMI_STATE_LISTENING: return FACE_LISTEN;
@@ -150,6 +152,10 @@ static void face_tick(lv_timer_t *timer)
     nomi_state_t state = s_cb.get_state ? s_cb.get_state() : NOMI_STATE_IDLE;
     bool hide_status = state == NOMI_STATE_IDLE || ((s_sleeping || face_is_playing()) && state != NOMI_STATE_WIFI_SETUP);
     if (lv_obj_has_flag(s_status, LV_OBJ_FLAG_HIDDEN) != hide_status) lv_obj_set_flag(s_status, LV_OBJ_FLAG_HIDDEN, hide_status);
+    // 思考中：设备状态还是"聆听中"（小智只在开口时才切到说话），状态文字这里自己换掉，结束时换回来
+    if ((state == NOMI_STATE_THINKING) != (s_last_state == NOMI_STATE_THINKING)) {
+        lv_label_set_text(s_status, state == NOMI_STATE_THINKING ? "思考中…" : s_status_text);
+    }
 
     // 说完了就收起字幕（小智回到待机时会清聊天记录，但 Nomi 的字幕不在那套界面里，得自己收）
     if (s_last_state == NOMI_STATE_SPEAKING && state != NOMI_STATE_SPEAKING) s_subtitle_hide_at = now + SUBTITLE_LINGER_MS;
@@ -216,7 +222,8 @@ void nomi_ui_set_font(const lv_font_t *font)
 
 void nomi_ui_set_status(const char *status)
 {
-    lv_label_set_text(s_status, status ? status : "");
+    snprintf(s_status_text, sizeof(s_status_text), "%s", status ? status : "");
+    if (s_last_state != NOMI_STATE_THINKING) lv_label_set_text(s_status, s_status_text);  // 思考中先不盖掉
 }
 
 // 字幕只有两行高，放不下的句子按 UTF-8 从后往前截出能放下的尾巴（正在念的就是最后这句），
@@ -488,7 +495,7 @@ static void sync_listen_switch(nomi_state_t state)
 {
     if (!s_listen_sw) return;
     if ((int32_t)(s_listen_hold_until - lv_tick_get()) > 0) return;  // 用户刚点过，先别抢
-    bool on = state == NOMI_STATE_LISTENING || state == NOMI_STATE_SPEAKING;
+    bool on = state == NOMI_STATE_LISTENING || state == NOMI_STATE_THINKING || state == NOMI_STATE_SPEAKING;
     if (lv_obj_has_state(s_listen_sw, LV_STATE_CHECKED) == on) return;
     s_sw_syncing = true;  // 程序改状态也可能触发事件，别当成用户点了一下
     if (on) lv_obj_add_state(s_listen_sw, LV_STATE_CHECKED);

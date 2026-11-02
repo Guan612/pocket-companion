@@ -130,7 +130,12 @@ void ApplyAec(bool on) {
 // 以下回调在 LVGL 任务里被 nomi_ui 调用
 
 nomi_state_t GetState() {
-    switch (Application::GetInstance().GetDeviceState()) {
+    auto state = Application::GetInstance().GetDeviceState();
+#if CONFIG_DIRECT_API
+    // 录完一句到开口之间设备状态还是聆听（松键后是待机），但其实已经停止收音在等识别和大模型
+    if (DirectApiProtocol::IsThinking() && state != kDeviceStateSpeaking) return NOMI_STATE_THINKING;
+#endif
+    switch (state) {
         case kDeviceStateListening: return NOMI_STATE_LISTENING;
         case kDeviceStateSpeaking: return NOMI_STATE_SPEAKING;
         case kDeviceStateConnecting:

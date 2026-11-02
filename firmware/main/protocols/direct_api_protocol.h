@@ -66,10 +66,15 @@ public:
     static std::string face_prompt;
     static std::function<bool(const std::string& json, std::string& error)> face_handler;
 
+    // 正在"思考"：一句话录完（已停止收音）到开口说话之间——识别、大模型、工具调用、拍照都在这段。
+    // 设备状态这时仍是聆听（自动模式）或待机（松键后），屏幕靠它显示"思考中"
+    static bool IsThinking() { return thinking_; }
+
 protected:
     bool SendText(const std::string& text) override;
 
 private:
+    static std::atomic<bool> thinking_;
     std::atomic<bool> opened_{false};
     std::atomic<bool> recording_{false};
     std::atomic<bool> cancel_{false};
