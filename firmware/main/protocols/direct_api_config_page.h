@@ -120,6 +120,18 @@ button:disabled{opacity:.5}
 </div>
 </div>
 
+<div id="musicCard" hidden>
+<h2>在线音乐</h2>
+<div class="card">
+  <p class="hint">跟它说「放一首晴天」「来首周杰伦的歌」「换一首」，就在这个网站上搜歌来放，收听页的「音乐」标签显示封面和歌词。网站要是特定格式的（见仓库里的 docs/online-music.md），失效了换一个同款的填上就行。</p>
+  <label>音乐网站<input id="musicSite" autocomplete="off" placeholder="http://…（网站支持的话用 http，省设备内存）"></label>
+  <div class="row"><button id="musicSave">保存</button><span id="musicMsg" class="hint"></span></div>
+  <label>试一下<input id="musicQuery" autocomplete="off" placeholder="歌名，可以带歌手：晴天 周杰伦"></label>
+  <div class="row"><button id="musicSearch">搜索</button></div>
+  <div id="musicResults"></div>
+</div>
+</div>
+
 <h2>人设提示词</h2>
 <textarea id="prompt" rows="4" placeholder="留空用默认提示词"></textarea>
 
@@ -508,6 +520,47 @@ $('#podAdd').onclick = async () => {
   $('#podAdd').disabled = false;
 };
 loadPod();
+
+// 在线音乐：板子没挂 /music.json 时整块不显示
+const musicMsg = (text, cls) => { $('#musicMsg').textContent = text; $('#musicMsg').className = 'hint ' + (cls || ''); };
+async function musicPost(path, body, done) {
+  try {
+    const r = await (await fetch(path, {method: 'POST', body: JSON.stringify(body)})).json();
+    musicMsg(r.ok ? (done || '') : r.error, r.ok ? 'ok' : 'err');
+    return r;
+  } catch (e) { musicMsg('请求失败：' + e.message, 'err'); return {}; }
+}
+(async () => {
+  try {
+    const res = await fetch('/music.json', {cache: 'no-store'});
+    if (!res.ok) return;
+    $('#musicSite').value = (await res.json()).site || '';
+  } catch (e) { return; }
+  $('#musicCard').hidden = false;
+})();
+$('#musicSave').onclick = async () => {
+  $('#musicSave').disabled = true;
+  await musicPost('/music/site', {site: $('#musicSite').value.trim()}, '已保存');
+  $('#musicSave').disabled = false;
+};
+$('#musicSearch').onclick = async () => {
+  const q = $('#musicQuery').value.trim();
+  if (!q) return musicMsg('先填歌名', 'err');
+  $('#musicSearch').disabled = true; musicMsg('搜索中…');
+  const r = await musicPost('/music/search', {q});
+  $('#musicSearch').disabled = false;
+  const box = $('#musicResults');
+  box.innerHTML = '';
+  if (!r.ok) return;
+  if (!r.results.length) return musicMsg('没搜到，换个歌名试试', 'err');
+  r.results.forEach((s, index) => {
+    const row = document.createElement('div');
+    row.className = 'row';
+    row.innerHTML = `<span style="flex:1;overflow-wrap:anywhere">${esc(s.title)}<br><span class="hint">${esc(s.artist)}</span></span><button>播放</button>`;
+    row.querySelector('button').onclick = async () => { musicMsg('取歌曲页…'); await musicPost('/music/play', {index}, '开始放了'); };
+    box.appendChild(row);
+  });
+};
 
 // 读到当前设置之前不让保存，免得空页面把已有设置冲掉
 async function load() {

@@ -15,7 +15,6 @@
 #include <esp_timer.h>
 #include <freertos/idf_additions.h>
 #include <freertos/task.h>
-#include <jpeg_decoder.h>
 
 #include <algorithm>
 #include <cstdio>
@@ -297,34 +296,14 @@ void NomiPodcast::LoadCover(const std::string& art) {
     }
     LogHeap("after cover");
     if (!ok) return;
-    esp_jpeg_image_cfg_t cfg = {};
-    cfg.indata = reinterpret_cast<uint8_t*>(jpg.data());
-    cfg.indata_size = jpg.size();
-    cfg.out_format = JPEG_IMAGE_FORMAT_RGB565;
-    esp_jpeg_image_output_t info = {};
-    if (esp_jpeg_get_image_info(&cfg, &info) != ESP_OK || info.width == 0 || info.width > 640 || info.height > 640) {
+    // 拿到的不是 88 见方（不是 Apple 的图）也行，缩放着写进没在显示的那块
+    int next = cover_active_ == 0 ? 1 : 0;
+    if (!nomi::DecodeCover(jpg, covers_[next], kCoverSize)) {
         ESP_LOGW(TAG, "Cover is not a usable JPEG: %s", url.c_str());
         return;
     }
-    size_t out_size = info.width * info.height * 2;
-    auto* pixels = static_cast<uint8_t*>(heap_caps_malloc(out_size, MALLOC_CAP_SPIRAM));
-    if (pixels == nullptr) return;
-    cfg.outbuf = pixels;
-    cfg.outbuf_size = out_size;
-    if (esp_jpeg_decode(&cfg, &info) == ESP_OK) {
-        // 拿到的不是 88 见方（不是 Apple 的图）就最近邻缩放；写进没在显示的那块
-        int next = cover_active_ == 0 ? 1 : 0;
-        auto* src = reinterpret_cast<const uint16_t*>(pixels);
-        for (int y = 0; y < kCoverSize; y++) {
-            for (int x = 0; x < kCoverSize; x++) {
-                covers_[next][y * kCoverSize + x] =
-                    src[(y * info.height / kCoverSize) * info.width + x * info.width / kCoverSize];
-            }
-        }
-        cover_active_ = next;
-        cover_version_++;
-    }
-    heap_caps_free(pixels);
+    cover_active_ = next;
+    cover_version_++;
 }
 
 const uint16_t* NomiPodcast::Cover(int& version) {
@@ -584,7 +563,7 @@ void NomiPodcast::RegisterTools() {
             if (name.empty()) {
                 // 接着放：正在暂停的那期，或者存着的最后一期
                 auto& radio = NomiRadio::GetInstance();
-                if (radio.IsEpisode()) {
+                if (radio.IsEpisode() && !radio.Current().song) {
                     if (!radio.Wanted()) radio.Toggle();
                     result = "接着放《" + radio.Current().podcast + "》：" + radio.Current().name;
                 } else {
@@ -727,11 +706,11 @@ void NomiPodcast::RegisterTools() {
                 });
 
     mcp.AddTool("self.podcast.seek",
-                "播客快进 / 快退。seconds：正数快进、负数倒回（比如 30、-15）。主人说\"快进一分钟\"\"倒回去一点\"时调用。",
+                "播客 / 歌曲快进、快退。seconds：正数快进、负数倒回（比如 30、-15）。主人说\"快进一分钟\"\"倒回去一点\"时调用。",
                 PropertyList({Property("seconds", kPropertyTypeInteger, -7200, 7200)}),
                 [](const PropertyList& props) -> ToolResult {
                     auto& radio = NomiRadio::GetInstance();
-                    if (!radio.IsEpisode()) return std::unexpected(std::string("现在没在放播客"));
+                    if (!radio.IsEpisode()) return std::unexpected(std::string("现在没在放播客或歌"));
                     radio.Seek(props["seconds"].value<int>());
                     if (!radio.Wanted()) radio.Toggle();
 #if CONFIG_DIRECT_API

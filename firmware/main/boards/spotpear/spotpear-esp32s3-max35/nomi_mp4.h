@@ -38,6 +38,7 @@ bool Mp4FindMoov(const uint8_t* data, size_t len, uint64_t base, uint64_t& moov_
 bool Mp4ParseMoov(const uint8_t* moov, size_t size, Mp4Track& track);
 
 uint32_t Mp4SampleAtSecond(const Mp4Track& track, uint32_t second);
+uint32_t Mp4DurationSeconds(const Mp4Track& track);  // 总长：stts 表里"样本数 × 每个样本多长"加起来
 bool Mp4Seek(const Mp4Track& track, uint32_t sample, Mp4Cursor& cursor);
 // 当前样本的大小；返回 false 表示放完了
 bool Mp4SampleSize(const Mp4Track& track, const Mp4Cursor& cursor, uint32_t& size);

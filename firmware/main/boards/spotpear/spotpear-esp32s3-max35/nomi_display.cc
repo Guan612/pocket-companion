@@ -6,6 +6,7 @@
 #include "display/lvgl_display/lvgl_theme.h"
 #include "face_script.h"
 #include "nomi_clock.h"
+#include "nomi_music.h"
 #include "nomi_podcast.h"
 #include "nomi_radio.h"
 #include "nomi_ui.h"
@@ -176,6 +177,7 @@ int GetInt(const char* key, int def) {
     if (!strcmp(key, "pod_dur")) return NomiRadio::GetInstance().Current().duration;
     if (!strcmp(key, "pod_opened")) return NomiPodcast::GetInstance().Opened();
     if (!strcmp(key, "pod_load")) return NomiPodcast::GetInstance().LoadState();
+    if (!strcmp(key, "music_playing")) return NomiMusic::GetInstance().Playing();
     if (!strcmp(key, NOMI_KEY_PERSONA)) {
         // 按当前提示词反查是哪个预设；网页里改过就算自定义
         std::string prompt = Settings(kDirectApiNs).GetString("prompt");
@@ -311,15 +313,25 @@ const char* GetText(const char* key) {
     } else if (!strcmp(key, "pod_name") || !strcmp(key, "pod_title")) {
         auto st = NomiRadio::GetInstance().Current();
         if (st.episode) text = !strcmp(key, "pod_name") ? st.podcast : st.name;
+    } else if (!strcmp(key, "music_lyrics")) {
+        text = NomiMusic::GetInstance().LyricsWindow();
+    } else if (!strcmp(key, "music_hint")) {
+        text = NomiMusic::GetInstance().Hint();
     }
     return text.c_str();
 }
 
-// 播客封面：NomiPodcast 两块缓冲轮着用，换图时 version 加一
+// 封面：播客、歌各自两块缓冲轮着用，换图时 version 加一
 const uint16_t* GetImage(const char* key, int* size, int* version) {
-    if (strcmp(key, "pod_cover") != 0) return nullptr;
-    *size = NomiPodcast::kCoverSize;
-    return NomiPodcast::GetInstance().Cover(*version);
+    if (!strcmp(key, "pod_cover")) {
+        *size = NomiPodcast::kCoverSize;
+        return NomiPodcast::GetInstance().Cover(*version);
+    }
+    if (!strcmp(key, "music_cover")) {
+        *size = NomiMusic::kCoverSize;
+        return NomiMusic::GetInstance().Cover(*version);
+    }
+    return nullptr;
 }
 
 void Action(const char* name) {

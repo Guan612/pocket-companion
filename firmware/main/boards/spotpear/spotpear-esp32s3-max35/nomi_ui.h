@@ -60,8 +60,10 @@ typedef struct {
     // get_int("radio_state") 0 没在放 / 1 连接中 / 2 在放 / 3 对话中暂停 / 4 连不上 / 5 为加载别的暂停，
     // get_int("radio_index") 当前台在台单里的下标（搜来没收藏的台为 -1）。
     // 播客：pod_list（订阅名）、pod_episodes（打开的订阅最新几期，一行一期 "标题\t日期 · 时长"）、
-    // pod_name / pod_title（正在放的播客名、这期标题）；get_int：pod_playing（放的是不是播客）、
+    // pod_name / pod_title（正在放的播客名、这期标题；放的是歌时是歌手、歌名）；get_int：pod_playing（放的是播客或歌）、
     // pod_opened（打开的是第几个订阅，-1 在订阅列表）、pod_load（0 好了 1 加载中 2 失败）、pod_pos / pod_dur（秒）。
+    // 音乐：get_int("music_playing")（放的是在线音乐的一首歌）、music_lyrics（7 行歌词，第 4 行是唱到的这句；
+    // 没有歌词为空）、music_hint（没在放歌时显示的提示）。
     // 不认识的 key 返回空串
     const char *(*get_text)(const char *key);
     // 动作：test_api、reconfigure_wifi、factory_reset、alarm_stop / alarm_snooze（响铃时"知道了" /
@@ -73,8 +75,8 @@ typedef struct {
     const char *(*history_get)(int index, const char **role);
     // 可选：记录满了从头上丢掉的消息总数（只增不减）。有它历史页只增量更新，不用每次重建整个列表
     int (*history_dropped)(void);
-    // 可选：图片（RGB565，size 见方），"pod_cover" 是正在放的播客的封面；没有返回 NULL。
-    // 缓冲要一直有效（换图时换一块新的、version 加一）
+    // 可选：图片（RGB565，size 见方），"pod_cover" 是正在放的播客的封面，"music_cover" 是正在放的歌的专辑封面；
+    // 没有返回 NULL。缓冲要一直有效（换图时换一块新的、version 加一）
     const uint16_t *(*get_image)(const char *key, int *size, int *version);
 } nomi_ui_callbacks_t;
 

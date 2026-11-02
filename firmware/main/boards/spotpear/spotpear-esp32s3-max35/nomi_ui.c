@@ -44,13 +44,14 @@ static uint16_t *s_buf;
 enum { PAGE_HIST, PAGE_FACE, PAGE_MUSIC, PAGE_CLOCK, PAGE_COUNT };
 static lv_obj_t *s_outer, *s_settings_tile, *s_main_tile;
 static lv_obj_t *s_modes, *s_chat_tile, *s_hist_tile, *s_music_tile, *s_clock_tile;
-// 收听页（电台 / 播客）
-static lv_obj_t *s_tab_btns[2], *s_now_cover, *s_now_title, *s_now_sub;
+// 收听页（电台 / 播客 / 音乐）
+static lv_obj_t *s_tab_btns[3], *s_now_cover, *s_now_title, *s_now_sub;
 static lv_obj_t *s_radio_prev, *s_radio_play, *s_radio_next, *s_radio_list, *s_radio_volume;
 static lv_obj_t *s_volume_row, *s_progress_row, *s_progress, *s_time_pos, *s_time_dur;
+static lv_obj_t *s_lyrics, *s_lyric_lines[7];        // 音乐标签右边的歌词，第 4 行是唱到的这句
 static lv_obj_t *s_radio_mini, *s_radio_mini_label;  // 表情页左上角"♪ 名字"小条
-static int s_listen_tab;        // 右边列表：0 电台台单，1 播客
-static int s_now_episode = -1;  // 左边显示的是不是播客节目（换了就跟着切标签、换控件）
+static int s_listen_tab = 2;  // 右边：0 电台台单，1 播客，2 歌词（标签从左到右是音乐、播客、电台，默认最左边）
+static int s_now_kind = -1;  // 左边放的是什么：0 电台，1 播客节目，2 歌（换了就跟着切标签、换控件）
 static lv_image_dsc_t s_cover_dsc;
 static int s_cover_version = -1;
 static uint32_t s_radio_refresh_at;  // 下次对收听页的时刻
@@ -1019,10 +1020,10 @@ static void create_dots(void)
     lv_obj_align(s_dots, LV_ALIGN_BOTTOM_MID, 0, -6);
 }
 
-/* ---------- 第三页：收听（电台 / 播客） ---------- */
+/* ---------- 第三页：收听（电台 / 播客 / 音乐） ---------- */
 
-// 左边是"正在放"：不管右边切到哪个标签，都显示现在放的东西（电台或一期播客）；
-// 右边列表跟着标签变：电台台单，或者播客订阅 → 点进去是最新几期
+// 左边是"正在放"：不管右边切到哪个标签，都显示现在放的东西（电台、一期播客或一首歌）；
+// 右边跟着标签变：电台台单，播客订阅 → 点进去是最新几期，或者正在放的歌的歌词
 
 enum { RADIO_OFF, RADIO_CONNECTING, RADIO_PLAYING, RADIO_HELD, RADIO_ERROR, RADIO_LOADING };  // 同 NomiRadio::State
 enum { ITEM_STATION, ITEM_PODCAST, ITEM_BACK, ITEM_EPISODE, ITEM_RETRY };
@@ -1046,9 +1047,9 @@ static void on_radio_button(lv_event_t *e)
 {
     const char *name = lv_event_get_user_data(e);
     user_activity();
-    // 左右两个键：电台是换台，播客是倒回 15 秒 / 快进 30 秒
-    if (s_now_episode == 1 && !strcmp(name, "radio_prev")) name = "pod_seek:-15";
-    else if (s_now_episode == 1 && !strcmp(name, "radio_next")) name = "pod_seek:30";
+    // 左右两个键：电台是换台，播客和歌是倒回 15 秒 / 快进 30 秒
+    if (s_now_kind != 0 && !strcmp(name, "radio_prev")) name = "pod_seek:-15";
+    else if (s_now_kind != 0 && !strcmp(name, "radio_next")) name = "pod_seek:30";
     action(name);
     radio_refresh(false);
 }
@@ -1181,6 +1182,7 @@ static void sync_listen_list(bool force)
 {
     enum { SIZE = 2600 };
     static char *sig, *now;  // 放堆上（设备上大块走 PSRAM）：静态数组占内部 RAM，放栈上会撑爆界面任务的栈
+    if (s_listen_tab == 2) return;  // 音乐标签右边是歌词；切回来时 force 会重建列表
     if (!sig && !(sig = calloc(1, SIZE))) return;
     if (!now && !(now = malloc(SIZE))) return;
     int len;
@@ -1226,18 +1228,41 @@ static void sync_listen_list(bool force)
     }
 }
 
+// 右边歌词：7 行，唱到的那句在第 4 行；没在放歌时中间那行是提示
+static void sync_lyrics(bool song)
+{
+    enum { SIZE = 1024 };
+    static char *buf;  // 放堆上（设备上大块走 PSRAM）
+    if (!buf && !(buf = malloc(SIZE))) return;
+    snprintf(buf, SIZE, "%s", song ? get_text("music_lyrics") : "");
+    if (!buf[0]) {
+        for (int i = 0; i < 7; i++) {
+            set_text_if_changed(s_lyric_lines[i], i != 3 ? "" : song ? "这首没有歌词" : get_text("music_hint"));
+        }
+        return;
+    }
+    char *p = buf;
+    for (int i = 0; i < 7; i++) {
+        char *nl = p ? strchr(p, '\n') : NULL;
+        if (nl) *nl = '\0';
+        set_text_if_changed(s_lyric_lines[i], p ? p : "");
+        p = nl ? nl + 1 : NULL;
+    }
+}
+
 // 对一次收听页和左上角小条。force 时列表也重建、音量条也对一下
 static void radio_refresh(bool force)
 {
     if (!s_music_tile) return;
     int state = get_int("radio_state", RADIO_OFF);
-    int episode = get_int("pod_playing", 0) ? 1 : 0;
+    int kind = get_int("music_playing", 0) ? 2 : get_int("pod_playing", 0) ? 1 : 0;
+    bool episode = kind != 0;  // 播客和歌：能暂停接着放、快进快退
     char title[160], sub[160];
 
-    // 换了放的东西（电台 ↔ 播客）：右边标签跟过去，左右两个键换成换台 / 快进快退，底下换成音量 / 进度
-    if (episode != s_now_episode) {
-        s_now_episode = episode;
-        if (state != RADIO_OFF) s_listen_tab = episode;
+    // 换了放的东西（电台 / 播客 / 歌）：右边标签跟过去，左右两个键换成换台 / 快进快退，底下换成音量 / 进度
+    if (kind != s_now_kind) {
+        s_now_kind = kind;
+        if (state != RADIO_OFF) s_listen_tab = kind;
         lv_obj_t *prev = lv_obj_get_child(s_radio_prev, 0), *next = lv_obj_get_child(s_radio_next, 0);
         lv_obj_set_style_text_font(prev, episode ? s_font : &nomi_font_icon_36, 0);
         lv_obj_set_style_text_font(next, episode ? s_font : &nomi_font_icon_36, 0);
@@ -1248,19 +1273,24 @@ static void radio_refresh(bool force)
         force = true;
     }
 
-    // 标签按钮
-    for (int i = 0; i < 2; i++) {
+    // 标签按钮；音乐标签右边换成歌词
+    for (int i = 0; i < 3; i++) {
         bool on = i == s_listen_tab;
         lv_obj_set_style_bg_color(s_tab_btns[i], lv_color_hex(on ? C_ACCENT : C_CONTROL), 0);
         set_color(lv_obj_get_child(s_tab_btns[i], 0), on ? 0x0b1220 : C_MUTED);
     }
+    bool lyrics = s_listen_tab == 2;
+    if (lv_obj_has_flag(s_lyrics, LV_OBJ_FLAG_HIDDEN) == lyrics) {
+        lv_obj_set_flag(s_lyrics, LV_OBJ_FLAG_HIDDEN, !lyrics);
+        lv_obj_set_flag(s_radio_list, LV_OBJ_FLAG_HIDDEN, lyrics);
+    }
 
-    // 封面（播客才有）：换了图就把新缓冲交给图片控件
+    // 封面（播客、歌才有）：换了图、或者换成了另一家的图（缓冲不是同一块），就把新缓冲交给图片控件
     const uint16_t *cover = NULL;
     int version = 0, size = 0;
-    if (episode && s_cb.get_image) cover = s_cb.get_image("pod_cover", &size, &version);
+    if (episode && s_cb.get_image) cover = s_cb.get_image(kind == 2 ? "music_cover" : "pod_cover", &size, &version);
     bool show_cover = cover && size == COVER_SIZE;
-    if (show_cover && version != s_cover_version) {
+    if (show_cover && (version != s_cover_version || (const uint8_t *)cover != s_cover_dsc.data)) {
         s_cover_version = version;
         memset(&s_cover_dsc, 0, sizeof(s_cover_dsc));
         s_cover_dsc.header.magic = LV_IMAGE_HEADER_MAGIC;
@@ -1334,9 +1364,14 @@ static void radio_refresh(bool force)
     // 表情页左上角小条：在放（或对话时暂停着）、而且停在表情页时显示，点一下来收听页
     bool mini = state != RADIO_OFF && current_page() == PAGE_FACE && !s_sleeping;
     if (lv_obj_has_flag(s_radio_mini, LV_OBJ_FLAG_HIDDEN) == mini) lv_obj_set_flag(s_radio_mini, LV_OBJ_FLAG_HIDDEN, !mini);
-    if (mini) set_text_if_changed(s_radio_mini_label, episode ? get_text("pod_name") : get_text("radio_name"));
+    if (mini) {
+        set_text_if_changed(s_radio_mini_label, kind == 2   ? get_text("pod_title")
+                                                : kind == 1 ? get_text("pod_name")
+                                                            : get_text("radio_name"));
+    }
 
     sync_listen_list(force);
+    if (lyrics) sync_lyrics(kind == 2);
     if (force && !lv_obj_has_state(s_radio_volume, LV_STATE_PRESSED)) {
         lv_slider_set_value(s_radio_volume, get_int(NOMI_KEY_VOLUME, 70), LV_ANIM_OFF);  // 设置页 / 语音也能改音量
     }
@@ -1349,13 +1384,14 @@ static void on_radio_mini(lv_event_t *e)
     show_page(PAGE_MUSIC, true);
 }
 
-static lv_obj_t *add_tab_button(const char *text, int index)
+// index 是标签号（s_listen_tab），slot 是从左数第几个
+static lv_obj_t *add_tab_button(const char *text, int index, int slot)
 {
     lv_obj_t *btn = lv_button_create(s_music_tile);
     lv_obj_set_size(btn, 64, 30);
     lv_obj_set_style_radius(btn, 15, 0);
     lv_obj_set_style_shadow_width(btn, 0, 0);
-    lv_obj_set_pos(btn, 16 + index * 70, 6);
+    lv_obj_set_pos(btn, 16 + slot * 70, 6);
     lv_obj_add_event_cb(btn, on_listen_tab, LV_EVENT_CLICKED, (void *)(intptr_t)index);
     lv_obj_t *label = lv_label_create(btn);
     lv_label_set_text(label, text);
@@ -1365,8 +1401,10 @@ static lv_obj_t *add_tab_button(const char *text, int index)
 
 static void build_music_page(void)
 {
-    s_tab_btns[0] = add_tab_button("电台", 0);
-    s_tab_btns[1] = add_tab_button("播客", 1);
+    // 从左到右：音乐、播客、电台
+    s_tab_btns[2] = add_tab_button("音乐", 2, 0);
+    s_tab_btns[1] = add_tab_button("播客", 1, 1);
+    s_tab_btns[0] = add_tab_button("电台", 0, 2);
 
     // 左半边：封面、标题（一行滚动）、下面一行、播放控制、音量或进度
     s_now_cover = lv_image_create(s_music_tile);
@@ -1454,6 +1492,32 @@ static void build_music_page(void)
     lv_obj_set_style_pad_bottom(s_radio_list, 12, 0);
     lv_obj_set_scroll_dir(s_radio_list, LV_DIR_VER);
     lv_obj_set_scrollbar_mode(s_radio_list, LV_SCROLLBAR_MODE_ACTIVE);
+
+    // 右半边（音乐标签）：歌词，唱到的那句在正中间、放不下就折行，其余一行、放不下省略
+    s_lyrics = lv_obj_create(s_music_tile);
+    lv_obj_remove_style_all(s_lyrics);
+    lv_obj_set_size(s_lyrics, 206, FACE_H - 36);
+    lv_obj_set_pos(s_lyrics, 260, 36);
+    lv_obj_set_flex_flow(s_lyrics, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(s_lyrics, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_row(s_lyrics, 10, 0);
+    lv_obj_remove_flag(s_lyrics, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(s_lyrics, LV_OBJ_FLAG_HIDDEN);
+    const int line = lv_font_get_line_height(s_font);
+    for (int i = 0; i < 7; i++) {
+        lv_obj_t *l = lv_label_create(s_lyrics);
+        lv_obj_set_width(l, LV_PCT(100));
+        lv_obj_set_style_text_align(l, LV_TEXT_ALIGN_CENTER, 0);
+        if (i == 3) {
+            lv_label_set_long_mode(l, LV_LABEL_LONG_MODE_WRAP);
+        } else {
+            lv_obj_set_height(l, line);
+            lv_label_set_long_mode(l, LV_LABEL_LONG_MODE_DOTS);
+        }
+        set_color(l, i == 3 ? C_ACCENT : i == 2 || i == 4 ? C_TEXT : C_MUTED);
+        lv_label_set_text(l, "");
+        s_lyric_lines[i] = l;
+    }
 
     lv_obj_add_flag(s_music_tile, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_add_event_cb(s_music_tile, on_face_pressed, LV_EVENT_PRESSED, NULL);

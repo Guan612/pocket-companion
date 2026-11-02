@@ -193,6 +193,13 @@ uint32_t Mp4SampleAtSecond(const Mp4Track& t, uint32_t second) {
     return base;  // 超出结尾
 }
 
+uint32_t Mp4DurationSeconds(const Mp4Track& t) {
+    if (t.timescale == 0) return 0;
+    uint64_t total = 0;
+    for (uint32_t i = 0; i < t.stts_n; i++) total += uint64_t(U32(t.stts + i * 8)) * U32(t.stts + i * 8 + 4);
+    return static_cast<uint32_t>(total / t.timescale);
+}
+
 static uint64_t ChunkOffset(const Mp4Track& t, uint32_t chunk) {
     return t.co64 ? U64(t.stco + chunk * 8) : U32(t.stco + chunk * 4);
 }

@@ -5,6 +5,7 @@
 #include <esp_http_client.h>
 #include <esp_log.h>
 #include <esp_netif.h>
+#include <jpeg_decoder.h>
 
 #include <cctype>
 #include <cstdio>
@@ -218,6 +219,33 @@ bool HttpGet(const std::string& url, std::string& body, size_t max_bytes, std::s
     }
     esp_http_client_close(client);
     esp_http_client_cleanup(client);
+    return ok;
+}
+
+bool DecodeCover(const std::string& jpg, uint16_t* out, int size) {
+    esp_jpeg_image_cfg_t cfg = {};
+    cfg.indata = reinterpret_cast<uint8_t*>(const_cast<char*>(jpg.data()));
+    cfg.indata_size = jpg.size();
+    cfg.out_format = JPEG_IMAGE_FORMAT_RGB565;
+    esp_jpeg_image_output_t info = {};
+    if (esp_jpeg_get_image_info(&cfg, &info) != ESP_OK || info.width == 0 || info.width > 640 || info.height > 640) {
+        return false;
+    }
+    size_t out_size = info.width * info.height * 2;
+    auto* pixels = static_cast<uint8_t*>(heap_caps_malloc(out_size, MALLOC_CAP_SPIRAM));
+    if (pixels == nullptr) return false;
+    cfg.outbuf = pixels;
+    cfg.outbuf_size = out_size;
+    bool ok = esp_jpeg_decode(&cfg, &info) == ESP_OK;
+    if (ok) {
+        auto* src = reinterpret_cast<const uint16_t*>(pixels);
+        for (int y = 0; y < size; y++) {
+            for (int x = 0; x < size; x++) {
+                out[y * size + x] = src[(y * info.height / size) * info.width + x * info.width / size];
+            }
+        }
+    }
+    heap_caps_free(pixels);
     return ok;
 }
 

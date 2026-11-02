@@ -4,7 +4,7 @@
 // 网络抖一下不至于断音。设备不在待机（有人叫它说话）或闹钟在响时停掉、连接也断开，
 // 把内部 RAM 让给语音识别；回到待机后自动接着放（电台是直播，播客从停下的地方接着放）。
 // 电台台单存 NVS（nomi_radio 命名空间的 list，JSON），网页设置页和大模型工具都能增删；
-// 播客的订阅、节目单、进度归 NomiPodcast 管，它只把要放的那期交给这里。
+// 播客的订阅、节目单、进度归 NomiPodcast 管，它只把要放的那期交给这里；在线音乐的歌（NomiMusic）也一样。
 #pragma once
 
 #include <esp_timer.h>
@@ -29,8 +29,11 @@ public:
         int start = 0;
         int duration = 0;       // 总长（秒），不知道为 0
         int bytes_per_sec = 0;  // MP3 按时间跳转用：文件大小 / 时长；不知道按 128kbps 算
-        std::string podcast;    // 节目所属播客名（显示用）
+        std::string podcast;    // 节目所属播客名（显示用）；歌是歌手
         std::string key;        // 进度记在哪（NomiPodcast 用）
+        bool song = false;      // 在线音乐的一首歌（NomiMusic）：放完就停，不记进度
+        // 地址和响应头看不出真实格式时（m4a 的扩展名写成 .aac、类型是 octet-stream），调用方先探好填这里
+        enum Format { kAuto, kMp3, kAdts, kMp4 } format = kAuto;
     };
 
     static NomiRadio& GetInstance();
@@ -120,6 +123,7 @@ private:
     bool ReadEpisode(const std::string& url, int start);
     bool WriteAudio(const void* data, size_t size);
     void Select(const Station& station, int index);
+    void SetDuration(const std::string& url, int seconds);  // 节目没给时长时补上（还是放着的这个才写）
     void ReportProgress(bool finished);
     bool Search(const std::string& query, Station& found);
 };

@@ -127,6 +127,7 @@ public:
         }
         for (int hop = 0; hop < 5; hop++) {
             type_.clear();
+            range_.clear();
             if (esp_http_client_open(client_, 0) != ESP_OK) return 0;
             esp_http_client_fetch_headers(client_);
             int code = esp_http_client_get_status_code(client_);
@@ -154,6 +155,13 @@ public:
 
     const std::string& type() const { return type_; }
 
+    // 整个文件多大：200 时是 Content-Length，206 时取 Content-Range 的 "/总长"；不知道为 -1
+    int64_t Total(int code) {
+        if (code == 200) return client_ ? esp_http_client_get_content_length(client_) : -1;
+        size_t slash = range_.rfind('/');
+        return slash == std::string::npos ? -1 : atoll(range_.c_str() + slash + 1);
+    }
+
     void Close() {
         if (client_ == nullptr) return;
         esp_http_client_close(client_);
@@ -165,11 +173,13 @@ private:
     static esp_err_t OnEvent(esp_http_client_event_t* e) {
         if (e->event_id == HTTP_EVENT_ON_HEADER && strcasecmp(e->header_key, "Content-Type") == 0) {
             static_cast<EpisodeHttp*>(e->user_data)->type_ = nomi::Lower(e->header_value);
+        } else if (e->event_id == HTTP_EVENT_ON_HEADER && strcasecmp(e->header_key, "Content-Range") == 0) {
+            static_cast<EpisodeHttp*>(e->user_data)->range_ = e->header_value;
         }
         return ESP_OK;
     }
     esp_http_client_handle_t client_ = nullptr;
-    std::string type_;
+    std::string type_, range_;
 };
 
 // 读一段（Range）到 out（size 字节）；url 换成跳转后的最终地址，下次直接去那里
@@ -448,9 +458,14 @@ void NomiRadio::SeekTo(int second) {
 void NomiRadio::ReportProgress(bool finished) {
     if (!on_progress) return;
     Station st = Current();
-    if (!st.episode) return;
+    if (!st.episode || st.song) return;
     int pos = position_;
     Application::GetInstance().Schedule([this, st, pos, finished]() { on_progress(st, pos, finished); });
+}
+
+void NomiRadio::SetDuration(const std::string& url, int seconds) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (seconds > 0 && current_.url == url && current_.duration <= 0) current_.duration = seconds;
 }
 
 /* ---------- 收流 ---------- */
@@ -459,9 +474,10 @@ void NomiRadio::ReaderLoop() {
     for (;;) {
         xSemaphoreTake(reader_go_, portMAX_DELAY);
         Station st = Current();
-        bool ok = !st.episode         ? ReadStream(PreferHttp(st.url), 0, 0, true)
-                  : IsMp4(st.url, "") ? ReadMp4(st.url, st.start)
-                                      : ReadEpisode(st.url, st.start);
+        bool mp4 = st.format == Station::kMp4 || (st.format == Station::kAuto && IsMp4(st.url, ""));
+        bool ok = !st.episode ? ReadStream(PreferHttp(st.url), 0, 0, true)
+                  : mp4       ? ReadMp4(st.url, st.start)
+                              : ReadEpisode(st.url, st.start);
         if (!ok && !stopping_) {
             // 断线 / 连不上：1、3、6、12、24、30 秒后再试（服务器偶尔停一下，第一次马上重连）；
             // 连续三次失败显示"连不上"
@@ -496,11 +512,17 @@ bool NomiRadio::ReadEpisode(const std::string& url, int start) {
         ESP_LOGW(TAG, "Episode HTTP %d: %s", code, url.c_str());
         return false;
     }
-    if (IsMp4(url, http.type())) {  // 地址看不出来、响应头说是 m4a
+    if (st.format == Station::kAuto && IsMp4(url, http.type())) {  // 地址看不出来、响应头说是 m4a
         http.Close();
         return ReadMp4(url, start);
     }
-    codec_ = http.type().find("aac") != std::string::npos ? kCodecAac : kCodecMp3;
+    bool aac = st.format == Station::kAuto ? http.type().find("aac") != std::string::npos : st.format == Station::kAdts;
+    codec_ = aac ? kCodecAac : kCodecMp3;
+    if (st.song && st.duration <= 0) {
+        // 歌没给时长：按文件大小估（和上面按时间跳转一样的码率）。播客不估，有的节目只有 64kbps
+        int64_t total = http.Total(code);
+        if (total > 0) SetDuration(url, total / (st.bytes_per_sec > 0 ? st.bytes_per_sec : 16000));
+    }
     uint64_t skip = code == 200 && offset > 0 ? offset : 0;  // 服务器不认 Range：从头读，前面的扔掉
     ESP_LOGI(TAG, "Episode: %s from %lld", http.type().c_str(), static_cast<long long>(offset > 0 ? offset : 0));
     auto* buf = static_cast<char*>(heap_caps_malloc(4096, MALLOC_CAP_SPIRAM));
@@ -689,6 +711,7 @@ bool NomiRadio::ReadMp4(const std::string& source, int start) {
         ESP_LOGW(TAG, "m4a has no AAC track");
         return false;
     }
+    SetDuration(source, Mp4DurationSeconds(track));
     Mp4Cursor cursor;
     if (!Mp4Seek(track, Mp4SampleAtSecond(track, start), cursor)) {
         reached_end_ = true;  // 位置已经在结尾
@@ -905,7 +928,9 @@ std::string NomiRadio::PromptContext() {
         char pos[48];
         int p = position_;
         snprintf(pos, sizeof(pos), "（放到 %d:%02d", p / 60, p % 60);
-        ctx = "正在放播客《" + current_.podcast + "》：" + current_.name + pos +
+        ctx = (current_.song ? "正在放歌《" + current_.name + "》- " + current_.podcast
+                             : "正在放播客《" + current_.podcast + "》：" + current_.name) +
+              pos +
               (current_.duration > 0 ? " / 共 " + std::to_string(current_.duration / 60) + " 分钟）" : std::string("）")) +
               "。电台";
     } else {
@@ -1027,7 +1052,8 @@ void NomiRadio::RegisterTools() {
     auto& mcp = McpServer::GetInstance();
     mcp.AddTool(
         "self.radio.play",
-        "放网络电台 / 音乐。主人说\"放点音乐\"\"来点轻音乐\"\"听新闻\"\"放中国之声\"\"换个台\"时调用。\n"
+        "放网络电台 / 音乐。主人说\"放点音乐\"\"来点轻音乐\"\"听新闻\"\"放中国之声\"\"换个台\"时调用；"
+        "点名要听哪首歌、哪个歌手的歌用 self.music.play。\n"
         "station：台名（收藏的台见系统提示），也可以是想听的类型或别的台名（会去网上的电台目录搜）；"
         "\"下一个\"\"上一个\"换台；空字符串接着放上次的台。调用后把这句回答说完，设备就安静下来开始放。",
         PropertyList({Property("station", kPropertyTypeString, std::string("")).SetMaxLength(60)}),

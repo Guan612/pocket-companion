@@ -5,6 +5,7 @@
 #pragma once
 
 #include <cstddef>
+#include <cstdint>
 #include <functional>
 #include <string>
 
@@ -27,5 +28,8 @@ std::string XmlUnescape(const std::string& s);
 // 成功（HTTP 200）返回 true；final_url 是跳转后的最终地址
 bool HttpGet(const std::string& url, std::string& body, size_t max_bytes = 64 * 1024,
              std::string* final_url = nullptr, const std::function<bool(const std::string&)>& enough = nullptr);
+
+// 封面：JPEG 解码后最近邻缩放成 size 见方的 RGB565，写进 out（size × size 个像素）；不是能用的 JPEG 返回 false
+bool DecodeCover(const std::string& jpg, uint16_t* out, int size);
 
 }  // namespace nomi
