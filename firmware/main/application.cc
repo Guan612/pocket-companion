@@ -78,6 +78,15 @@ void Application::Initialize() {
     ESP_LOGI(TAG, "After board/audio init");
     SystemInfo::PrintHeapStats();
 
+#if CONFIG_DIRECT_API
+    // 直连模式：资源分区（完整中文字体、唤醒词模型）在本机 flash 上，不依赖网络，开机就用上。
+    // 原来要等联网激活后才应用，换个地方连不上 Wi-Fi（或在配网）时界面只有内置小字库，到处缺字，唤醒词也没有
+    if (Assets::GetInstance().partition_valid()) {
+        assets_applied_ = Assets::GetInstance().Apply();
+        ESP_LOGI(TAG, "Assets applied at boot: %s", assets_applied_ ? "ok" : "failed");
+    }
+#endif
+
     AudioServiceCallbacks callbacks;
     callbacks.on_send_queue_available = [this]() {
         xEventGroupSetBits(event_group_, MAIN_EVENT_SEND_AUDIO);
@@ -408,6 +417,11 @@ void Application::CheckAssetsVersion() {
     Settings settings("assets", true);
     // Check if there is a new assets need to be downloaded
     std::string download_url = settings.GetString("download_url");
+
+    // 开机已经应用过、也没有要下载的新资源：不用再应用一遍
+    if (download_url.empty() && assets_applied_) {
+        return;
+    }
 
     if (!download_url.empty()) {
         settings.EraseKey("download_url");

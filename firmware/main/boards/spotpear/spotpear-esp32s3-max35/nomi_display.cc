@@ -20,6 +20,8 @@
 #include <esp_system.h>
 #include <esp_wifi.h>
 #include <nvs_flash.h>
+#include <ssid_manager.h>
+#include <wifi_manager.h>
 
 #include <cstdio>
 #include <cstring>
@@ -61,6 +63,7 @@ struct ChatEntry {
 };
 std::vector<ChatEntry> g_chat_log;  // 只在 LVGL 任务里访问（所有调用方都在同一线程）
 constexpr size_t kChatLogMax = 100;
+int g_chat_dropped = 0;  // 记录满了从头上丢掉的条数（历史页靠它增量更新）
 
 bool IsAsciiAlnum(char c) {
     return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9');
@@ -80,11 +83,13 @@ void AddChatMessage(const char* role, const char* content) {
         g_chat_log.push_back({role, std::move(text)});
     }
     if (g_chat_log.size() > kChatLogMax) {
+        g_chat_dropped += static_cast<int>(g_chat_log.size() - kChatLogMax);
         g_chat_log.erase(g_chat_log.begin(), g_chat_log.end() - kChatLogMax);
     }
 }
 
 int HistoryCount() { return static_cast<int>(g_chat_log.size()); }
+int HistoryDropped() { return g_chat_dropped; }
 
 const char* HistoryGet(int index, const char** role) {
     static const char* kEmpty = "";
@@ -132,6 +137,7 @@ nomi_state_t GetState() {
         case kDeviceStateActivating:
         case kDeviceStateUpgrading: return NOMI_STATE_CONNECTING;
         case kDeviceStateFatalError: return NOMI_STATE_ERROR;
+        case kDeviceStateWifiConfiguring: return NOMI_STATE_WIFI_SETUP;
         default: return NOMI_STATE_IDLE;
     }
 }
@@ -232,12 +238,21 @@ const char* GetText(const char* key) {
         for (const auto& p : kPersonas) text += std::string(text.empty() ? "" : "\n") + p.name;
     } else if (!strcmp(key, "voices")) {
         for (const auto& v : VoiceList()) text += std::string(text.empty() ? "" : "\n") + VoiceLabel(v);
-    } else if (!strcmp(key, "wifi")) {
+    } else if (!strcmp(key, "wifi") || !strcmp(key, "wifi_ssid")) {
         wifi_ap_record_t ap = {};
         if (esp_wifi_sta_get_ap_info(&ap) == ESP_OK) {
             text = reinterpret_cast<const char*>(ap.ssid);
-            text += "（信号 " + std::to_string(ap.rssi) + " dBm）";
+            if (!strcmp(key, "wifi")) text += "（信号 " + std::to_string(ap.rssi) + " dBm）";
         }
+    } else if (!strcmp(key, "saved_wifi")) {
+        for (const auto& item : SsidManager::GetInstance().GetSsidList()) {
+            if (!text.empty()) text += '\n';
+            text += item.ssid;
+        }
+    } else if (!strcmp(key, "hotspot")) {
+        text = WifiManager::GetInstance().GetApSsid();  // 不在配网模式时是空的
+    } else if (!strcmp(key, "hotspot_url")) {
+        if (WifiManager::GetInstance().IsConfigMode()) text = WifiManager::GetInstance().GetApWebUrl();
     } else if (!strcmp(key, "ip")) {
         text = DeviceIp();
     } else if (!strcmp(key, "config_url")) {
@@ -295,11 +310,28 @@ bool NomiDisplay::aec_supported = false;
 std::function<void()> NomiDisplay::on_user_activity;
 std::function<void()> NomiDisplay::on_power_timing_changed;
 
+namespace {
+
+SpiLcdDisplay::Options NomiDisplayOptions() {
+    SpiLcdDisplay::Options o;
+    // 两条 10 行的缓冲轮流用：和原来单条 20 行占一样多的内部 RAM（内部 RAM 很紧，连续对话要靠它），
+    // 但 LVGL 画一条的同时 SPI 在发另一条，翻页、滚动时整屏刷新快不少
+    o.buffer_lines = 10;
+    o.double_buffer = true;
+    // LVGL 任务原来是优先级 1，比 AFE / 唤醒词（3）、Opus 编码（2）、每个 HTTPS 连接的接收任务（1）
+    // 都低或平级，拖动一卡一卡；触摸也是 LVGL 任务里轮询的，被饿着时点得快了会漏。
+    // 提到 2：和 Opus 编码轮流跑，仍让着 AFE 和音频输入输出（串口里 Opus 已经在掉帧，不能再压它）
+    o.task_priority = 2;
+    return o;
+}
+
+}  // namespace
+
 NomiDisplay::NomiDisplay(esp_lcd_panel_io_handle_t panel_io, esp_lcd_panel_handle_t panel,
                          int width, int height, int offset_x, int offset_y, bool mirror_x,
                          bool mirror_y, bool swap_xy)
     : SpiLcdDisplay(panel_io, panel, width, height, offset_x, offset_y, mirror_x, mirror_y,
-                    swap_xy) {}
+                    swap_xy, NomiDisplayOptions()) {}
 
 void NomiDisplay::GetIdleSeconds(int& dim_seconds, int& off_seconds) {
     static const int dim[] = NOMI_DIM_SECONDS;
@@ -340,6 +372,7 @@ void NomiDisplay::SetupUI() {
         .action = Action,
         .history_count = HistoryCount,
         .history_get = HistoryGet,
+        .history_dropped = HistoryDropped,
     };
     // 先用内置字体，资源分区里的完整中文字体加载后会经 SetTextFont 换上
     nomi_ui_create(screen, face_buf_, &BUILTIN_TEXT_FONT, &callbacks);
@@ -394,9 +427,13 @@ void NomiDisplay::SetChatMessage(const char* role, const char* content) {
     SpiLcdDisplay::SetChatMessage(role, content);
     if (!ui_ready_) return;
     DisplayLockGuard lock(this);
-    // 系统消息（请稍候、错误提示等）用通知条，字幕只留给对话
+    // 系统消息（请稍候、错误提示等）用通知条，字幕只留给对话。
+    // 配网模式的"手机连接热点…浏览器访问…"要一直挂着：4 秒就收的话，换个地方连不上网时屏幕上什么都看不出来
     if (role != nullptr && strcmp(role, "system") == 0) {
-        if (content != nullptr && *content) nomi_ui_notify(content, 4000);
+        if (content != nullptr && *content) {
+            bool setup = Application::GetInstance().GetDeviceState() == kDeviceStateWifiConfiguring;
+            nomi_ui_notify(content, setup ? 30 * 60 * 1000 : 4000);
+        }
         return;
     }
     // 推送通知的字幕不进聊天历史

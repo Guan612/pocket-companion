@@ -20,6 +20,7 @@ typedef enum {
     NOMI_STATE_LISTENING,
     NOMI_STATE_SPEAKING,
     NOMI_STATE_ERROR,
+    NOMI_STATE_WIFI_SETUP,  // 配网模式（开着配网热点）：状态文字常显
 } nomi_state_t;
 
 // 设置项（get_int / set_int 的 key）
@@ -46,7 +47,9 @@ typedef struct {
     int (*get_int)(const char *key, int def);
     // 拖动滑条过程中 final 为 false，松手时为 true（设备只在 final 时写 NVS）
     void (*set_int)(const char *key, int value, bool final);
-    // 只读文字：personas、voices（'\n' 分隔）、wifi、ip、config_url、version
+    // 只读文字：personas、voices（'\n' 分隔）、wifi（带信号）、wifi_ssid、ip、config_url、version、
+    // saved_wifi（已存的 Wi-Fi，'\n' 分隔）、hotspot / hotspot_url（配网热点名和网址，不在配网模式时为空）。
+    // 不认识的 key 返回空串
     const char *(*get_text)(const char *key);
     // 动作：test_api、reconfigure_wifi、factory_reset、toggle_listen（连续聆听开关：
     // 开 = 待机时开始连续对话，关 = 退出对话回待机）
@@ -54,6 +57,8 @@ typedef struct {
     // 聊天历史（第二页）：下标 0 最旧；role 为 "user" / "assistant"，文本只需在下一次调用前有效
     int (*history_count)(void);
     const char *(*history_get)(int index, const char **role);
+    // 可选：记录满了从头上丢掉的消息总数（只增不减）。有它历史页只增量更新，不用每次重建整个列表
+    int (*history_dropped)(void);
 } nomi_ui_callbacks_t;
 
 // face_buf：480×320 RGB565 画布缓冲，由调用方分配；font：中文字体

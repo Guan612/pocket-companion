@@ -84,7 +84,10 @@ private:
     bool Aborted() const { return cancel_ || !opened_; }
 
     std::mutex mutex_;
-    std::vector<std::vector<uint8_t>> packets_;  // 本轮录音的 Opus 包（16k，60ms）
+    // 本轮录音的 Opus 包（16k，60ms），每包前面 2 字节长度，连成一整块放 PSRAM。
+    // 原来一包一个 vector：每个一两百字节，全落在内部 RAM，15 秒就是两百多块，
+    // 把连续对话本来就紧的内部 RAM 吃掉、切碎，上传录音的 TLS 就发不出去（语音识别连接失败）
+    std::string packets_;
     bool heard_voice_ = false;
     int silence_ms_ = 0;
     int voice_ms_ = 0;    // 本轮里 VAD 连续听到声音多久了（要够 kMinVoiceMs 才算有人说话）
@@ -99,12 +102,11 @@ private:
     void FinishRecording();
     static void WorkerEntry(void* arg);
     void WorkerLoop();
-    void RunTurn(std::vector<std::vector<uint8_t>> packets);
+    void RunTurn(std::string packets);
 
     void EmitJson(const char* type, const char* key, const char* value,
                   const char* key2 = nullptr, const char* value2 = nullptr);
-    std::string Transcribe(const DirectApiConfig& cfg,
-                           const std::vector<std::vector<uint8_t>>& packets);
+    std::string Transcribe(const DirectApiConfig& cfg, std::string packets);
     std::string Chat(const DirectApiConfig& cfg, const std::string& user_text);
     bool Speak(const DirectApiConfig& cfg, const std::string& sentence);
 };

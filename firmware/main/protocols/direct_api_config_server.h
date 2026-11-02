@@ -14,6 +14,9 @@ std::string Start();
 // 最近一次 Start() 得到的访问地址
 const std::string& Url();
 
+// 停掉设置页（进配网模式前：配网热点的网页也要用 80 端口）。之后可以再 Start()
+void Stop();
+
 // 调试：设置了它，GET /cam.jpg 返回一张摄像头 JPEG（?raw=1 返回送编码器前的原始 RGB565 帧）
 extern std::function<std::string(bool raw)> debug_capture;
 

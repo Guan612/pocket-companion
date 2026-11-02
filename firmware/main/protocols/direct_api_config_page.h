@@ -81,6 +81,15 @@ button:disabled{opacity:.5}
   <p class="err" id="missing" hidden></p>
 </div>
 
+<h2>Wi-Fi 网络</h2>
+<div class="card">
+  <p class="hint">可以存多个（最多 10 个）：设备在哪个网络附近就自动连哪个，都在时连信号强的。不在身边的也能先存上，比如在家把公司的加好，到了公司就能直接连。这一栏点了就生效，不用点底部的保存。</p>
+  <div id="wifiList"><p class="hint">读取中…</p></div>
+  <label>Wi-Fi 名称<input id="wifiSsid" autocomplete="off" placeholder="区分大小写，要和路由器上的一模一样"></label>
+  <label>密码<input id="wifiPass" type="password" autocomplete="off" placeholder="开放网络留空"></label>
+  <div class="row"><button id="wifiAdd">添加 / 更新密码</button><span id="wifiMsg" class="hint"></span></div>
+</div>
+
 <h2>人设提示词</h2>
 <textarea id="prompt" rows="4" placeholder="留空用默认提示词"></textarea>
 
@@ -331,6 +340,45 @@ $('#save').onclick = async () => {
   } catch (e) { msg(e.message, 'err'); }
   $('#save').disabled = false;
 };
+
+// Wi-Fi 列表：和设备上"设置 → 网络"、配网热点页存的是同一份，增删立即生效（不走底部的保存）
+const wifiMsg = (text, cls) => { $('#wifiMsg').textContent = text; $('#wifiMsg').className = 'hint ' + (cls || ''); };
+async function loadWifi() {
+  try {
+    const w = await (await fetch('/wifi.json', {cache: 'no-store'})).json();
+    const box = $('#wifiList');
+    box.innerHTML = w.saved.length ? '' : '<p class="hint">还没有保存的 Wi-Fi。</p>';
+    for (const ssid of w.saved) {
+      const cur = ssid === w.current;
+      const row = document.createElement('div');
+      row.className = 'row';
+      row.innerHTML = `<span style="flex:1;overflow-wrap:anywhere">${esc(ssid)}</span>${cur ? '<span class="tag ok">已连接</span>' : ''}<button class="danger">删除</button>`;
+      row.querySelector('button').onclick = async () => {
+        const tip = cur ? `「${ssid}」正连着。删掉后这次不断，但断线或重启后就不会再连它。确定删除？` : `删除「${ssid}」？`;
+        if (confirm(tip)) await wifiPost('/wifi/delete', {ssid});
+      };
+      box.appendChild(row);
+    }
+    $('#wifiAdd').title = `已存 ${w.saved.length} / ${w.max} 个`;
+  } catch (e) { wifiMsg('读取 Wi-Fi 列表失败，刷新再试', 'err'); }
+}
+async function wifiPost(path, body) {
+  try {
+    const r = await (await fetch(path, {method: 'POST', body: JSON.stringify(body)})).json();
+    wifiMsg(r.ok ? (r.message || '') : r.error, r.ok ? 'ok' : 'err');
+    if (r.ok) await loadWifi();
+    return r.ok;
+  } catch (e) { wifiMsg('请求失败：' + e.message, 'err'); return false; }
+}
+$('#wifiAdd').onclick = async () => {
+  const ssid = $('#wifiSsid').value, password = $('#wifiPass').value;
+  if (!ssid.trim()) return wifiMsg('先填 Wi-Fi 名称', 'err');
+  if (ssid !== ssid.trim() && !confirm('名称前后有空格，确定是这样？')) return;
+  $('#wifiAdd').disabled = true;
+  if (await wifiPost('/wifi/add', {ssid, password})) { $('#wifiSsid').value = ''; $('#wifiPass').value = ''; }
+  $('#wifiAdd').disabled = false;
+};
+loadWifi();
 
 // 读到当前设置之前不让保存，免得空页面把已有设置冲掉
 async function load() {

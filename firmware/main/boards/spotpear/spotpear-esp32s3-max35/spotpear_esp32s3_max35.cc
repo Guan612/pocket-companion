@@ -33,6 +33,13 @@
 
 #define TAG "SpotpearMax35"
 
+// esp32-camera 内部的启停（driver/cam_hal.c，没进公开头文件）：只停 DMA 和场同步中断，
+// 传感器、帧缓冲、采集任务都留着，再 cam_start() 从下一帧接着收
+extern "C" {
+void cam_stop(void);
+void cam_start(void);
+}
+
 class SpotpearMax35Board : public WifiBoard {
 private:
     Button boot_button_;
@@ -42,6 +49,7 @@ private:
     PowerSaveTimer* power_save_timer_ = nullptr;
     Esp32Camera* camera_ = nullptr;
     std::mutex camera_mutex_;  // 抓拍不能和别的抓拍同时拿帧
+    bool camera_ready_ = false;  // 摄像头初始化成功（采集平时停着，抓拍时才开）
     std::atomic<bool> sleeping_{false};
     bool holding_ = false;     // BOOT 键按住说话中
     esp_timer_handle_t dim_timer_ = nullptr;  // 睡着一会儿后调暗屏幕
@@ -239,14 +247,34 @@ private:
         config.fb_location = CAMERA_FB_IN_PSRAM;
         config.grab_mode = CAMERA_GRAB_LATEST;  // 总是拿到最新的画面
         camera_ = new Esp32Camera(config);
+        // esp_camera_init 一结束就开始连续采集：VGA RGB565 每秒十几帧，驱动的采集任务（优先级 23）
+        // 用 CPU 把每帧 600KB 拷进 PSRAM（板上不支持 PSRAM DMA）。一直这么跑，抢走大量 CPU 和 PSRAM 带宽：
+        // 音频编码掉帧（Encode queue is full）、AFE 喂不进（Ringbuffer full）、界面滑动也跟着卡。
+        // 只有大模型要看一眼时才需要画面，平时停着
+        if (esp_camera_sensor_get() != nullptr) {
+            cam_stop();
+            camera_ready_ = true;
+        }
     }
 
     // 取一帧 RGB565。摄像头输出是大端，看图模型 / 编码器要小端，先换字节；
     // raw=true 直接返回换好字节序的原始帧（设置页 /cam.jpg?raw=1 调试用）
     std::string CaptureFrame(bool raw) {
         std::lock_guard<std::mutex> lock(camera_mutex_);
-        camera_fb_t* fb = esp_camera_fb_get();
-        if (fb == nullptr) return "";
+        if (!camera_ready_) return "";
+        // 平时采集是停着的：开起来，先丢掉几帧——队列里压着停之前的旧帧，停的那一刻收到一半的帧也作废。
+        // 传感器一直在出图，曝光早就稳了，丢三帧就是当下的画面
+        cam_start();
+        camera_fb_t* fb = nullptr;
+        for (int i = 0; i < 4; i++) {
+            if (fb != nullptr) esp_camera_fb_return(fb);
+            fb = esp_camera_fb_get();
+            if (fb == nullptr) break;
+        }
+        if (fb == nullptr) {
+            cam_stop();
+            return "";
+        }
         std::string out;
         if (fb->format == PIXFORMAT_RGB565) {
             size_t pixels = fb->width * fb->height;
@@ -269,6 +297,7 @@ private:
             }
         }
         esp_camera_fb_return(fb);
+        cam_stop();
         return out;
     }
 

@@ -59,9 +59,20 @@ public:
 // SPI LCD display
 class SpiLcdDisplay : public LcdDisplay {
 public:
+    // 刷屏参数：默认和原来一样（单缓冲 20 行、LVGL 任务优先级 1）。
+    // 双缓冲时 LVGL 画下一条的同时 SPI 在发上一条，整屏刷新快很多；内部 RAM 占用是 2 × lines 行
+    struct Options {
+        int buffer_lines = 20;
+        bool double_buffer = false;
+        int task_priority = 1;
+    };
+
     SpiLcdDisplay(esp_lcd_panel_io_handle_t panel_io, esp_lcd_panel_handle_t panel, int width,
                   int height, int offset_x, int offset_y, bool mirror_x, bool mirror_y,
                   bool swap_xy);
+    SpiLcdDisplay(esp_lcd_panel_io_handle_t panel_io, esp_lcd_panel_handle_t panel, int width,
+                  int height, int offset_x, int offset_y, bool mirror_x, bool mirror_y,
+                  bool swap_xy, const Options& options);
 };
 
 // RGB LCD display

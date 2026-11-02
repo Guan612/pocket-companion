@@ -44,6 +44,15 @@ static nomi_state_t s_last_state = NOMI_STATE_IDLE;
 static uint32_t s_subtitle_hide_at;  // 到这个时刻收起字幕，0 表示不收
 static bool s_sw_syncing;            // 状态同步改开关时不算用户操作
 static uint32_t s_listen_hold_until; // 用户刚点过连续聆听开关：这段时间状态同步别把开关扳回去
+// 历史页增量更新：列表里的标签和记录一一对应，只追加新消息、改最后一条、删掉记录头上丢掉的
+static int s_hist_shown;        // 列表里已有几条消息
+static int s_hist_base;         // 上次同步时记录已经从头上丢掉了几条
+static size_t s_hist_last_len;  // 最后一条显示时的长度（回答是逐句接上去的）
+static lv_obj_t *s_hist_hint;   // "还没有对话"提示
+static char s_settings_sig[768];  // 设置页建好时各项的值；下拉时没变就不重建
+static lv_obj_t *s_wifi_label;  // 设置 → 网络里"当前 Wi-Fi"那行（信号强度每次打开都刷新）
+static int s_battery_level = -2;
+static bool s_battery_charging;
 
 static int get_int(const char *key, int def) { return s_cb.get_int ? s_cb.get_int(key, def) : def; }
 static void set_int(const char *key, int value, bool final)
@@ -67,7 +76,7 @@ static void user_activity(void)
 static void show_main(bool anim);
 static void show_page(int page, bool anim);
 static void on_face_pressed(lv_event_t *e);
-static void rebuild_history(bool to_bottom);
+static void sync_history(bool to_bottom);
 static void sync_listen_switch(nomi_state_t state);
 
 // 二维码用 Nayuki 的 qrcodegen：设备上由小智依赖的 esp_emote_gfx 带进来，模拟器里由 LVGL 带进来。
@@ -114,6 +123,16 @@ static bool hist_page_active(void)
     return lv_tileview_get_tile_active(s_modes) == s_hist_tile;
 }
 
+// 表情只在看得见、而且没在翻页时才画。屏幕是 40MHz SPI，整屏刷一次要 60ms，表情每帧还要重画
+// 一大块；停在设置 / 历史页、或者手指正在拖页面时还照画，翻页和滚动就会被它拖慢
+// 注意 tileview 的"当前页"在第一次切页 / 滑动结束前是 NULL，所以只按"停在别的页"判断看不见
+static bool face_visible(void)
+{
+    if (lv_tileview_get_tile_active(s_outer) == s_settings_tile) return false;
+    if (lv_tileview_get_tile_active(s_modes) == s_hist_tile) return false;
+    return !lv_obj_is_scrolling(s_outer) && !lv_obj_is_scrolling(s_modes);
+}
+
 static void face_tick(lv_timer_t *timer)
 {
     (void)timer;
@@ -126,9 +145,11 @@ static void face_tick(lv_timer_t *timer)
     if (mode != face_get_mode()) face_set_mode(mode);
     for (; s_acc >= STEP_S; s_acc -= STEP_S) face_step(STEP_S);
 
-    // 待机、睡着、正在表演时不显示状态文字，脸本身就说明了（表演的道具也可能放在头顶那一格）
+    // 待机、睡着、正在表演时不显示状态文字，脸本身就说明了（表演的道具也可能放在头顶那一格）。
+    // 配网模式例外：一直写着"配网模式"，不然换个地方连不上网时屏幕上什么提示都没有
     nomi_state_t state = s_cb.get_state ? s_cb.get_state() : NOMI_STATE_IDLE;
-    lv_obj_set_flag(s_status, LV_OBJ_FLAG_HIDDEN, state == NOMI_STATE_IDLE || s_sleeping || face_is_playing());
+    bool hide_status = state == NOMI_STATE_IDLE || ((s_sleeping || face_is_playing()) && state != NOMI_STATE_WIFI_SETUP);
+    if (lv_obj_has_flag(s_status, LV_OBJ_FLAG_HIDDEN) != hide_status) lv_obj_set_flag(s_status, LV_OBJ_FLAG_HIDDEN, hide_status);
 
     // 说完了就收起字幕（小智回到待机时会清聊天记录，但 Nomi 的字幕不在那套界面里，得自己收）
     if (s_last_state == NOMI_STATE_SPEAKING && state != NOMI_STATE_SPEAKING) s_subtitle_hide_at = now + SUBTITLE_LINGER_MS;
@@ -142,13 +163,14 @@ static void face_tick(lv_timer_t *timer)
     // 连续聆听开关跟着设备状态走
     sync_listen_switch(state);
 
-    // 来了新消息且正停在历史页：把列表重建一遍（说话时逐句更新，一次重建就几毫秒）
-    if (s_hist_dirty && hist_page_active()) {
+    // 来了新消息且正停在历史页：只把新句子补上去（不在拖动列表时做，免得滚动中跳一下）
+    if (s_hist_dirty && hist_page_active() && !lv_obj_is_scrolling(s_hist_list)) {
         s_hist_dirty = false;
-        rebuild_history(false);
+        sync_history(false);
     }
 
-    // 表情直接画进画布缓冲，只通知 LVGL 重画变化的那块
+    // 表情直接画进画布缓冲，只通知 LVGL 重画变化的那块；看不见或正在翻页时先停着（动画状态照走）
+    if (!face_visible()) return;
     rrect_t d = face_render(s_buf);
     if (!rrect_empty(d)) {
         lv_area_t area = {d.x0, d.y0, d.x1 - 1, d.y1 - 1};
@@ -183,6 +205,7 @@ static void set_color(lv_obj_t *obj, uint32_t color)
 void nomi_ui_set_font(const lv_font_t *font)
 {
     if (!font) return;
+    if (font != s_font) s_settings_sig[0] = '\0';  // 设置页里有几层显式设了字体，下次下拉时重建
     s_font = font;
     lv_obj_t *roots[] = {s_status, s_subtitle, s_toast, s_settings_tile, s_hist_tile};
     for (size_t i = 0; i < sizeof(roots) / sizeof(roots[0]); i++) {
@@ -240,6 +263,10 @@ void nomi_ui_set_subtitle(const char *role, const char *text)
 
 void nomi_ui_set_battery(int level, bool charging)
 {
+    // 每秒都会调一次，没变就别动标签（改文字会让那块区域重画、多刷一次屏）
+    if (level == s_battery_level && charging == s_battery_charging) return;
+    s_battery_level = level;
+    s_battery_charging = charging;
     if (level < 0) {
         lv_obj_add_flag(s_battery, LV_OBJ_FLAG_HIDDEN);
         return;
@@ -292,30 +319,66 @@ void nomi_ui_notify(const char *text, uint32_t duration_ms)
 
 /* ---------- 第二页：历史对话 ---------- */
 
-// 按回调里的记录重建整个列表；to_bottom 为 true 时滚到最下面
-static void rebuild_history(bool to_bottom)
+// 一条消息的文字：自己的话带个称呼、用灰色；它的回答用亮白
+static void set_history_label(lv_obj_t *label, const char *role, const char *text)
+{
+    bool from_user = strcmp(role, "user") == 0;
+    lv_label_set_text_fmt(label, "%s%s", from_user ? "我：" : "", text ? text : "");
+    set_color(label, from_user ? C_MUTED : C_TEXT);
+}
+
+// 让列表和回调里的记录一致。不再每次整个重建：记录最多 100 条、每条能有上千字，
+// 全部重建要排一遍版，翻到历史页和说话时逐句更新都会卡一下。to_bottom 为 true 时滚到最下面
+static void sync_history(bool to_bottom)
 {
     if (!s_cb.history_count || !s_cb.history_get) return;
     bool was_at_bottom = lv_obj_get_scroll_bottom(s_hist_list) <= 2;
-    lv_obj_clean(s_hist_list);
     int n = s_cb.history_count();
-    if (n <= 0) {
-        lv_obj_t *hint = lv_label_create(s_hist_list);
-        lv_label_set_text(hint, "还没有对话\n\n聊过的话会记在这里\n往右滑回去叫它说话吧");
-        lv_obj_set_width(hint, LV_PCT(100));
-        lv_obj_set_style_text_align(hint, LV_TEXT_ALIGN_CENTER, 0);
-        lv_obj_set_style_text_opa(hint, LV_OPA_60, 0);
+    int dropped = s_cb.history_dropped ? s_cb.history_dropped() : s_hist_base;
+
+    // 记录满了会从头上丢旧消息，列表也删掉对应的前几条；对不上（比如记录被清空）就整个重建
+    int gone = dropped - s_hist_base;
+    if (gone < 0 || n < s_hist_shown - gone) {
+        lv_obj_clean(s_hist_list);
+        s_hist_hint = NULL;
+        s_hist_shown = 0;
+    } else if (gone > 0) {
+        int k = gone < s_hist_shown ? gone : s_hist_shown;
+        for (int i = 0; i < k; i++) lv_obj_delete(lv_obj_get_child(s_hist_list, 0));
+        s_hist_shown -= k;
     }
-    for (int i = 0; i < n; i++) {
-        const char *role = "";
-        const char *text = s_cb.history_get(i, &role);
-        if (!text || !*text) continue;
+    s_hist_base = dropped;
+
+    const char *role = "";
+    const char *text;
+    // 最后一条回答可能又接上了新句子
+    if (s_hist_shown > 0 && s_hist_shown <= n) {
+        text = s_cb.history_get(s_hist_shown - 1, &role);
+        if (strlen(text ? text : "") != s_hist_last_len) {
+            set_history_label(lv_obj_get_child(s_hist_list, s_hist_shown - 1), role, text);
+        }
+    }
+    for (int i = s_hist_shown; i < n; i++) {
+        text = s_cb.history_get(i, &role);
         lv_obj_t *label = lv_label_create(s_hist_list);
-        // 自己的话带个称呼、用灰色；它的回答用亮白
-        bool from_user = strcmp(role, "user") == 0;
-        lv_label_set_text_fmt(label, "%s%s", from_user ? "我：" : "", text);
         lv_obj_set_width(label, LV_PCT(100));
-        set_color(label, from_user ? C_MUTED : C_TEXT);
+        set_history_label(label, role, text);
+    }
+    s_hist_shown = n;
+    if (n > 0) {
+        text = s_cb.history_get(n - 1, &role);
+        s_hist_last_len = strlen(text ? text : "");
+    }
+
+    if (n > 0 && s_hist_hint) {
+        lv_obj_delete(s_hist_hint);
+        s_hist_hint = NULL;
+    } else if (n == 0 && !s_hist_hint) {
+        s_hist_hint = lv_label_create(s_hist_list);
+        lv_label_set_text(s_hist_hint, "还没有对话\n\n聊过的话会记在这里\n往右滑回去叫它说话吧");
+        lv_obj_set_width(s_hist_hint, LV_PCT(100));
+        lv_obj_set_style_text_align(s_hist_hint, LV_TEXT_ALIGN_CENTER, 0);
+        lv_obj_set_style_text_opa(s_hist_hint, LV_OPA_60, 0);
     }
     if (to_bottom || was_at_bottom) {
         lv_obj_update_layout(s_hist_list);  // 先算好布局才知道能滚多远
@@ -323,14 +386,14 @@ static void rebuild_history(bool to_bottom)
     }
 }
 
-// 左右翻到另一页：翻到历史页时把列表刷成最新的
+// 左右翻到另一页：翻到历史页时把新消息补上，并停在最新那条
 static void on_page_changed(lv_event_t *e)
 {
     (void)e;
     if (s_page_by_code) return;
     if (hist_page_active()) {
         s_hist_dirty = false;
-        rebuild_history(true);
+        sync_history(true);
     }
 }
 
@@ -545,19 +608,40 @@ static void add_info(lv_obj_t *page, const char *title, const char *value)
     set_color(label, C_MUTED);
 }
 
-// 危险操作要点两次：第一次只把按钮文字改成"再点一次确认"
+// 危险操作要点两次：第一次只把按钮文字改成"再点一次确认"。
+// 设置页不再每次打开都重建，所以离开设置页时要把点过一次的按钮复原，免得下次一点就执行
+static lv_obj_t *s_armed_btn;
+
+static void disarm_action_button(void)
+{
+    if (!s_armed_btn) return;
+    lv_obj_remove_state(s_armed_btn, LV_STATE_USER_1);
+    lv_label_set_text(lv_obj_get_child(s_armed_btn, 0), lv_obj_get_user_data(s_armed_btn));
+    s_armed_btn = NULL;
+}
+
 static void on_action_button(lv_event_t *e)
 {
     lv_obj_t *btn = lv_event_get_target(e);
     const char *name = lv_event_get_user_data(e);
     bool dangerous = strcmp(name, "factory_reset") == 0 || strcmp(name, "reconfigure_wifi") == 0;
     if (dangerous && !lv_obj_has_state(btn, LV_STATE_USER_1)) {
+        disarm_action_button();
         lv_obj_add_state(btn, LV_STATE_USER_1);
         lv_label_set_text(lv_obj_get_child(btn, 0), "再点一次确认");
+        s_armed_btn = btn;
         return;
     }
-    if (dangerous) show_main(true);
+    if (dangerous) {
+        disarm_action_button();
+        show_main(true);
+    }
     action(name);
+}
+
+static void on_action_button_deleted(lv_event_t *e)
+{
+    if (lv_event_get_target(e) == s_armed_btn) s_armed_btn = NULL;
 }
 
 static void add_action(lv_obj_t *parent, const char *text, const char *name, bool danger)
@@ -568,7 +652,9 @@ static void add_action(lv_obj_t *parent, const char *text, const char *name, boo
     lv_obj_set_style_shadow_width(btn, 0, 0);
     lv_obj_set_style_pad_hor(btn, 14, 0);
     lv_obj_set_style_pad_ver(btn, 10, 0);
+    lv_obj_set_user_data(btn, (void *)text);  // 原来的文字，复原"再点一次确认"时用
     lv_obj_add_event_cb(btn, on_action_button, LV_EVENT_CLICKED, (void *)name);
+    lv_obj_add_event_cb(btn, on_action_button_deleted, LV_EVENT_DELETE, NULL);
     lv_obj_t *label = lv_label_create(btn);
     lv_label_set_text(label, text);
     set_color(label, danger ? C_DANGER : C_TEXT);
@@ -634,19 +720,69 @@ static void build_display_page(lv_obj_t *page)
     add_choice(page, "多久后息屏", NULL, NOMI_KEY_OFF, off, 1);
 }
 
+// 已存的 Wi-Fi，一行一个，正连着的标出来
+static void add_saved_wifi(lv_obj_t *page)
+{
+    static char buf[400];
+    snprintf(buf, sizeof(buf), "%s", get_text("saved_wifi"));
+    char current[40];
+    snprintf(current, sizeof(current), "%s", get_text("wifi_ssid"));
+    int count = 0;
+    for (char *p = buf; *p; p++) count += *p == '\n';
+    if (buf[0]) count++;
+    char title[48];
+    snprintf(title, sizeof(title), "已存的 Wi-Fi（%d / 10）", count);
+    lv_obj_t *item = add_item(page, title, "在哪个网络附近就自动连哪个；网页设置页里能添加和删除，不在身边的也能先存");
+    if (!count) {
+        lv_obj_t *label = lv_label_create(item);
+        lv_label_set_text(label, "还没有");
+        set_color(label, C_MUTED);
+        return;
+    }
+    for (char *p = buf; p && *p;) {
+        char *nl = strchr(p, '\n');
+        if (nl) *nl = '\0';
+        lv_obj_t *label = lv_label_create(item);
+        lv_obj_set_width(label, LV_PCT(100));
+        bool on = current[0] && strcmp(p, current) == 0;
+        lv_label_set_text_fmt(label, "%s%s", p, on ? "  · 已连接" : "");
+        set_color(label, on ? C_TEXT : C_MUTED);
+        p = nl ? nl + 1 : NULL;
+    }
+}
+
 static void build_network_page(lv_obj_t *page)
 {
-    add_info(page, "Wi-Fi", get_text("wifi"));
-    add_info(page, "IP 地址", get_text("ip"));
+    // 配网模式：先告诉人怎么加网络——扫码连上热点（手机一般会自动弹出配网页）
+    const char *hotspot = get_text("hotspot");
+    if (hotspot[0]) {
+        char wifi_qr[64], hint[160];
+        snprintf(wifi_qr, sizeof(wifi_qr), "WIFI:T:nopass;S:%s;;", hotspot);
+        snprintf(hint, sizeof(hint), "手机扫码连上热点 %s，浏览器打开 %s 添加 Wi-Fi", hotspot, get_text("hotspot_url"));
+        lv_obj_t *item = add_item(page, "配网中", hint);
+        add_qrcode(item, wifi_qr);
+        add_saved_wifi(page);
+        return;  // 配网时没有局域网地址，网页设置页的二维码也不显示（二维码画布只有一块，也放不下两张）
+    } else {
+        lv_obj_t *item = add_item(page, "当前 Wi-Fi", NULL);
+        s_wifi_label = lv_label_create(item);
+        lv_obj_set_width(s_wifi_label, LV_PCT(100));
+        set_color(s_wifi_label, C_MUTED);
+        const char *wifi = get_text("wifi");
+        lv_label_set_text(s_wifi_label, wifi[0] ? wifi : "没连上");
+        add_info(page, "IP 地址", get_text("ip"));
+    }
     const char *url = get_text("config_url");
-    lv_obj_t *item = add_item(page, "网页设置页", url[0] ? "手机扫码打开，填写 API 地址和 Key" : "还没连上网络");
     if (url[0]) {
+        lv_obj_t *item = add_item(page, "网页设置页", "手机扫码打开，填写 API 地址和 Key、管理 Wi-Fi");
         add_qrcode(item, url);
         lv_obj_t *label = lv_label_create(item);
         lv_label_set_text(label, url);
         set_color(label, C_MUTED);
     }
-    add_action(add_button_row(page), "重新配网", "reconfigure_wifi", true);
+    add_saved_wifi(page);
+    add_item(page, "添加 Wi-Fi", "开配网热点，用手机连上它添加新网络；已存的都保留。会先断开现在的网络");
+    add_action(add_button_row(page), "开配网热点", "reconfigure_wifi", true);
 }
 
 static void build_system_page(lv_obj_t *page)
@@ -679,17 +815,42 @@ static void on_outer_scroll_end(lv_event_t *e)
 {
     (void)e;
     lock_outer_if_settings();
+    if (lv_tileview_get_tile_active(s_outer) == s_main_tile) disarm_action_button();
 }
 
-// 设置页每次从主界面拉下来时重建，保证显示的是最新的值
+#define TAB_BAR_W 92  // 设置页左边标签栏的宽度
+
+// 设置页上显示的所有值拼成一串。下拉时和建页面时的那串一样就不重建：
+// 重建要删掉再建一百来个控件，正赶在手指开始拖的那一下，拖动会顿一下
+static void settings_signature(char *out, size_t size)
+{
+    static const char *const keys[] = {NOMI_KEY_TALK_KEY, NOMI_KEY_AEC,     NOMI_KEY_AEC_SUPPORTED,
+                                       NOMI_KEY_SUBTITLES, NOMI_KEY_PERSONA, NOMI_KEY_VOICE,
+                                       NOMI_KEY_BRIGHTNESS, NOMI_KEY_DIM,    NOMI_KEY_OFF,
+                                       NOMI_KEY_VOLUME,    NOMI_KEY_TTS_SPEAK};
+    static const char *const texts[] = {"voices", "wifi_ssid", "ip", "config_url", "hotspot", "saved_wifi"};
+    size_t len = 0;
+    out[0] = '\0';
+    for (size_t i = 0; i < sizeof(keys) / sizeof(keys[0]) && len < size; i++) {
+        len += snprintf(out + len, size - len, "%d,", get_int(keys[i], -9));
+    }
+    for (size_t i = 0; i < sizeof(texts) / sizeof(texts[0]) && len < size; i++) {
+        len += snprintf(out + len, size - len, "%s|", get_text(texts[i]));
+    }
+}
+
+// 建设置页（开机建一次；之后下拉时值变了才重建）
 static void build_settings(void)
 {
+    settings_signature(s_settings_sig, sizeof(s_settings_sig));
     lv_obj_clean(s_settings_tile);
+    s_listen_sw = NULL;
+    s_wifi_label = NULL;
 
     lv_obj_t *tv = lv_tabview_create(s_settings_tile);
     lv_obj_set_size(tv, LV_PCT(100), LV_PCT(100));
     lv_tabview_set_tab_bar_position(tv, LV_DIR_LEFT);
-    lv_tabview_set_tab_bar_size(tv, 92);
+    lv_tabview_set_tab_bar_size(tv, TAB_BAR_W);
     lv_obj_set_style_bg_opa(tv, LV_OPA_TRANSP, 0);
     lv_obj_t *bar = lv_tabview_get_tab_bar(tv);
     lv_obj_t *content = lv_tabview_get_content(tv);
@@ -726,12 +887,12 @@ static void build_settings(void)
         lv_obj_set_style_border_width(btn, 3, LV_STATE_CHECKED);
     }
 
-    // 底部一条把手区：只有按住这里往上推才收起设置，其他地方上下推都是翻内容
+    // 底部一条把手区：只有按住这里往上推才收起设置，其他地方上下推都是翻内容。
+    // 只盖内容区，别伸到左边标签栏下面：原来整屏宽，把最下面"系统"标签的下半截挡住了，点着不灵
     lv_obj_t *grip_zone = lv_obj_create(s_settings_tile);
     lv_obj_remove_style_all(grip_zone);
-    lv_obj_set_size(grip_zone, LV_PCT(100), 28);
+    lv_obj_set_size(grip_zone, FACE_W - TAB_BAR_W, 28);
     lv_obj_align(grip_zone, LV_ALIGN_BOTTOM_RIGHT, 0, 0);
-    lv_obj_set_style_pad_left(grip_zone, 92, 0);  // 横条居中在内容区，避开左边的标签栏
     lv_obj_add_flag(grip_zone, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_add_event_cb(grip_zone, on_grip, LV_EVENT_PRESSED, NULL);
     lv_obj_add_event_cb(grip_zone, on_grip, LV_EVENT_RELEASED, NULL);
@@ -749,6 +910,7 @@ static void build_settings(void)
 
 static void show_main(bool anim)
 {
+    disarm_action_button();
     lv_tileview_set_tile(s_outer, s_main_tile, anim ? LV_ANIM_ON : LV_ANIM_OFF);
 }
 
@@ -760,12 +922,20 @@ static void show_page(int page, bool anim)
     s_page_by_code = false;
 }
 
-// 外层开始上下翻：从主界面往下拉时先把设置页刷新成最新的值
+// 外层开始上下翻：从主界面往下拉时，设置页上的值有变化才重建；没变只刷新一下信号强度
 static void on_outer_scroll(lv_event_t *e)
 {
     (void)e;
     user_activity();
-    if (lv_tileview_get_tile_active(s_outer) == s_main_tile) build_settings();
+    if (lv_tileview_get_tile_active(s_outer) != s_main_tile) return;
+    char sig[sizeof(s_settings_sig)];
+    settings_signature(sig, sizeof(sig));
+    if (strcmp(sig, s_settings_sig) != 0) {
+        build_settings();
+    } else if (s_wifi_label) {
+        const char *wifi = get_text("wifi");
+        lv_label_set_text(s_wifi_label, wifi[0] ? wifi : "没连上");
+    }
 }
 
 // 触摸只用来叫醒它；说话交给 BOOT 键和唤醒词
@@ -871,6 +1041,7 @@ void nomi_ui_create(lv_obj_t *screen, uint16_t *face_buf, const lv_font_t *font,
 
     build_settings();
     show_main(false);
+    show_page(0, false);  // 让左右翻页的 tileview 也有"当前页"（不设的话一直是 NULL，直到第一次滑动）
 
     // 通知条在最上层，翻到哪一页都看得到
     s_toast = lv_label_create(screen);

@@ -10,6 +10,8 @@
 #include <esp_http_server.h>
 #include <esp_log.h>
 #include <esp_netif.h>
+#include <ssid_manager.h>
+#include <wifi_manager.h>
 
 #include <array>
 #include <cstring>
@@ -21,6 +23,8 @@
 //   GET  /config.json  供应商列表（不含 Key，只报有没有存）、各用途选的模型、人设、长期记忆
 //   POST /save         整份设置一次提交（JSON），校验通过才写 NVS
 //   POST /models       由设备去调供应商的 GET {地址}/models，把模型 id 列表交给页面（浏览器直连会被跨域拦）
+//   GET  /wifi.json    已存的 Wi-Fi（只有名字，不回传密码）和正连着的那个
+//   POST /wifi/add     存一个 Wi-Fi（不当场连，不在身边的也能先存）；/wifi/delete 删掉一个。都立即生效
 // 存储格式见 direct_api_settings.h。浏览器模拟器（tools/device-sim/serve.py）实现了同样的接口。
 
 namespace {
@@ -266,6 +270,72 @@ esp_err_t HandleModels(httpd_req_t* req) {
     return SendJson(req, resp);
 }
 
+// ---------- Wi-Fi 列表：和配网热点页存的是同一份（esp-wifi-connect 的 SsidManager，最多 10 个） ----------
+// 设备开机 / 断线后会扫一遍，已存的网络哪个在附近就连哪个（都在时连信号强的）
+
+constexpr int kMaxSavedWifi = 10;  // SsidManager 的 MAX_WIFI_SSID_COUNT
+
+esp_err_t HandleWifiList(httpd_req_t* req) {
+    auto& wifi = WifiManager::GetInstance();
+    cJSON* root = cJSON_CreateObject();
+    cJSON_AddStringToObject(root, "current", wifi.IsConnected() ? wifi.GetSsid().c_str() : "");
+    cJSON* saved = cJSON_AddArrayToObject(root, "saved");
+    for (const auto& item : SsidManager::GetInstance().GetSsidList()) {
+        cJSON_AddItemToArray(saved, cJSON_CreateString(item.ssid.c_str()));
+    }
+    cJSON_AddNumberToObject(root, "max", kMaxSavedWifi);
+    return SendJson(req, root);
+}
+
+int FindSavedWifi(const std::string& ssid) {
+    const auto& list = SsidManager::GetInstance().GetSsidList();
+    for (size_t i = 0; i < list.size(); i++) {
+        if (list[i].ssid == ssid) return static_cast<int>(i);
+    }
+    return -1;
+}
+
+esp_err_t HandleWifiAdd(httpd_req_t* req) {
+    std::string body;
+    if (!ReadBody(req, body)) return SendError(req, "请求太大");
+    cJSON* root = cJSON_Parse(body.c_str());
+    if (root == nullptr) return SendError(req, "请求不是 JSON");
+    std::string ssid = JsonString(root, "ssid"), password = JsonString(root, "password");
+    cJSON_Delete(root);
+    if (ssid.empty() || ssid.size() > 32) return SendError(req, "Wi-Fi 名称要填，且不超过 32 字节（约 10 个汉字）");
+    // WPA2 密码 8～63 个字符（或 64 位十六进制）；开放网络不填
+    if (!password.empty() && (password.size() < 8 || password.size() > 64)) {
+        return SendError(req, "密码要 8～63 个字符；开放网络留空");
+    }
+    bool exists = FindSavedWifi(ssid) >= 0;
+    if (!exists && static_cast<int>(SsidManager::GetInstance().GetSsidList().size()) >= kMaxSavedWifi) {
+        return SendError(req, "最多存 " + std::to_string(kMaxSavedWifi) + " 个，先删掉一个");
+    }
+    SsidManager::GetInstance().AddSsid(ssid, password);
+    ESP_LOGI(TAG, "Wi-Fi saved: %s", ssid.c_str());
+    cJSON* ok = cJSON_CreateObject();
+    cJSON_AddBoolToObject(ok, "ok", true);
+    cJSON_AddStringToObject(ok, "message", exists ? "已更新密码" : "已保存，到了它附近会自动连上");
+    return SendJson(req, ok);
+}
+
+esp_err_t HandleWifiDelete(httpd_req_t* req) {
+    std::string body;
+    if (!ReadBody(req, body)) return SendError(req, "请求太大");
+    cJSON* root = cJSON_Parse(body.c_str());
+    if (root == nullptr) return SendError(req, "请求不是 JSON");
+    std::string ssid = JsonString(root, "ssid");
+    cJSON_Delete(root);
+    int index = FindSavedWifi(ssid);
+    if (index < 0) return SendError(req, "没有存这个 Wi-Fi");
+    SsidManager::GetInstance().RemoveSsid(index);
+    ESP_LOGI(TAG, "Wi-Fi removed: %s", ssid.c_str());
+    cJSON* ok = cJSON_CreateObject();
+    cJSON_AddBoolToObject(ok, "ok", true);
+    cJSON_AddStringToObject(ok, "message", "已删除");
+    return SendJson(req, ok);
+}
+
 std::string DeviceIp() {
     esp_netif_t* netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
     esp_netif_ip_info_t ip = {};
@@ -305,6 +375,7 @@ std::string Start() {
     if (s_server == nullptr) {
         httpd_config_t config = HTTPD_DEFAULT_CONFIG();
         config.stack_size = 12288;  // /models 里有 HTTPS 请求
+        config.max_uri_handlers = 12;
         if (httpd_start(&s_server, &config) != ESP_OK) {
             ESP_LOGE(TAG, "Failed to start config server");
             return "";
@@ -315,6 +386,9 @@ std::string Start() {
             {.uri = "/save", .method = HTTP_POST, .handler = HandleSave, .user_ctx = nullptr},
             {.uri = "/models", .method = HTTP_POST, .handler = HandleModels, .user_ctx = nullptr},
             {.uri = "/cam.jpg", .method = HTTP_GET, .handler = HandleCamJpeg, .user_ctx = nullptr},
+            {.uri = "/wifi.json", .method = HTTP_GET, .handler = HandleWifiList, .user_ctx = nullptr},
+            {.uri = "/wifi/add", .method = HTTP_POST, .handler = HandleWifiAdd, .user_ctx = nullptr},
+            {.uri = "/wifi/delete", .method = HTTP_POST, .handler = HandleWifiDelete, .user_ctx = nullptr},
         };
         for (const auto& u : uris) httpd_register_uri_handler(s_server, &u);
     }
@@ -322,6 +396,16 @@ std::string Start() {
     s_url = ip.empty() ? "" : "http://" + ip + "/";
     ESP_LOGI(TAG, "Config page: %s", s_url.c_str());
     return s_url;
+}
+
+// 配网热点的网页也要占 80 端口：进配网前不停掉这里，它 httpd_start 失败会直接重启
+void Stop() {
+    if (s_server != nullptr) {
+        httpd_stop(s_server);
+        s_server = nullptr;
+        ESP_LOGI(TAG, "Config page stopped");
+    }
+    s_url.clear();
 }
 
 const std::string& Url() { return s_url; }

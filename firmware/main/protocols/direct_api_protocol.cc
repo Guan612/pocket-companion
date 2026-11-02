@@ -17,11 +17,14 @@
 #include <esp_audio_simple_dec_default.h>
 #include <esp_log.h>
 #include <esp_opus_dec.h>
+#include <esp_heap_caps.h>
 #include <esp_timer.h>
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <cstring>
+#include <functional>
 #include <mutex>
 
 #define TAG "DirectApi"
@@ -89,11 +92,9 @@ std::unique_ptr<Http> NewHttp(const std::string& key) {
     return http;
 }
 
-// 16k 单声道 16bit PCM 加 44 字节 WAV 头
-std::string MakeWav(const std::vector<int16_t>& pcm) {
-    const uint32_t data_size = pcm.size() * sizeof(int16_t);
+// 16k 单声道 16bit PCM 的 44 字节 WAV 头；data_size 是后面 PCM 的字节数
+std::string WavHeader(uint32_t data_size) {
     std::string wav;
-    wav.reserve(44 + data_size);
     auto u32 = [&wav](uint32_t v) { wav.append(reinterpret_cast<const char*>(&v), 4); };
     auto u16 = [&wav](uint16_t v) { wav.append(reinterpret_cast<const char*>(&v), 2); };
     wav += "RIFF";
@@ -108,11 +109,58 @@ std::string MakeWav(const std::vector<int16_t>& pcm) {
     u16(16);
     wav += "data";
     u32(data_size);
-    wav.append(reinterpret_cast<const char*>(pcm.data()), data_size);
     return wav;
 }
 
-std::vector<int16_t> DecodeOpus(const std::vector<std::vector<uint8_t>>& packets) {
+// 把一段数据整个写出去（Http::Write 一次可能只发一部分）
+bool WriteAll(Http& http, const char* data, size_t size) {
+    while (size > 0) {
+        auto n = http.Write(data, size);
+        if (!n || *n <= 0) return false;
+        data += *n;
+        size -= *n;
+    }
+    return true;
+}
+
+// 内部 RAM 剩多少、最大连续块多大：连续对话出问题时看这个（TLS / lwIP / 任务栈都要内部 RAM）
+void LogHeap(const char* when) {
+    ESP_LOGI(TAG, "Heap %s: internal free=%u largest=%u min=%u, psram free=%u", when,
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
+             (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL),
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+}
+
+// 发请求，连不上就缓一缓再试：TLS 握手和上传都要内部 RAM，紧的时候第一次常分不到
+// （串口里是 create_ssl_handle failed / SSL send failed）。最多试 3 次，间隔 0.4 秒、1 秒
+bool OpenWithRetry(Http& http, const char* method, const std::string& url, const char* what,
+                   const std::function<bool()>& aborted) {
+    static const int kDelaysMs[] = {400, 1000};
+    for (int attempt = 0;; attempt++) {
+        if (http.Open(method, url)) return true;
+        ESP_LOGW(TAG, "%s: open failed (attempt %d)", what, attempt + 1);
+        LogHeap("after failed open");
+        if (attempt >= 2 || aborted()) return false;
+        vTaskDelay(pdMS_TO_TICKS(kDelaysMs[attempt]));
+    }
+}
+
+// 按 2 字节长度前缀（小端）逐个取出 Opus 包，见 DirectApiProtocol::packets_
+template <typename F>
+size_t ForEachPacket(const std::string& packets, F&& fn) {
+    size_t count = 0;
+    for (size_t pos = 0; pos + 2 <= packets.size(); count++) {
+        const auto* p = reinterpret_cast<const uint8_t*>(packets.data()) + pos;
+        const size_t len = p[0] | (p[1] << 8);
+        if (pos + 2 + len > packets.size()) break;
+        fn(p + 2, len);
+        pos += 2 + len;
+    }
+    return count;
+}
+
+std::vector<int16_t> DecodeOpus(const std::string& packets) {
     std::vector<int16_t> pcm;
     esp_opus_dec_cfg_t cfg = {
         .sample_rate = kMicSampleRate,
@@ -125,12 +173,12 @@ std::vector<int16_t> DecodeOpus(const std::vector<std::vector<uint8_t>>& packets
         return pcm;
     }
     const size_t frame_samples = kMicSampleRate * kMicFrameMs / 1000;
-    pcm.reserve(packets.size() * frame_samples);
+    pcm.reserve(ForEachPacket(packets, [](const uint8_t*, size_t) {}) * frame_samples);
     std::vector<int16_t> frame(frame_samples);
-    for (const auto& p : packets) {
+    ForEachPacket(packets, [&](const uint8_t* data, size_t len) {
         esp_audio_dec_in_raw_t raw = {
-            .buffer = const_cast<uint8_t*>(p.data()),
-            .len = static_cast<uint32_t>(p.size()),
+            .buffer = const_cast<uint8_t*>(data),
+            .len = static_cast<uint32_t>(len),
             .consumed = 0,
             .frame_recover = ESP_AUDIO_DEC_RECOVERY_NONE,
         };
@@ -143,7 +191,7 @@ std::vector<int16_t> DecodeOpus(const std::vector<std::vector<uint8_t>>& packets
         if (esp_opus_dec_decode(dec, &raw, &out, &info) == ESP_AUDIO_ERR_OK) {
             pcm.insert(pcm.end(), frame.begin(), frame.begin() + out.decoded_size / sizeof(int16_t));
         }
-    }
+    });
     esp_opus_dec_close(dec);
     return pcm;
 }
@@ -267,6 +315,9 @@ DirectApiProtocol::~DirectApiProtocol() {
         vTaskDelete(worker_);
     }
     vSemaphoreDelete(turn_sem_);
+    // 协议被重置多半是要进配网模式（WifiBoard::EnterWifiConfigMode 先 ResetProtocol 再开热点），
+    // 热点的配网页也要 80 端口；联网后新协议 Start() 会再把设置页开起来
+    DirectApiConfigServer::Stop();
 }
 
 bool DirectApiProtocol::Start() {
@@ -365,7 +416,13 @@ bool DirectApiProtocol::SendAudio(std::unique_ptr<AudioStreamPacket> packet) {
     bool done = false;
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        packets_.push_back(std::move(packet->payload));
+        const auto& payload = packet->payload;
+        if (payload.size() <= 0xFFFF) {
+            if (packets_.capacity() < 4096) packets_.reserve(32 * 1024);  // 一次要一大块，落在 PSRAM
+            packets_.push_back(static_cast<char>(payload.size() & 0xFF));
+            packets_.push_back(static_cast<char>(payload.size() >> 8));
+            packets_.append(reinterpret_cast<const char*>(payload.data()), payload.size());
+        }
         recorded_ms_ += kMicFrameMs;
         // 手动模式靠松键结束；自动模式用设备端 VAD 判断说完了没有
         if (mode_ != kListeningModeManualStop) {
@@ -447,7 +504,7 @@ void DirectApiProtocol::WorkerLoop() {
         if (!opened_) {
             continue;
         }
-        std::vector<std::vector<uint8_t>> packets;
+        std::string packets;
         {
             std::lock_guard<std::mutex> lock(mutex_);
             packets.swap(packets_);
@@ -472,7 +529,7 @@ void DirectApiProtocol::EmitJson(const char* type, const char* key, const char* 
     cJSON_Delete(root);
 }
 
-void DirectApiProtocol::RunTurn(std::vector<std::vector<uint8_t>> packets) {
+void DirectApiProtocol::RunTurn(std::string packets) {
     auto cfg = DirectApiConfig::Load();
     auto& app = Application::GetInstance();
     // 没识别出内容时回到聆听；手动模式下 Application 会自己回到待机
@@ -495,8 +552,7 @@ void DirectApiProtocol::RunTurn(std::vector<std::vector<uint8_t>> packets) {
     }
 
     EmitJson("llm", "emotion", "thinking");
-    std::string text = Transcribe(cfg, packets);
-    packets.clear();
+    std::string text = Transcribe(cfg, std::move(packets));
     if (Aborted()) return;
     // 上一轮拍的照片现在才编完、而这轮又没说话：就当在问照片的事，不然照片会一直挂着
     if (text.empty() && HasPendingImage()) {
@@ -559,41 +615,63 @@ void DirectApiProtocol::RunTurn(std::vector<std::vector<uint8_t>> packets) {
     }
 }
 
-std::string DirectApiProtocol::Transcribe(const DirectApiConfig& cfg,
-                                          const std::vector<std::vector<uint8_t>>& packets) {
+std::string DirectApiProtocol::Transcribe(const DirectApiConfig& cfg, std::string packets) {
     if (Aborted()) return "";  // 轮次已作废就别再发请求
     auto pcm = DecodeOpus(packets);
+    std::string().swap(packets);  // 解完就放掉，别带着进上传
     if (pcm.size() < kMicSampleRate / 3) {  // 不到 0.3 秒，多半是误触
         return "";
     }
 
+    // multipart 正文 = 头（表单字段 + WAV 头）+ PCM + 尾。
+    // 不再拼成一整个字符串交给 SetContent：15 秒录音就是 480KB，拼接时扩容翻倍、HTTP 库组请求时
+    // 还要再整份拷一遍，峰值 1MB 以上，PSRAM 不够就 abort 重启（串口：BuildHttpRequest → operator new）。
+    // 现在先只发请求头，正文从 pcm 里分块直接写出去
     const std::string boundary = "----PocketCompanionBoundary";
-    std::string body;
+    std::string head;
     auto field = [&](const char* name, const std::string& value) {
-        body += "--" + boundary + "\r\nContent-Disposition: form-data; name=\"" + name +
+        head += "--" + boundary + "\r\nContent-Disposition: form-data; name=\"" + name +
                 "\"\r\n\r\n" + value + "\r\n";
     };
     field("model", cfg.asr.model);
     if (!cfg.asr_language.empty()) field("language", cfg.asr_language);
-    body += "--" + boundary +
+    head += "--" + boundary +
             "\r\nContent-Disposition: form-data; name=\"file\"; filename=\"speech.wav\"\r\n"
             "Content-Type: audio/wav\r\n\r\n";
-    body += MakeWav(pcm);
-    body += "\r\n--" + boundary + "--\r\n";
+    const size_t pcm_bytes = pcm.size() * sizeof(int16_t);
+    head += WavHeader(pcm_bytes);
+    const std::string tail = "\r\n--" + boundary + "--\r\n";
+    const size_t total = head.size() + pcm_bytes + tail.size();
+
+    const std::string url = cfg.asr.url + "/audio/transcriptions";
+    std::unique_ptr<Http> http;
+    LogHeap("before ASR");
+    // 连不上或发到一半断了就缓一缓重来（TLS 握手和上传都要内部 RAM，紧的时候第一次常失败），最多 3 次
+    static const int kDelaysMs[] = {400, 1000};
+    for (int attempt = 0; !http; attempt++) {
+        auto h = NewHttp(cfg.asr.key);
+        h->SetHeader("Content-Type", "multipart/form-data; boundary=" + boundary);
+        h->SetHeader("Content-Length", std::to_string(total));
+        // content 存在但为空：库按我们给的 Content-Length 只发请求头，不加 chunked、也不拼正文
+        h->SetContent(std::string());
+        bool ok = static_cast<bool>(h->Open("POST", url)) && WriteAll(*h, head.data(), head.size());
+        const auto* p = reinterpret_cast<const char*>(pcm.data());
+        for (size_t off = 0; ok && off < pcm_bytes; off += 4096) {
+            ok = !Aborted() && WriteAll(*h, p + off, std::min<size_t>(4096, pcm_bytes - off));
+        }
+        ok = ok && WriteAll(*h, tail.data(), tail.size());
+        if (ok) {
+            http = std::move(h);
+            break;
+        }
+        ESP_LOGW(TAG, "ASR: upload failed (attempt %d)", attempt + 1);
+        LogHeap("after failed upload");
+        if (attempt >= 2 || Aborted()) break;
+        vTaskDelay(pdMS_TO_TICKS(kDelaysMs[attempt]));
+    }
     pcm.clear();
     pcm.shrink_to_fit();
-
-    auto http = NewHttp(cfg.asr.key);
-    http->SetHeader("Content-Type", "multipart/form-data; boundary=" + boundary);
-    http->SetContent(std::move(body));
-    // TLS 握手要一大块连续内存，唤醒词 + AFE 常驻后堆很紧，第一次可能分不到
-    // （串口里是 create_ssl_handle failed）；缓一下再试一次，多数就过了
-    auto opened = http->Open("POST", cfg.asr.url + "/audio/transcriptions");
-    if (!opened && !Aborted()) {
-        vTaskDelay(pdMS_TO_TICKS(400));
-        opened = http->Open("POST", cfg.asr.url + "/audio/transcriptions");
-    }
-    if (!opened) {
+    if (!http) {
         if (!Aborted()) SetError("语音识别连接失败");  // 用户已退出聆听时晚到的失败不弹
         return "";
     }
@@ -718,12 +796,8 @@ std::string DirectApiProtocol::Chat(const DirectApiConfig& cfg, const std::strin
         http->SetHeader("Content-Type", "application/json");
         http->SetContent(std::string(json));
         cJSON_free(json);
-        // TLS 握手的内存紧张时第一次会失败，缓一下再试一次（见 Transcribe 里的说明）
-        auto opened = http->Open("POST", ep->url + "/chat/completions");
-        if (!opened && !Aborted()) {
-            vTaskDelay(pdMS_TO_TICKS(400));
-            opened = http->Open("POST", ep->url + "/chat/completions");
-        }
+        auto opened = OpenWithRetry(*http, "POST", ep->url + "/chat/completions", "LLM",
+                                    [this]() { return Aborted(); });
         if (!opened) {
             cJSON_Delete(req);
             history_.pop_back();
@@ -873,10 +947,8 @@ std::unique_ptr<Http> RequestSpeech(const DirectApiConfig& cfg, const std::strin
     http->SetContent(std::string(json));
     cJSON_free(json);
     status = 0;
-    // TLS 握手的内存紧张时第一次会失败，缓一下再试一次（见 Transcribe 里的说明）
-    if (!http->Open("POST", cfg.tts.url + "/audio/speech")) {
-        vTaskDelay(pdMS_TO_TICKS(400));
-        if (!http->Open("POST", cfg.tts.url + "/audio/speech")) return nullptr;
+    if (!OpenWithRetry(*http, "POST", cfg.tts.url + "/audio/speech", "TTS", []() { return false; })) {
+        return nullptr;
     }
     auto s = http->GetStatusCode();
     status = s ? *s : 0;

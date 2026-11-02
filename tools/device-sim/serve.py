@@ -50,6 +50,7 @@ SCAN = [
 MAX_PROVIDERS, MAX_MODELS, MAX_PROVIDER_BYTES = 8, 30, 3800
 ROLES = ("chat", "vision", "asr", "tts")
 MEMORY_MAX_BYTES = 2000  # LongTermMemory::kMaxBytes
+MAX_SAVED_WIFI = 10  # esp-wifi-connect SsidManager 的 MAX_WIFI_SSID_COUNT
 
 
 def empty_settings():
@@ -81,7 +82,7 @@ def load_nvs():
 
 def save_nvs():
     NVS_FILE.write_text(json.dumps(nvs, ensure_ascii=False, indent=1), encoding="utf-8")
-net = {"mode": "off"}  # 设备当前网络：off / ap（配网热点）/ sta（连上路由器）
+net = {"mode": "off", "ssid": ""}  # 设备当前网络：off / ap（配网热点）/ sta（连上路由器）；ssid 是开机 / 配网时连的那个
 events = []  # 网页上发生的事，模拟器轮询后交给设备代码
 urls = {}
 
@@ -591,8 +592,10 @@ class SimHandler(Handler):
             tts_mp3[0] = False
             with lock:
                 wifi = nvs["wifi"][0] if nvs["wifi"] else ""
+                saved = list(nvs["wifi"])
+                net["ssid"] = wifi  # 模拟器开机连存储里第一个
                 speak = bool(nvs["directapi"].get("tts_speak", True))
-            return self.send(200, {"wifi_ssid": wifi, "api_ok": api_complete(), "ap_ssid": AP_SSID,
+            return self.send(200, {"wifi_ssid": wifi, "saved_wifi": saved, "api_ok": api_complete(), "ap_ssid": AP_SSID,
                                    "env": env, "voices": voice_labels(), "speak": speak, **urls})
         if u.path == "/sim/events":
             since = int(parse_qs(u.query).get("since", ["0"])[0])
@@ -736,9 +739,10 @@ class ApHandler(Handler):
                 if ssid in nvs["wifi"]:
                     nvs["wifi"].remove(ssid)
                 nvs["wifi"].insert(0, ssid)
+                net["ssid"] = ssid
             save_nvs()
             print(f"配网：已连接并保存 {ssid}")
-            push_event("wifi_saved", ssid=ssid)
+            push_event("wifi_saved", ssid=ssid, saved=list(nvs["wifi"]))
             return self.send(200, {"success": True})
         if u.path == "/exit":
             self.send(200, {"success": True})
@@ -769,6 +773,10 @@ class StaHandler(Handler):
                         "roles": roles, "prompt": c["prompt"], "memory_md": nvs["memory"],
                         "limits": {"providers": MAX_PROVIDERS, "models": MAX_MODELS, "memory": MEMORY_MAX_BYTES}}
             return self.send(200, data)
+        if u.path == "/wifi.json":
+            with lock:
+                current = net["ssid"] if net["mode"] == "sta" and env["router"] else ""
+                return self.send(200, {"current": current, "saved": list(nvs["wifi"]), "max": MAX_SAVED_WIFI})
         self.send(404, "not found", "text/plain")
 
     def do_POST(self):
@@ -783,7 +791,37 @@ class StaHandler(Handler):
             return self.save(req)
         if path == "/models":
             return self.models(req)
+        if path in ("/wifi/add", "/wifi/delete"):
+            return self.wifi(path, req)
         self.send(404, "not found", "text/plain")
+
+    def wifi(self, path, req):
+        """和 direct_api_config_server.cc 的 /wifi/add、/wifi/delete 一致：只改存储，不当场连。"""
+        err = lambda msg: self.send(200, {"ok": False, "error": msg})
+        ssid, password = str(req.get("ssid") or ""), str(req.get("password") or "")
+        with lock:
+            saved = nvs["wifi"]
+            if path == "/wifi/add":
+                if not ssid or len(ssid.encode()) > 32:
+                    return err("Wi-Fi 名称要填，且不超过 32 字节（约 10 个汉字）")
+                if password and not 8 <= len(password.encode()) <= 64:
+                    return err("密码要 8～63 个字符；开放网络留空")
+                exists = ssid in saved
+                if not exists and len(saved) >= MAX_SAVED_WIFI:
+                    return err(f"最多存 {MAX_SAVED_WIFI} 个，先删掉一个")
+                if not exists:
+                    saved.insert(0, ssid)  # SsidManager::AddSsid 插在最前面
+                message = "已更新密码" if exists else "已保存，到了它附近会自动连上"
+            else:
+                if ssid not in saved:
+                    return err("没有存这个 Wi-Fi")
+                saved.remove(ssid)
+                message = "已删除"
+            snapshot = list(saved)
+        save_nvs()
+        print(f"Wi-Fi 列表：{snapshot}")
+        push_event("wifi_list", saved=snapshot)
+        self.send(200, {"ok": True, "message": message})
 
     def save(self, req):
         err = lambda msg: self.send(200, {"ok": False, "error": msg})

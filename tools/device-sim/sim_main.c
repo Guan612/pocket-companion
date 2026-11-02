@@ -54,9 +54,9 @@ static void dev_log(char level, const char *tag, const char *fmt, ...)
 
 /* ---------- 网页那一面传进来的文字 ---------- */
 
-enum { TEXT_WIFI_SSID, TEXT_CONFIG_URL, TEXT_IP, TEXT_AP_URL, TEXT_AP_SSID, TEXT_VOICES, TEXT_COUNT };
+enum { TEXT_WIFI_SSID, TEXT_CONFIG_URL, TEXT_IP, TEXT_AP_URL, TEXT_AP_SSID, TEXT_VOICES, TEXT_SAVED_WIFI, TEXT_COUNT };
 static char s_str[4096];  // JS 先把 UTF-8 写进这里，再调 sim_set_text / sim_turn_* / sim_face_play 等
-static char s_text[TEXT_COUNT][256];
+static char s_text[TEXT_COUNT][400];  // 已存 Wi-Fi 列表最长 10 × 33 字节
 
 /* ---------- 设备状态 ---------- */
 
@@ -110,6 +110,7 @@ static int s_speak = 1;  // 语音播报（静音模式）：真值在 serve.py 
 static char s_hist_text[HIST_MAX][HIST_TEXT_LEN];
 static char s_hist_role[HIST_MAX][12];
 static int s_hist_n;
+static int s_hist_dropped;  // 记录满了从头上丢掉的条数（NomiDisplay 的 g_chat_dropped）
 
 static bool ascii_alnum(char c)
 {
@@ -133,6 +134,7 @@ static void hist_add(const char *role, const char *text)
         memmove(s_hist_text, s_hist_text + 1, (HIST_MAX - 1) * HIST_TEXT_LEN);
         memmove(s_hist_role, s_hist_role + 1, (HIST_MAX - 1) * sizeof(s_hist_role[0]));
         s_hist_n--;
+        s_hist_dropped++;
     }
     snprintf(s_hist_role[s_hist_n], sizeof(s_hist_role[0]), "%s", role);
     snprintf(s_hist_text[s_hist_n], HIST_TEXT_LEN, "%s", text);
@@ -140,6 +142,7 @@ static void hist_add(const char *role, const char *text)
 }
 
 static int hist_count(void) { return s_hist_n; }
+static int hist_dropped(void) { return s_hist_dropped; }
 
 static const char *hist_get(int index, const char **role)
 {
@@ -158,13 +161,13 @@ static void set_stage(stage_t stage)
     s_step = 0;
 }
 
-// Application::Alert：状态栏 + 表情 + 系统消息（NomiDisplay 把系统消息显示成 4 秒通知条）
+// Application::Alert：状态栏 + 表情 + 系统消息（NomiDisplay 把系统消息显示成 4 秒通知条，配网模式的提示一直挂着）
 static void alert(const char *status, const char *message, const char *emotion)
 {
     dev_log('W', "Application", "Alert [%s] %s: %s", emotion, status, message);
     nomi_ui_set_status(status);
     nomi_ui_set_emotion(emotion);
-    nomi_ui_notify(message, 4000);
+    nomi_ui_notify(message, s_stage == STAGE_WIFI_CONFIG ? 30 * 60 * 1000 : 4000);
 }
 
 // Application::HandleStateChangedEvent 里 kDeviceStateIdle 那段（NomiDisplay 没接 ClearChatMessages，字幕留着）
@@ -490,6 +493,7 @@ static nomi_state_t get_state(void)
     if (s_stage == STAGE_ACTIVATING || s_chat == CHAT_CONNECTING) return NOMI_STATE_CONNECTING;
     if (s_chat == CHAT_LISTENING) return NOMI_STATE_LISTENING;
     if (s_chat == CHAT_SPEAKING) return NOMI_STATE_SPEAKING;
+    if (s_stage == STAGE_WIFI_CONFIG) return NOMI_STATE_WIFI_SETUP;
     return NOMI_STATE_IDLE;
 }
 
@@ -539,6 +543,10 @@ static const char *get_text(const char *key)
         snprintf(buf, sizeof(buf), "%s（信号 -42 dBm）", s_text[TEXT_WIFI_SSID]);
         return buf;
     }
+    if (!strcmp(key, "wifi_ssid")) return online ? s_text[TEXT_WIFI_SSID] : "";
+    if (!strcmp(key, "saved_wifi")) return s_text[TEXT_SAVED_WIFI];  // serve.py 设备存储里的列表
+    if (!strcmp(key, "hotspot")) return s_stage == STAGE_WIFI_CONFIG ? s_text[TEXT_AP_SSID] : "";
+    if (!strcmp(key, "hotspot_url")) return s_stage == STAGE_WIFI_CONFIG ? s_text[TEXT_AP_URL] : "";
     if (!strcmp(key, "ip")) return online ? s_text[TEXT_IP] : "";
     if (!strcmp(key, "config_url")) return online && s_stage == STAGE_READY ? s_text[TEXT_CONFIG_URL] : "";
     if (!strcmp(key, "version")) return "Pocket Companion " FW_VERSION "（模拟器）";
@@ -648,6 +656,7 @@ void sim_init(uint32_t ms, int has_wifi, int api_ok, int router, int speak)
         .action = action,
         .history_count = hist_count,
         .history_get = hist_get,
+        .history_dropped = hist_dropped,
     };
     // 没拿到小智字体时退回 LVGL 自带的中文子集（缺字较多）
     const lv_font_t *font = s_font_bin ? cbin_font_create(s_font_bin) : NULL;

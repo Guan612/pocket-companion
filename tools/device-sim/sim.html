@@ -345,7 +345,7 @@ button{font:inherit;color:var(--fg)}
     homeSsid=cfg.wifi_ssid||homeSsid;
     apiOk=cfg.api_ok;
     setText(0,cfg.wifi_ssid);setText(1,cfg.settings_url.shown);setText(2,cfg.device_ip);
-    setText(3,cfg.ap_url.shown);setText(4,cfg.ap_ssid);setText(5,cfg.voices.join(String.fromCharCode(10)));
+    setText(3,cfg.ap_url.shown);setText(4,cfg.ap_ssid);setText(5,cfg.voices.join(String.fromCharCode(10)));setText(6,(cfg.saved_wifi||[]).join(String.fromCharCode(10)));
     seq=(await (await fetch('/sim/events?since=0')).json()).seq;  // 开机前的旧事件不再处理
     lastNet=-1;lastStage=-1;
     log(`--- ${why}：${cfg.wifi_ssid?'存过 Wi-Fi「'+cfg.wifi_ssid+'」':'没存 Wi-Fi'}，API ${cfg.api_ok?'已配好':'未配置'} ---`,'S');
@@ -362,7 +362,8 @@ button{font:inherit;color:var(--fg)}
       const r=await (await fetch('/sim/events?since='+seq)).json();
       for(const ev of r.events){
         if(!e)break;
-        if(ev.type==='wifi_saved'){homeSsid=ev.ssid;setText(0,ev.ssid);e.sim_wifi_saved()}
+        if(ev.type==='wifi_saved'){homeSsid=ev.ssid;setText(0,ev.ssid);setText(6,(ev.saved||[]).join(String.fromCharCode(10)));e.sim_wifi_saved()}
+        else if(ev.type==='wifi_list'){setText(6,(ev.saved||[]).join(String.fromCharCode(10)))}
         else if(ev.type==='ap_exit')e.sim_ap_exit();
         else if(ev.type==='settings_saved'){apiOk=ev.api_ok;setText(5,(ev.voices||[]).join(String.fromCharCode(10)));e.sim_settings_saved(ev.api_ok?1:0)}
       }
