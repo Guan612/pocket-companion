@@ -1151,6 +1151,9 @@ idf_component_register(SRCS ${SOURCES}
                         app_update
                         spi_flash
                         mbedtls
+                        # spotpear-esp32s3-max35 的电台 / 播客取网页用（连接、握手有超时）。
+                        # 组件依赖在读到 CONFIG_ 之前就要定，没法按板子加；别的板子不引用就不会链进去
+                        esp_http_client
                         console
                         efuse
                         bt

@@ -93,6 +93,76 @@ def radio_search(query):
     return None
 
 
+MAX_PODCASTS = 10  # NomiPodcast 的 kMaxSubs
+
+
+def podcast_list():
+    """订阅（NomiPodcast 存在 NVS 的 nomi_pod/list）。调用方持有 lock。"""
+    if nvs.get("podcasts") is None:
+        nvs["podcasts"] = []
+    return nvs["podcasts"]
+
+
+def apple_search(query, limit=6):
+    """NomiPodcast::SearchApple：Apple 播客目录按名字搜。"""
+    url = f"https://itunes.apple.com/search?media=podcast&entity=podcast&limit={limit}&term=" + quote(query)
+    try:
+        with urllib.request.urlopen(urllib.request.Request(url, headers={"User-Agent": "PocketCompanion/1.0"}), timeout=10) as r:
+            items = json.loads(r.read()).get("results", [])
+    except Exception:
+        return None
+    return [{"name": i.get("collectionName", ""), "feed": i.get("feedUrl", ""), "art": i.get("artworkUrl100", "")}
+            for i in items if i.get("collectionName") and i.get("feedUrl")]
+
+
+def _xml_field(xml, tag, attr=None):
+    import html as _html
+    m = re.search(r"<" + re.escape(tag) + r"(?=[\s>/])([^>]*)>", xml)
+    if not m:
+        return ""
+    if attr:
+        a = re.search(r"\s" + re.escape(attr) + r"=([\"'])(.*?)\1", m.group(1))
+        return _html.unescape(a.group(2)) if a else ""
+    end = xml.find("</" + tag + ">", m.end())
+    if end < 0:
+        return ""
+    text = xml[m.end():end]
+    cd = re.search(r"<!\[CDATA\[(.*?)\]\]>", text, re.S)
+    return (cd.group(1) if cd else _html.unescape(text)).strip()
+
+
+def fetch_feed(feed):
+    """NomiPodcast::FetchEpisodes：RSS 只读最新 10 期（有的有好几 MB），20 秒为限。返回 (节目名, 节目单)。"""
+    months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+    body, deadline = b"", time.time() + 20
+    try:
+        with urllib.request.urlopen(urllib.request.Request(feed, headers={"User-Agent": "PocketCompanion/1.0"}), timeout=10) as r:
+            while body.count(b"</item>") < 10 and len(body) < 1536 * 1024 and time.time() < deadline:
+                chunk = r.read(16384)
+                if not chunk:
+                    break
+                body += chunk
+    except Exception:
+        if not body:
+            return None, []
+    text = body.decode("utf-8", "replace")
+    first = text.find("<item")
+    channel = _xml_field(text[:first] if first > 0 else text, "title")
+    eps = []
+    for item in re.findall(r"<item[\s>](.*?)</item>", text, re.S)[:10]:
+        url = _xml_field(item, "enclosure", "url")
+        if not url:
+            continue
+        d = _xml_field(item, "itunes:duration")
+        parts = [int(x) for x in re.findall(r"\d+", d)][:3]
+        dur = sum(v * 60 ** (len(parts) - 1 - i) for i, v in enumerate(parts)) if parts else 0
+        pub = _xml_field(item, "pubDate")
+        m = re.search(r"(\d{1,2}) (" + "|".join(months) + ")", pub)
+        date = f"{months.index(m.group(2)) + 1}月{int(m.group(1))}日" if m else ""
+        eps.append({"title": _xml_field(item, "title"), "url": url, "duration": dur, "date": date})
+    return channel, eps
+
+
 def empty_settings():
     return {"providers": [], "keys": {}, "roles": {r: {"p": "", "m": ""} for r in ROLES},
             "asr_lang": "", "tts_voice": "", "tts_voices": [], "tts_speak": True, "prompt": "", "city": ""}
@@ -232,6 +302,11 @@ TOOLS = [
     {"type": "function", "function": {"name": "self.radio.play",
      "description": "放网络电台 / 音乐。主人说\"放点音乐\"\"来点轻音乐\"\"听新闻\"\"放中国之声\"\"换个台\"时调用。station：台名（收藏的台见系统提示），也可以是想听的类型或别的台名（会去网上的电台目录搜）；\"下一个\"\"上一个\"换台；空字符串接着放上次的台。调用后把这句回答说完，设备就安静下来开始放。",
      "parameters": {"type": "object", "properties": {"station": {"type": "string", "maxLength": 60}}}}},
+    {"type": "function", "function": {"name": "self.podcast.play",
+     "description": "放播客。主人说\"放《忽左忽右》最新一期\"\"听播客\"时调用。podcast：播客名（订阅的见系统提示；没订阅的也行，会去 Apple 播客目录搜）；episode：哪一期，空 = 最新一期，\"上一期\" = 倒数第二期，也可以是标题里的关键词。调用后把这句回答说完，设备就安静下来开始放。",
+     "parameters": {"type": "object", "properties": {"podcast": {"type": "string"}, "episode": {"type": "string"}}}}},
+    {"type": "function", "function": {"name": "self.podcast.seek", "description": "播客快进 / 快退。seconds：正数快进、负数倒回。",
+     "parameters": {"type": "object", "properties": {"seconds": {"type": "integer"}}, "required": ["seconds"]}}},
     {"type": "function", "function": {"name": "self.radio.stop", "description": "停掉电台 / 音乐。主人说\"关掉音乐\"\"别放了\"\"停\"时调用。",
      "parameters": {"type": "object", "properties": {}}}},
     {"type": "function", "function": {"name": "self.camera.look",
@@ -362,6 +437,29 @@ def call_tool(name, args, device, actions):
             return f"收藏里没有，网上的电台目录也没搜到「{q}」；可以换个说法，或在网页设置页添加电台地址"
         actions.append({"type": "radio", "index": -1, **found})
         return f"搜到「{found['name']}」，马上放；主人想以后还听可以说\"收藏这个台\""
+    if name == "self.podcast.play":  # NomiPodcast：订阅里找，找不到去 Apple 目录搜；读 RSS 挑一期
+        q, which = str(a.get("podcast", "")).strip(), str(a.get("episode", "")).strip()
+        if not q:
+            return "（模拟器）接着放请在屏幕上点播放"
+        with lock:
+            subs = [dict(p) for p in podcast_list()]
+        p = next((p for p in subs if q.lower() in p["name"].lower() or p["name"].lower() in q.lower()), None)
+        if not p:
+            found = apple_search(q, 1)
+            if not found:
+                return f"订阅里没有，Apple 播客目录也没搜到「{q}」"
+            p = found[0]
+        _, eps = fetch_feed(p["feed"])
+        if not eps:
+            return f"《{p['name']}》的节目单读不到"
+        pick = 1 if which in ("上一期", "前一期") and len(eps) > 1 else next(
+            (i for i, ep in enumerate(eps) if which and which not in ("最新", "最新一期") and which in ep["title"]), 0)
+        actions.append({"type": "podcast", "podcast": p, "episode": eps[pick]})
+        actions.append({"type": "exit_chat"})
+        return f"开始放《{p['name']}》：{eps[pick]['title']}"
+    if name == "self.podcast.seek":
+        actions.append({"type": "pod_seek", "seconds": int(a.get("seconds", 0))})
+        return "好的"
     if name == "self.radio.stop":
         actions.append({"type": "radio_stop"})
         return "已停止"
@@ -408,6 +506,9 @@ def chat(cfg, user_text, device, actions, log):
             names = "、".join(s["name"] for s in radio_list())
         system += ("\n\n电台：" + (f"正在放「{radio_now['name']}」" if radio_now["index"] > -2 else "没在放") +
                    f"。收藏的台：{names}。")
+        with lock:  # NomiPodcast::PromptContext
+            pods = "、".join(p["name"] for p in podcast_list())
+        system += f"\n订阅的播客：{pods}。" if pods else "\n还没订阅播客。"
         if with_tools:
             system += TOOLS_HINT
         req = {"model": llm["model"],
@@ -673,10 +774,28 @@ class SimHandler(Handler):
                 speak = bool(nvs["directapi"].get("tts_speak", True))
                 city = nvs["directapi"].get("city", "")
                 radio = [dict(s) for s in radio_list()]
+                podcasts = [dict(p) for p in podcast_list()]
             radio_now.update(index=-2, name="")
             return self.send(200, {"wifi_ssid": wifi, "saved_wifi": saved, "api_ok": api_complete(), "ap_ssid": AP_SSID,
-                                   "env": env, "voices": voice_labels(), "speak": speak, "city": city, "radio": radio,
+                                   "env": env, "voices": voice_labels(), "speak": speak, "city": city, "radio": radio, "podcasts": podcasts,
                                    **urls})
+        if u.path == "/sim/pod/episodes":  # 屏幕上点开一个订阅：读 RSS（NomiPodcast::Open）
+            i = int(parse_qs(u.query).get("index", ["-1"])[0])
+            with lock:
+                subs = [dict(p) for p in podcast_list()]
+            if not 0 <= i < len(subs):
+                return self.send(200, {"ok": False, "episodes": []})
+            _, eps = fetch_feed(subs[i]["feed"])
+            return self.send(200, {"ok": bool(eps), "episodes": eps})
+        if u.path == "/sim/img":  # 封面：浏览器跨域取不到，这里代取
+            src = parse_qs(u.query).get("u", [""])[0]
+            if not src.startswith(("http://", "https://")):
+                return self.send(400, "bad url", "text/plain")
+            try:
+                with urllib.request.urlopen(urllib.request.Request(src, headers={"User-Agent": "PocketCompanion/1.0"}), timeout=10) as r:
+                    return self.send(200, r.read(512 * 1024), r.headers.get("Content-Type", "image/jpeg"))
+            except Exception as e:
+                return self.send(502, str(e), "text/plain")
         if u.path == "/sim/events":
             since = int(parse_qs(u.query).get("since", ["0"])[0])
             with lock:
@@ -705,6 +824,7 @@ class SimHandler(Handler):
                     nvs["directapi"] = empty_settings()
                     nvs["memory"] = ""
                     nvs.pop("radio", None)
+                    nvs.pop("podcasts", None)
                 save_nvs()
             print("清除 Wi-Fi" if what == "wifi" else "恢复出厂：设备存储已清空")
             return self.send(200, {})
@@ -863,6 +983,10 @@ class StaHandler(Handler):
             with lock:
                 current = net["ssid"] if net["mode"] == "sta" and env["router"] else ""
                 return self.send(200, {"current": current, "saved": list(nvs["wifi"]), "max": MAX_SAVED_WIFI})
+        if u.path == "/podcast.json":  # NomiPodcast::ListJson
+            with lock:
+                return self.send(200, {"podcasts": [{"name": p["name"], "feed": p["feed"]} for p in podcast_list()],
+                                       "max": MAX_PODCASTS})
         if u.path == "/radio.json":  # NomiRadio::ListJson
             with lock:
                 return self.send(200, {"stations": list(radio_list()), "max": MAX_STATIONS, "playing": radio_now["index"]})
@@ -884,7 +1008,57 @@ class StaHandler(Handler):
             return self.wifi(path, req)
         if path in ("/radio/add", "/radio/delete", "/radio/play"):
             return self.radio(path, req)
+        if path.startswith("/podcast/"):
+            return self.podcast(path, req)
         self.send(404, "not found", "text/plain")
+
+    def podcast(self, path, req):
+        """和 NomiPodcast::SearchJson / SubscribeJson / DeleteJson / PlayJson 一致。"""
+        err = lambda msg: self.send(200, {"ok": False, "error": msg})
+        if path == "/podcast/search":
+            q = str(req.get("q") or "").strip()
+            if not q:
+                return err("先填要搜的播客名")
+            found = apple_search(q)
+            return err("搜索失败，检查网络后再试") if found is None else self.send(200, {"ok": True, "results": found})
+        if path == "/podcast/subscribe":
+            p = {k: str(req.get(k) or "").strip() for k in ("name", "feed", "art")}
+            if not p["feed"].startswith(("http://", "https://")):
+                return err("RSS 地址要以 http:// 或 https:// 开头")
+            if not p["name"]:
+                p["name"], eps = fetch_feed(p["feed"])
+                if not p["name"] or not eps:
+                    return err("这个地址读不到节目，确认是播客的 RSS 地址")
+            with lock:
+                subs = podcast_list()
+                if any(s["feed"] == p["feed"] for s in subs):
+                    return err("已经订阅了")
+                if len(subs) >= MAX_PODCASTS:
+                    return err("最多订阅 10 个，先删掉几个")
+                subs.append(p)
+                snapshot = [dict(s) for s in subs]
+        elif path in ("/podcast/delete", "/podcast/play"):
+            i = req.get("index")
+            with lock:
+                subs = podcast_list()
+                if not isinstance(i, int) or not 0 <= i < len(subs):
+                    return err("没有这个订阅")
+                p = dict(subs[i])
+                if path == "/podcast/delete":
+                    subs.pop(i)
+                snapshot = [dict(s) for s in subs]
+            if path == "/podcast/play":  # 设备上交给后台任务，这里也不让网页等
+                def play():
+                    _, eps = fetch_feed(p["feed"])
+                    if eps:
+                        push_event("pod_play", podcast=p, episode=eps[0])
+                threading.Thread(target=play, daemon=True).start()
+                return self.send(200, {"ok": True})
+        else:
+            return self.send(404, "not found", "text/plain")
+        save_nvs()
+        push_event("pod_list", podcasts=snapshot)
+        self.send(200, {"ok": True})
 
     def radio(self, path, req):
         """和 NomiRadio::AddFromJson / DeleteFromJson / PlayFromJson 一致。"""

@@ -280,6 +280,8 @@ button{font:inherit;color:var(--fg)}
       else if(a.type==='radio'){if(a.index<0){radioTemp={name:a.name,url:a.url};setStr(a.name)}x.sim_radio_play(a.index)}
       else if(a.type==='radio_step')x.sim_radio_step(a.delta);
       else if(a.type==='radio_stop')x.sim_radio_stop();
+      else if(a.type==='podcast')playEpisode(a.podcast,a.episode);
+      else if(a.type==='pod_seek')podSeek+=a.seconds;
       else x.sim_apply(a.type==='volume'?0:1,a.value);
     }
     if(res.error){setStr(res.error);x.sim_turn_error();return}
@@ -353,6 +355,7 @@ button{font:inherit;color:var(--fg)}
     setText(3,cfg.ap_url.shown);setText(4,cfg.ap_ssid);setText(5,cfg.voices.join(String.fromCharCode(10)));setText(6,(cfg.saved_wifi||[]).join(String.fromCharCode(10)));
     setText(7,cfg.city||'');
     radioStations=cfg.radio||[];radioTemp=null;setText(8,radioStations.map(s=>s.name).join(String.fromCharCode(10)));
+    podcasts=cfg.podcasts||[];podNow=null;setText(9,podcasts.map(p=>p.name).join(String.fromCharCode(10)));
     seq=(await (await fetch('/sim/events?since=0')).json()).seq;  // 开机前的旧事件不再处理
     lastNet=-1;lastStage=-1;
     log(`--- ${why}：${cfg.wifi_ssid?'存过 Wi-Fi「'+cfg.wifi_ssid+'」':'没存 Wi-Fi'}，API ${cfg.api_ok?'已配好':'未配置'} ---`,'S');
@@ -376,6 +379,8 @@ button{font:inherit;color:var(--fg)}
         else if(ev.type==='radio_list'){radioStations=ev.stations||[];setText(8,radioStations.map(s=>s.name).join(String.fromCharCode(10)))}
         else if(ev.type==='radio_play')e.sim_radio_play(ev.index);
         else if(ev.type==='radio_stop')e.sim_radio_stop();
+        else if(ev.type==='pod_list'){podcasts=ev.podcasts||[];setText(9,podcasts.map(p=>p.name).join(String.fromCharCode(10)))}
+        else if(ev.type==='pod_play')playEpisode(ev.podcast,ev.episode);
       }
       seq=r.seq;
     }catch{}finally{polling=false}
@@ -457,13 +462,70 @@ button{font:inherit;color:var(--fg)}
   radio.addEventListener('playing',()=>e&&radioKey&&e.sim_radio_set_state(2));
   radio.addEventListener('waiting',()=>e&&radioKey&&e.sim_radio_set_state(1));
   radio.addEventListener('error',()=>{if(e&&radioKey){e.sim_radio_set_state(4);log('W (radio) 浏览器放不了这个流：'+radioKey,'W')}});
+  // ---------- 播客：节目单由 serve.py 读 RSS，声音用同一个 <audio>（暂停接着放、快进快退浏览器都会） ----------
+  let podcasts=[],podEpisodes=[],podOpened=-1,podNow=null,podStart=0,podSeek=0,podSaved=0;
+  const NL=String.fromCharCode(10),TAB=String.fromCharCode(9);
+  const podPos=url=>{try{return +localStorage.getItem('pod:'+url)||0}catch{return 0}};  // 听到哪（设备上存 NVS）
+  const savePodPos=(url,s)=>{try{localStorage.setItem('pod:'+url,String(Math.floor(s)))}catch{}};
+  const podMeta=ep=>[ep.date,ep.duration?Math.round(ep.duration/60)+' 分钟':''].filter(Boolean).join(' · ');
+  // 封面：经 serve.py 取（跨域），画成 88 见方写进设备的 RGB565 缓冲
+  const loadCover=async art=>{
+    if(!art)return;
+    try{
+      const blob=await (await fetch('/sim/img?u='+encodeURIComponent(art.replace('100x100bb','88x88bb')))).blob();
+      const bmp=await createImageBitmap(blob),c=new OffscreenCanvas(88,88),g=c.getContext('2d');
+      g.drawImage(bmp,0,0,88,88);
+      const px=g.getImageData(0,0,88,88).data,out=new Uint16Array(e.memory.buffer,e.sim_cover_buffer(),88*88);
+      for(let i=0;i<88*88;i++)out[i]=((px[i*4]&0xF8)<<8)|((px[i*4+1]&0xFC)<<3)|(px[i*4+2]>>3);
+      e.sim_cover_ready(1);
+    }catch(err){log('W (podcast) 封面取不到：'+err,'W')}
+  };
+  const playEpisode=(pod,ep)=>{
+    if(!e||!pod||!ep)return;
+    podNow={pod,ep};podStart=Math.max(0,podPos(ep.url)-3);podSaved=podStart;
+    setText(11,pod.name+TAB+ep.title);
+    e.sim_cover_ready(0);
+    e.sim_pod_start(podStart,ep.duration||0);
+    loadCover(pod.art);
+  };
+  radio.addEventListener('ended',()=>{if(e&&podNow&&e.sim_pod_episode()){savePodPos(podNow.ep.url,0);e.sim_radio_stop()}});
+
   const radioTick=()=>{
-    const idx=e.sim_radio_index(),st=idx>=0?radioStations[idx]:radioTemp;
-    const key=e.sim_radio_audible()&&st?st.url:'';
-    if(key!==radioKey){
-      radioKey=key;
-      if(key){radio.src=key;radio.play().catch(()=>e.sim_radio_set_state(4))}
-      else{radio.pause();radio.removeAttribute('src');radio.load()}
+    // 屏幕上点出来的：打开节目单、放第几期
+    const o=e.sim_pod_open_request();
+    if(o>=0){
+      podOpened=o;podEpisodes=[];
+      fetch('/sim/pod/episodes?index='+o).then(r=>r.json()).then(r=>{
+        if(!e||podOpened!==o)return;
+        podEpisodes=r.episodes||[];
+        setText(10,podEpisodes.map(ep=>ep.title.split(TAB).join(' ')+TAB+podMeta(ep)).join(NL));
+        e.sim_pod_loaded(r.ok?1:0);
+      }).catch(()=>e&&e.sim_pod_loaded(0));
+    }
+    const p=e.sim_pod_play_request();
+    if(p>=0&&podEpisodes[p])playEpisode(podcasts[podOpened],podEpisodes[p]);
+    const idx=e.sim_radio_index(),episode=e.sim_pod_episode()&&podNow;
+    const st=episode?{name:podNow.ep.title,url:podNow.ep.url}:idx>=0?radioStations[idx]:radioTemp;
+    if(episode){
+      // 节目：换了期才换地址（暂停时地址留着，接着放）；对话、暂停时停下
+      if(radioKey!==st.url){radioKey=st.url;radio.src=st.url+'#t='+podStart}
+      const d=e.sim_pod_seek_request()+podSeek,to=e.sim_pod_seek_to_request();
+      podSeek=0;
+      if(d)radio.currentTime=Math.max(0,radio.currentTime+d);
+      if(to>=0)radio.currentTime=to;
+      const audible=e.sim_radio_audible();
+      if(audible&&radio.paused&&!radio.ended)radio.play().catch(()=>e.sim_radio_set_state(4));
+      if(!audible&&!radio.paused)radio.pause();
+      const pos=radio.currentTime||podStart;
+      e.sim_pod_progress(Math.floor(pos),isFinite(radio.duration)?Math.floor(radio.duration):0);
+      if(Math.abs(pos-podSaved)>=5){podSaved=pos;savePodPos(st.url,pos)}
+    }else{
+      const key=e.sim_radio_audible()&&st?st.url:'';
+      if(key!==radioKey){
+        radioKey=key;
+        if(key){radio.src=key;radio.play().catch(()=>e.sim_radio_set_state(4))}
+        else{radio.pause();radio.removeAttribute('src');radio.load()}
+      }
     }
     radio.volume=Math.min(1,e.sim_volume()/100);
     const rep=e.sim_radio_wanted()?idx+'|'+(st?st.name:''):'-2|';  // 报给 serve.py：网页上的播放按钮、系统提示里的"正在放"

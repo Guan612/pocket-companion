@@ -6,6 +6,7 @@
 #include "display/lvgl_display/lvgl_theme.h"
 #include "face_script.h"
 #include "nomi_clock.h"
+#include "nomi_podcast.h"
 #include "nomi_radio.h"
 #include "nomi_ui.h"
 #include "settings.h"
@@ -170,6 +171,11 @@ int GetInt(const char* key, int def) {
     if (!strcmp(key, "weather_code")) return NomiClock::GetInstance().WeatherCode();
     if (!strcmp(key, "radio_state")) return NomiRadio::GetInstance().GetState();
     if (!strcmp(key, "radio_index")) return NomiRadio::GetInstance().CurrentIndex();
+    if (!strcmp(key, "pod_playing")) return NomiRadio::GetInstance().IsEpisode();
+    if (!strcmp(key, "pod_pos")) return NomiRadio::GetInstance().Position();
+    if (!strcmp(key, "pod_dur")) return NomiRadio::GetInstance().Current().duration;
+    if (!strcmp(key, "pod_opened")) return NomiPodcast::GetInstance().Opened();
+    if (!strcmp(key, "pod_load")) return NomiPodcast::GetInstance().LoadState();
     if (!strcmp(key, NOMI_KEY_PERSONA)) {
         // 按当前提示词反查是哪个预设；网页里改过就算自定义
         std::string prompt = Settings(kDirectApiNs).GetString("prompt");
@@ -298,8 +304,22 @@ const char* GetText(const char* key) {
         text = NomiRadio::GetInstance().Title();
     } else if (!strcmp(key, "radio_list")) {
         text = NomiRadio::GetInstance().ListText();
+    } else if (!strcmp(key, "pod_list")) {
+        text = NomiPodcast::GetInstance().ListText();
+    } else if (!strcmp(key, "pod_episodes")) {
+        text = NomiPodcast::GetInstance().EpisodesText();
+    } else if (!strcmp(key, "pod_name") || !strcmp(key, "pod_title")) {
+        auto st = NomiRadio::GetInstance().Current();
+        if (st.episode) text = !strcmp(key, "pod_name") ? st.podcast : st.name;
     }
     return text.c_str();
+}
+
+// 播客封面：NomiPodcast 两块缓冲轮着用，换图时 version 加一
+const uint16_t* GetImage(const char* key, int* size, int* version) {
+    if (strcmp(key, "pod_cover") != 0) return nullptr;
+    *size = NomiPodcast::kCoverSize;
+    return NomiPodcast::GetInstance().Cover(*version);
 }
 
 void Action(const char* name) {
@@ -316,6 +336,20 @@ void Action(const char* name) {
         NomiRadio::GetInstance().Step(!strcmp(name, "radio_next") ? 1 : -1);
     } else if (!strncmp(name, "radio_play:", 11)) {
         NomiRadio::GetInstance().Play(atoi(name + 11));
+    } else if (!strncmp(name, "pod_open:", 9)) {
+        NomiPodcast::GetInstance().Open(atoi(name + 9));  // 拉节目单在后台任务里
+    } else if (!strcmp(name, "pod_back")) {
+        NomiPodcast::GetInstance().Back();
+    } else if (!strncmp(name, "pod_play:", 9)) {
+        NomiPodcast::GetInstance().PlayOpened(atoi(name + 9));
+    } else if (!strncmp(name, "pod_seek:", 9)) {
+        auto& radio = NomiRadio::GetInstance();
+        radio.Seek(atoi(name + 9));
+        if (!radio.Wanted()) radio.Toggle();
+    } else if (!strncmp(name, "pod_seek_to:", 12)) {
+        auto& radio = NomiRadio::GetInstance();
+        radio.SeekTo(atoi(name + 12));
+        if (!radio.Wanted()) radio.Toggle();
     } else if (!strcmp(name, "reconfigure_wifi")) {
         app.Schedule([]() { static_cast<WifiBoard&>(Board::GetInstance()).EnterWifiConfigMode(); });
     } else if (!strcmp(name, "factory_reset")) {
@@ -410,6 +444,7 @@ void NomiDisplay::SetupUI() {
         .history_count = HistoryCount,
         .history_get = HistoryGet,
         .history_dropped = HistoryDropped,
+        .get_image = GetImage,
     };
     // 先用内置字体，资源分区里的完整中文字体加载后会经 SetTextFont 换上
     nomi_ui_create(screen, face_buf_, &BUILTIN_TEXT_FONT, &callbacks);

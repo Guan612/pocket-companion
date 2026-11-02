@@ -393,7 +393,7 @@ std::string Start() {
     if (s_server == nullptr) {
         httpd_config_t config = HTTPD_DEFAULT_CONFIG();
         config.stack_size = 12288;  // /models 里有 HTTPS 请求
-        config.max_uri_handlers = 7 + 8;  // 自己的 7 个 + 板子挂的
+        config.max_uri_handlers = 7 + 13;  // 自己的 7 个 + 板子挂的
         if (httpd_start(&s_server, &config) != ESP_OK) {
             ESP_LOGE(TAG, "Failed to start config server");
             return "";

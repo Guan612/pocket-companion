@@ -57,19 +57,25 @@ typedef struct {
     // alarms（接下来要响的闹钟，按时间排，一行一个 "编号\t什么时候\t事由"）。
     // get_int("weather_code") 是 WMO 天气代码，夜里加 1000，没有天气时 -1。
     // 电台页：radio_name（当前台名）、radio_title（流里带的歌名，没有为空）、radio_list（台名，'\n' 分隔）；
-    // get_int("radio_state") 0 没在放 / 1 连接中 / 2 在放 / 3 对话中暂停 / 4 连不上，
+    // get_int("radio_state") 0 没在放 / 1 连接中 / 2 在放 / 3 对话中暂停 / 4 连不上 / 5 为加载别的暂停，
     // get_int("radio_index") 当前台在台单里的下标（搜来没收藏的台为 -1）。
+    // 播客：pod_list（订阅名）、pod_episodes（打开的订阅最新几期，一行一期 "标题\t日期 · 时长"）、
+    // pod_name / pod_title（正在放的播客名、这期标题）；get_int：pod_playing（放的是不是播客）、
+    // pod_opened（打开的是第几个订阅，-1 在订阅列表）、pod_load（0 好了 1 加载中 2 失败）、pod_pos / pod_dur（秒）。
     // 不认识的 key 返回空串
     const char *(*get_text)(const char *key);
     // 动作：test_api、reconfigure_wifi、factory_reset、alarm_stop / alarm_snooze（响铃时"知道了" /
     // "稍后提醒"）、alarm_delete:<编号>（时钟页上删闹钟）、radio_toggle / radio_next / radio_prev、
-    // radio_play:<下标>（电台页）
+    // radio_play:<下标>（电台页）、pod_open:<下标> / pod_back / pod_play:<下标>、pod_seek:<秒>、pod_seek_to:<秒>
     void (*action)(const char *name);
     // 聊天历史（第二页）：下标 0 最旧；role 为 "user" / "assistant"，文本只需在下一次调用前有效
     int (*history_count)(void);
     const char *(*history_get)(int index, const char **role);
     // 可选：记录满了从头上丢掉的消息总数（只增不减）。有它历史页只增量更新，不用每次重建整个列表
     int (*history_dropped)(void);
+    // 可选：图片（RGB565，size 见方），"pod_cover" 是正在放的播客的封面；没有返回 NULL。
+    // 缓冲要一直有效（换图时换一块新的、version 加一）
+    const uint16_t *(*get_image)(const char *key, int *size, int *version);
 } nomi_ui_callbacks_t;
 
 // face_buf：480×320 RGB565 画布缓冲，由调用方分配；font：中文字体

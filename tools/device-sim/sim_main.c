@@ -54,9 +54,9 @@ static void dev_log(char level, const char *tag, const char *fmt, ...)
 
 /* ---------- 网页那一面传进来的文字 ---------- */
 
-enum { TEXT_WIFI_SSID, TEXT_CONFIG_URL, TEXT_IP, TEXT_AP_URL, TEXT_AP_SSID, TEXT_VOICES, TEXT_SAVED_WIFI, TEXT_CITY, TEXT_RADIO_LIST, TEXT_COUNT };
+enum { TEXT_WIFI_SSID, TEXT_CONFIG_URL, TEXT_IP, TEXT_AP_URL, TEXT_AP_SSID, TEXT_VOICES, TEXT_SAVED_WIFI, TEXT_CITY, TEXT_RADIO_LIST, TEXT_POD_LIST, TEXT_POD_EPISODES, TEXT_POD_NOW, TEXT_COUNT };
 static char s_str[4096];  // JS 先把 UTF-8 写进这里，再调 sim_set_text / sim_turn_* / sim_face_play 等
-static char s_text[TEXT_COUNT][640];  // 已存 Wi-Fi 列表最长 10 × 33 字节，台单 20 个台名
+static char s_text[TEXT_COUNT][2048];  // 已存 Wi-Fi 列表最长 10 × 33 字节，台单 20 个台名
 
 /* ---------- 设备状态 ---------- */
 
@@ -630,6 +630,7 @@ void sim_alarm_ring(void) { alarm_add(2, "开会", -1); }
 
 static int s_radio_wanted, s_radio_index, s_radio_state = 1;  // state 由 JS 报：1 连接中 2 在放 4 连不上
 static char s_radio_temp[64];  // 搜来还没收藏的台名（index 为 -1）
+static int s_pod_episode;      // 现在的是播客节目（暂停了也算；放电台时清掉），见下面播客一节
 
 static int radio_count(void)
 {
@@ -657,6 +658,7 @@ static const char *radio_name(int index)
 
 static void radio_select(int index)
 {
+    s_pod_episode = 0;
     s_radio_index = index;
     s_radio_wanted = 1;
     s_radio_state = 1;
@@ -682,6 +684,61 @@ void sim_radio_step(int delta)
 {
     int n = radio_count();
     if (n) radio_select(((s_radio_index < 0 ? 0 : s_radio_index) + delta + n) % n);
+}
+
+/* ---------- 播客（对应 NomiPodcast）：节目单、声音、进度、封面都由 sim.html 弄，这里只记状态 ---------- */
+
+static int s_pod_pos, s_pod_dur;
+static int s_pod_opened = -1, s_pod_load;
+static int s_pod_open_req = -1, s_pod_play_req = -1, s_pod_seek_req, s_pod_seek_to = -1;
+static uint16_t s_cover[88 * 88];  // NomiPodcast::kCoverSize 见方，sim.html 画好写进来
+static int s_cover_ok, s_cover_version;
+
+// TEXT_POD_NOW 是 "播客名\t这期标题"
+static const char *pod_now(int title)
+{
+    static char buf[200];
+    const char *now = s_text[TEXT_POD_NOW], *tab = strchr(now, '\t');
+    if (!s_pod_episode || !tab) return "";
+    if (title) return tab + 1;
+    snprintf(buf, sizeof(buf), "%.*s", (int)(tab - now), now);
+    return buf;
+}
+
+static const uint16_t *get_image(const char *key, int *size, int *version)
+{
+    if (strcmp(key, "pod_cover") != 0 || !s_cover_ok) return NULL;
+    *size = 88;
+    *version = s_cover_version;
+    return s_cover;
+}
+
+// sim.html 每帧来取屏幕上点出来的请求，取走就清掉
+int sim_pod_open_request(void) { int r = s_pod_open_req; s_pod_open_req = -1; return r; }
+int sim_pod_play_request(void) { int r = s_pod_play_req; s_pod_play_req = -1; return r; }
+int sim_pod_seek_request(void) { int r = s_pod_seek_req; s_pod_seek_req = 0; return r; }
+int sim_pod_seek_to_request(void) { int r = s_pod_seek_to; s_pod_seek_to = -1; return r; }
+void sim_pod_loaded(int ok) { s_pod_load = ok ? 0 : 2; }
+int sim_pod_episode(void) { return s_pod_episode; }
+uint16_t *sim_cover_buffer(void) { return s_cover; }
+void sim_cover_ready(int ok) { s_cover_ok = ok; s_cover_version++; }
+
+// 开始放一期（名字和标题先写进 TEXT_POD_NOW）
+void sim_pod_start(int start, int duration)
+{
+    s_pod_episode = 1;
+    s_radio_wanted = 1;
+    s_radio_index = -1;
+    s_radio_state = 1;
+    s_pod_pos = start;
+    s_pod_dur = duration;
+    dev_log('I', "NomiRadio", "Play %s (from %ds)", pod_now(1), start);
+}
+
+void sim_pod_progress(int position, int duration)
+{
+    s_pod_pos = position;
+    if (duration > 0) s_pod_dur = duration;
 }
 
 /* ---------- nomi_ui 回调（对应 NomiDisplay） ---------- */
@@ -717,6 +774,11 @@ static int get_int(const char *key, int def)
         return s_chat != CHAT_IDLE || s_thinking ? 3 : s_radio_state;
     }
     if (!strcmp(key, "radio_index")) return s_radio_index;
+    if (!strcmp(key, "pod_playing")) return s_pod_episode;
+    if (!strcmp(key, "pod_pos")) return s_pod_pos;
+    if (!strcmp(key, "pod_dur")) return s_pod_dur;
+    if (!strcmp(key, "pod_opened")) return s_pod_opened;
+    if (!strcmp(key, "pod_load")) return s_pod_load;
     return def;
 }
 
@@ -763,6 +825,10 @@ static const char *get_text(const char *key)
     if (!strcmp(key, "radio_name")) return radio_name(s_radio_index);
     if (!strcmp(key, "radio_title")) return "";  // 浏览器拿不到流里的歌名
     if (!strcmp(key, "radio_list")) return s_text[TEXT_RADIO_LIST];
+    if (!strcmp(key, "pod_list")) return s_text[TEXT_POD_LIST];
+    if (!strcmp(key, "pod_episodes")) return s_text[TEXT_POD_EPISODES];
+    if (!strcmp(key, "pod_name")) return pod_now(0);
+    if (!strcmp(key, "pod_title")) return pod_now(1);
     return clock_text(key);
 }
 
@@ -775,6 +841,21 @@ static void action(const char *name)
         nomi_ui_alarm_hide();
     } else if (!strncmp(name, "alarm_delete:", 13)) {
         alarm_delete(atoi(name + 13));
+    } else if (!strncmp(name, "pod_open:", 9)) {
+        s_pod_opened = s_pod_open_req = atoi(name + 9);
+        s_pod_load = 1;
+    } else if (!strcmp(name, "pod_back")) {
+        s_pod_opened = -1;
+    } else if (!strncmp(name, "pod_play:", 9)) {
+        s_pod_play_req = atoi(name + 9);
+    } else if (!strncmp(name, "pod_seek:", 9)) {
+        s_pod_seek_req += atoi(name + 9);
+        s_radio_wanted = 1;
+    } else if (!strncmp(name, "pod_seek_to:", 12)) {
+        s_pod_seek_to = atoi(name + 12);
+        s_radio_wanted = 1;
+    } else if (!strcmp(name, "radio_toggle") && s_pod_episode) {
+        s_radio_wanted = !s_radio_wanted;  // 节目：暂停 / 接着放
     } else if (!strcmp(name, "radio_toggle")) {
         if (s_radio_wanted) s_radio_wanted = 0;
         else if (s_radio_index >= 0 || s_radio_temp[0]) radio_select(s_radio_index);
@@ -885,6 +966,7 @@ void sim_init(uint32_t ms, int has_wifi, int api_ok, int router, int speak)
         .history_count = hist_count,
         .history_get = hist_get,
         .history_dropped = hist_dropped,
+        .get_image = get_image,
     };
     // 没拿到小智字体时退回 LVGL 自带的中文子集（缺字较多）
     const lv_font_t *font = s_font_bin ? cbin_font_create(s_font_bin) : NULL;

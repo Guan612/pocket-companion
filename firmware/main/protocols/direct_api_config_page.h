@@ -107,6 +107,19 @@ button:disabled{opacity:.5}
 </div>
 </div>
 
+<div id="podCard" hidden>
+<h2>播客</h2>
+<div class="card">
+  <p class="hint">也可以跟它说「放《忽左忽右》最新一期」「订阅这个播客」。</p>
+  <div id="podList"></div>
+  <label>搜索<input id="podQuery" autocomplete="off" placeholder="播客名，比如：忽左忽右"></label>
+  <div class="row"><button id="podSearch">搜索</button><span id="podMsg" class="hint"></span></div>
+  <div id="podResults"></div>
+  <label>或者直接填 RSS 地址<input id="podFeed" autocomplete="off" placeholder="https://…"></label>
+  <div class="row"><button id="podAdd">订阅</button></div>
+</div>
+</div>
+
 <h2>人设提示词</h2>
 <textarea id="prompt" rows="4" placeholder="留空用默认提示词"></textarea>
 
@@ -437,6 +450,64 @@ $('#radioAdd').onclick = async () => {
   $('#radioAdd').disabled = false;
 };
 loadRadio();
+
+// 播客订阅：板子没挂 /podcast.json 时整块不显示
+const podMsg = (text, cls) => { $('#podMsg').textContent = text; $('#podMsg').className = 'hint ' + (cls || ''); };
+async function loadPod() {
+  let r;
+  try {
+    const res = await fetch('/podcast.json', {cache: 'no-store'});
+    if (!res.ok) return;
+    r = await res.json();
+  } catch (e) { return; }
+  $('#podCard').hidden = false;
+  const box = $('#podList');
+  box.innerHTML = r.podcasts.length ? '' : '<p class="hint">还没订阅。</p>';
+  r.podcasts.forEach((p, index) => {
+    const row = document.createElement('div');
+    row.className = 'row';
+    row.innerHTML = `<span style="flex:1;overflow-wrap:anywhere">${esc(p.name)}</span><button>播最新一期</button><button class="danger">删除</button>`;
+    const [play, del] = row.querySelectorAll('button');
+    play.onclick = async () => { podMsg('读节目单…'); await podPost('/podcast/play', {index}, '开始放了'); };
+    del.onclick = async () => { if (confirm(`取消订阅「${p.name}」？`)) await podPost('/podcast/delete', {index}); };
+    box.appendChild(row);
+  });
+  $('#podSearch').title = `已订阅 ${r.podcasts.length} / ${r.max} 个`;
+}
+async function podPost(path, body, done) {
+  try {
+    const r = await (await fetch(path, {method: 'POST', body: JSON.stringify(body)})).json();
+    podMsg(r.ok ? (done || '') : r.error, r.ok ? 'ok' : 'err');
+    if (r.ok) await loadPod();
+    return r;
+  } catch (e) { podMsg('请求失败：' + e.message, 'err'); return {}; }
+}
+$('#podSearch').onclick = async () => {
+  const q = $('#podQuery').value.trim();
+  if (!q) return podMsg('先填播客名', 'err');
+  $('#podSearch').disabled = true; podMsg('搜索中…');
+  const r = await podPost('/podcast/search', {q});
+  $('#podSearch').disabled = false;
+  const box = $('#podResults');
+  box.innerHTML = '';
+  if (!r.ok) return;
+  if (!r.results.length) return podMsg('没搜到，换个名字试试', 'err');
+  for (const p of r.results) {
+    const row = document.createElement('div');
+    row.className = 'row';
+    row.innerHTML = `<span style="flex:1;overflow-wrap:anywhere">${esc(p.name)}</span><button>订阅</button>`;
+    row.querySelector('button').onclick = async () => { if ((await podPost('/podcast/subscribe', p, '已订阅')).ok) box.innerHTML = ''; };
+    box.appendChild(row);
+  }
+};
+$('#podAdd').onclick = async () => {
+  const feed = $('#podFeed').value.trim();
+  if (!feed) return podMsg('先填 RSS 地址', 'err');
+  $('#podAdd').disabled = true; podMsg('读取中…');
+  if ((await podPost('/podcast/subscribe', {feed}, '已订阅')).ok) $('#podFeed').value = '';
+  $('#podAdd').disabled = false;
+};
+loadPod();
 
 // 读到当前设置之前不让保存，免得空页面把已有设置冲掉
 async function load() {
