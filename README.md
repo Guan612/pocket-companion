@@ -145,4 +145,8 @@ git subtree pull --prefix=firmware https://github.com/78/xiaozhi-esp32.git <tag>
 
 - 固件底座：[78/xiaozhi-esp32](https://github.com/78/xiaozhi-esp32)（MIT）
 
-许可证见 [LICENSE](LICENSE)。
+## 许可证
+
+本仓库以 [GNU AGPL v3](LICENSE) 发布：可以自由使用、修改、再分发，但发布修改版（包括作为网络服务给别人用）时要以同样的协议公开源码。
+
+`firmware/` 里来自小智上游的代码原本是 MIT 许可证，它的版权和许可声明保留在 [firmware/LICENSE](firmware/LICENSE)。
