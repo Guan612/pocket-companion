@@ -90,4 +90,12 @@
 // 20M 时 DVP 字节率太高，驱动乒乓搬运（半缓冲 12 行）余量不足会花屏；10M 够用且稳
 #define CAMERA_XCLK_HZ    10000000
 
+// TF 卡，SPI 模式（卡座的 D1/D2 没接，没有插卡检测脚）。CS、MISO 直连；CLK、MOSI 经 R65/R66（0R，选焊）
+// 接到 GPIO43/44，和 4G 座共用。GPIO43 另一种焊法（R30）下还是功放开关，见 nomi_sdcard.h
+#define SD_SPI_HOST  SPI3_HOST
+#define SD_CS_PIN    GPIO_NUM_13
+#define SD_MISO_PIN  GPIO_NUM_21
+#define SD_CLK_PIN   GPIO_NUM_43
+#define SD_MOSI_PIN  GPIO_NUM_44
+
 #endif  // _BOARD_CONFIG_H_

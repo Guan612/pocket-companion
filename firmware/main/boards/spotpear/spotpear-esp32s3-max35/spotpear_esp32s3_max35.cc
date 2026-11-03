@@ -16,6 +16,7 @@
 #include "nomi_music.h"
 #include "nomi_podcast.h"
 #include "nomi_radio.h"
+#include "nomi_sdcard.h"
 #include "nomi_ui.h"
 #include "power_save_timer.h"
 #include "wifi_board.h"
@@ -375,6 +376,11 @@ private:
         NomiRadio::GetInstance().RegisterTools();
         NomiPodcast::GetInstance().RegisterTools();
         NomiMusic::GetInstance().RegisterTools();
+        // TF 卡卸载后把 GPIO43 还给功放（R30 焊上的板子它是功放开关），电平按现在出不出声来
+        NomiSdCard::GetInstance().on_bus_released = [this]() {
+            gpio_set_direction(AUDIO_CODEC_PA_PIN, GPIO_MODE_OUTPUT);
+            gpio_set_level(AUDIO_CODEC_PA_PIN, GetAudioCodec()->output_enabled() ? 1 : 0);
+        };
 #if CONFIG_DIRECT_API
         // 每轮对话的系统提示词里带上现在几点、天气、已设的闹钟、电台（设"明早 7 点"要知道今天是哪天）
         DirectApiProtocol::context_provider = []() {
@@ -382,6 +388,9 @@ private:
                    NomiPodcast::GetInstance().PromptContext();
         };
         DirectApiConfigServer::on_city_changed = []() { NomiClock::GetInstance().RefreshWeather(); };
+        // 网页设置页的「SD 卡」卡片：每次读都当场检测
+        DirectApiConfigServer::AddJsonHandler("/sd.json", false,
+                                              [](const std::string&) { return NomiSdCard::GetInstance().StatusJson(); });
         // 网页设置页的「电台」卡片
         DirectApiConfigServer::AddJsonHandler("/radio.json", false,
                                               [](const std::string&) { return NomiRadio::GetInstance().ListJson(); });

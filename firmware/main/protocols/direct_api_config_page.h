@@ -133,6 +133,14 @@ button.mini{padding:7px 10px}
 </div>
 </div>
 
+<div id="sdCard" hidden>
+<h2>SD 卡</h2>
+<div class="card">
+  <div class="row"><span id="sdState" style="flex:1">检测中…</span><button id="sdRescan">重新检测</button></div>
+  <p class="hint">要 FAT32 格式。64GB 以上的卡出厂多是 exFAT，先在电脑上格式化成 FAT32 再插。没有插卡检测，插拔后点「重新检测」。</p>
+</div>
+</div>
+
 <h2>人设提示词</h2>
 <textarea id="prompt" rows="4" placeholder="留空用默认提示词"></textarea>
 
@@ -474,6 +482,29 @@ $('#radioAdd').onclick = async () => {
   $('#radioAdd').disabled = false;
 };
 loadRadio();
+
+// SD 卡：板子没挂 /sd.json 时整块不显示；每次读设备都当场检测一遍
+async function loadSd() {
+  let r;
+  try {
+    const res = await fetch('/sd.json', {cache: 'no-store'});
+    if (!res.ok) return;
+    r = await res.json();
+  } catch (e) { return; }
+  $('#sdCard').hidden = false;
+  const gb = b => (b / 1073741824).toFixed(1) + ' GB';
+  const el = $('#sdState');
+  if (r.state === 'ready') { el.textContent = `已插卡：共 ${gb(r.total)}，剩余 ${gb(r.free)}`; el.className = 'ok'; }
+  else if (r.state === 'unsupported') { el.textContent = '卡的格式不支持，要格式化成 FAT32'; el.className = 'err'; }
+  else { el.textContent = '没检测到卡（没插，或者没插到底）'; el.className = 'hint'; }
+}
+$('#sdRescan').onclick = async () => {
+  $('#sdRescan').disabled = true;
+  $('#sdState').textContent = '检测中…'; $('#sdState').className = '';
+  await loadSd();
+  $('#sdRescan').disabled = false;
+};
+loadSd();
 
 // 播客订阅：板子没挂 /podcast.json 时整块不显示
 const podMsg = (text, cls) => { $('#podMsg').textContent = text; $('#podMsg').className = 'hint ' + (cls || ''); };
