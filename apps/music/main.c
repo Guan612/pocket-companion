@@ -2,10 +2,11 @@
 //
 // 系统只管"放这一首"（解码、封面、歌词、进度条），放哪首、下一首放什么都在应用里：
 // - 本地（这个文件）：队列是一个文件夹里的歌（按文件名排），列表循环 / 单曲循环 / 随机；放到哪首记在 kv 里。
-// - 电台（这个文件）：assets/stations.txt 里的台（一行"台名|地址"），上一个 / 下一个在台单里换。
+// - 电台（这个文件）：台单在 kv "stations" 里（一行"台名\t地址"，应用自带的网页上增删、排序），
+//   还没动过就用 assets/stations.txt 里那几个默认的；台单里没有的台名去网上的电台目录搜（radio-browser）。
 // - 播客（podcast.c）：订阅、最新几期、每个播客听到哪。
 // - 在线（online.c）：在主人填的音乐网站上搜歌、放、配歌词封面。
-// 首页的收听卡片是这个应用画的（manifest 里 "tile": true）。订阅、网站地址在应用自带的网页里管（assets/web）。
+// 首页的收听卡片是这个应用画的（manifest 里 "tile": true）。台单、订阅、网站地址在应用自带的网页里管（assets/web）。
 #include "music.h"
 
 #define MAX_TRACKS 300
@@ -160,7 +161,8 @@ static int g_index = -1;  // 队列里第几首（-1 还没挑）
 static char g_station_names[MAX_STATIONS][48];
 static char g_station_urls[MAX_STATIONS][200];
 static int g_station_count;
-static int g_station = -1;  // 上次放的是第几个台
+static int g_station = -1;  // 上次放的是台单里第几个台；-1 = 搜来还没收藏的
+static char g_temp_name[48], g_temp_url[200];  // 搜来还没收藏的台（「收藏这个台」存的就是它）
 
 static const char *const kSources[] = {"", "local", "radio", "podcast", "online"};
 
@@ -194,8 +196,8 @@ static int find_track(const char *name)
 void update_context(void)
 {
     char text[600];
-    if (g_src == SRC_RADIO && g_station >= 0) {
-        nomi_fmt(text, sizeof(text), "在听电台「%s」。", g_station_names[g_station]);
+    if (g_src == SRC_RADIO) {
+        nomi_fmt(text, sizeof(text), "在听电台「%s」。", g_station >= 0 ? g_station_names[g_station] : g_temp_name);
     } else if (g_src == SRC_LOCAL && g_index >= 0) {
         char folder[NAME_LEN], title[NAME_LEN];
         last_part(folder, sizeof(folder), g_qdir);
@@ -240,6 +242,19 @@ static int play_station(int i)
     return 0;
 }
 
+// 放一个还不在台单里的台（搜来的）：先放起来，主人说「收藏这个台」才进台单
+static int play_temp_station(const char *name, const char *url)
+{
+    int r = media_play(url, name, "电台", NOMI_PLAY_LIVE, 0, 0, 0);
+    if (r < 0) return r;
+    nomi_copy_n(g_temp_name, sizeof(g_temp_name), name, 0);
+    nomi_copy_n(g_temp_url, sizeof(g_temp_url), url, 0);
+    g_station = -1;
+    set_source(SRC_RADIO);
+    update_context();
+    return 0;
+}
+
 // 本地队列换一首：user 为 1 是主人点的上一首 / 下一首（单曲循环时也换），0 是放完了自动接
 static void local_step(int delta, int user)
 {
@@ -265,7 +280,9 @@ static void local_step(int delta, int user)
 static int resume_last(void)
 {
     switch (g_src) {
-    case SRC_RADIO: return play_station(g_station);
+    case SRC_RADIO:
+        if (g_station >= 0) return play_station(g_station);
+        return g_temp_url[0] ? play_temp_station(g_temp_name, g_temp_url) : NOMI_E_NOT_FOUND;
     case SRC_PODCAST: return pod_resume();
     case SRC_ONLINE: return online_resume();
     case SRC_LOCAL: return play_track(g_index);
@@ -273,29 +290,185 @@ static int resume_last(void)
     }
 }
 
-static void load_stations(void)
+/* ---------- 电台台单（kv "stations"，一行"台名\t地址"；没动过时用包里带的默认台单） ---------- */
+
+static void save_stations(void)
 {
-    static char text[8192];
-    int n = fs_read("pkg:/stations.txt", 0, text, sizeof(text) - 1);
-    if (n < 0) n = 0;
-    text[n] = '\0';
+    static char buf[8192];
+    buf[0] = 0;
+    for (int i = 0; i < g_station_count; i++) {
+        nomi_append(buf, sizeof(buf), g_station_names[i]);
+        nomi_append(buf, sizeof(buf), "\t");
+        nomi_append(buf, sizeof(buf), g_station_urls[i]);
+        nomi_append(buf, sizeof(buf), "\n");
+    }
+    kv_set("stations", buf);
+}
+
+// 台单里的台按行拆开（kv 或默认的 stations.txt，后者用 | 分隔）
+static int parse_station_lines(char *text, char sep)
+{
     g_station_count = 0;
     for (char *p = text; *p && g_station_count < MAX_STATIONS;) {
         char *line = p;
         while (*p && *p != '\n') p++;
         if (*p) *p++ = '\0';
         char *bar = line;
-        while (*bar && *bar != '|') bar++;
-        if (*bar != '|' || line[0] == '#') continue;
+        while (*bar && *bar != sep) bar++;
+        if (*bar != sep || line[0] == '#') continue;
         *bar = '\0';
         char *url = bar + 1;
         int len = nomi_strlen(url);
         while (len && (url[len - 1] == '\r' || url[len - 1] == ' ')) url[--len] = '\0';
-        if (!len) continue;
+        if (!len || !line[0]) continue;
         copy(g_station_names[g_station_count], line, 48);
         copy(g_station_urls[g_station_count], url, 200);
         g_station_count++;
     }
+    return g_station_count;
+}
+
+static void load_stations(void)
+{
+    static char text[8192];
+    if (kv_get("stations", text, sizeof(text)) > 0) {
+        parse_station_lines(text, '\t');
+        return;
+    }
+    // 还没改过台单：包里带的默认台单（只当默认值，不写进 kv；一改就整个存进去）
+    int n = fs_read("pkg:/stations.txt", 0, text, sizeof(text) - 1);
+    if (n < 0) n = 0;
+    text[n] = '\0';
+    parse_station_lines(text, '|');
+}
+
+// 同名就是改地址；满了返回 NOMI_E_TOO_BIG
+static int add_station(const char *name, const char *url)
+{
+    for (int i = 0; i < g_station_count; i++) {
+        if (nomi_equal(g_station_names[i], name)) {
+            copy(g_station_urls[i], url, 200);
+            save_stations();
+            return 0;
+        }
+    }
+    if (g_station_count >= MAX_STATIONS) return NOMI_E_TOO_BIG;
+    copy(g_station_names[g_station_count], name, 48);
+    copy(g_station_urls[g_station_count], url, 200);
+    g_station_count++;
+    save_stations();
+    return 0;
+}
+
+static void remove_station(int i)
+{
+    if (i < 0 || i >= g_station_count) return;
+    for (int k = i; k + 1 < g_station_count; k++) {
+        copy(g_station_names[k], g_station_names[k + 1], 48);
+        copy(g_station_urls[k], g_station_urls[k + 1], 200);
+    }
+    g_station_count--;
+    if (g_station == i) g_station = -1;  // 正在放的还接着放，只是不在台单里了
+    else if (g_station > i) g_station--;
+    save_stations();
+}
+
+static void move_station(int from, int to)
+{
+    if (from < 0 || from >= g_station_count || to < 0 || to >= g_station_count || from == to) return;
+    char name[48], url[200];
+    copy(name, g_station_names[from], 48);
+    copy(url, g_station_urls[from], 200);
+    int step = from < to ? 1 : -1;
+    for (int i = from; i != to; i += step) {
+        copy(g_station_names[i], g_station_names[i + step], 48);
+        copy(g_station_urls[i], g_station_urls[i + step], 200);
+    }
+    copy(g_station_names[to], name, 48);
+    copy(g_station_urls[to], url, 200);
+    if (g_station == from) g_station = to;
+    else if (from < g_station && g_station <= to) g_station--;
+    else if (to <= g_station && g_station < from) g_station++;
+    save_stations();
+}
+
+/* ---------- 搜台（网上的电台目录 radio-browser） ---------- */
+
+// 名字截断时可能切开多字节字符：把结尾不完整的那几个字节去掉
+static void fix_utf8_tail(char *s)
+{
+    int n = nomi_strlen(s);
+    if (n <= 0) return;
+    unsigned char last = (unsigned char)s[n - 1];
+    if (last < 0x80) return;                                    // 结尾是 ASCII：完整
+    if (last >= 0xC0) {                                         // 结尾是起始字节：这个字没写完
+        s[n - 1] = '\0';
+        return;
+    }
+    int k = 1;  // 结尾连续的继续字节（0x80-0xBF）个数
+    while (k < 4 && n - 1 - k >= 0) {
+        unsigned char b = (unsigned char)s[n - 1 - k];
+        if (b >= 0x80 && b < 0xC0) {
+            k++;
+            continue;
+        }
+        if (b >= 0xC0) {  // 它们的起始字节：数一数齐不齐
+            int want = b >= 0xF0 ? 3 : b >= 0xE0 ? 2 : 1;
+            if (k != want) s[n - 1 - k] = '\0';
+        } else {
+            s[n - k] = '\0';  // 前面是 ASCII：这些继续字节是坏的
+        }
+        return;
+    }
+    s[n - k] = '\0';
+}
+
+// 千听的 https 地址换成 http：同一个 CDN，http 不用 TLS，省内部 RAM
+static void prefer_http(char *url, int size)
+{
+    static const char *const kHttps[2] = {"https://lhttp.qtfm.cn/", "https://lhttp.qingting.fm/"};
+    for (int i = 0; i < 2; i++) {
+        if (!nomi_starts(url, kHttps[i])) continue;
+        char rest[192];
+        copy(rest, url + nomi_len(kHttps[i]), sizeof(rest));
+        nomi_fmt(url, size, "http://lhttp.qingting.fm/%s", rest);
+        return;
+    }
+}
+
+// 按名字去电台目录搜（票数从高到低）：取第一个能直接放的（MP3 / AAC，不要 hls 分段流）
+static int search_station(const char *query, char *name, int name_size, char *url, int url_size)
+{
+    char enc[160], request[512];
+    nomi_url_encode(query, enc, sizeof(enc));
+    nomi_fmt(request, sizeof(request),
+             "http://all.api.radio-browser.info/json/stations/search?hidebroken=true&order=votes"
+             "&reverse=true&limit=8&name=%s",
+             enc);
+    int32_t n = net_get(request, g_net, 128 * 1024);
+    if (n < 0) return n;
+    g_net[n] = 0;
+    const char *end = g_net + n;
+    for (const char *p = nomi_find(g_net, end, "{"); p;) {
+        const char *next = nomi_find(p + 1, end, "},{");
+        const char *e = next ? next + 1 : end;  // 对象到自己的 '}' 为止
+        char codec[16], u[240], hls[8];
+        if (nomi_json_field(p, e, "codec", codec, sizeof(codec)) <= 0 ||
+            nomi_json_field(p, e, "url_resolved", u, sizeof(u)) <= 0 || !u[0]) {
+            // 不认识的条目，跳过
+        } else if ((nomi_json_field(p, e, "hls", hls, sizeof(hls)) > 0 && nomi_equal(hls, "1")) ||
+                   nomi_find(u, u + nomi_len(u), ".m3u8")) {
+            // 分段流放不了，跳过
+        } else if (nomi_equal(codec, "MP3") || nomi_equal(codec, "AAC") || nomi_equal(codec, "AAC+")) {
+            nomi_json_field(p, e, "name", name, name_size);
+            copy(url, u, url_size);
+            fix_utf8_tail(name);
+            prefer_http(url, url_size);
+            if (name[0] && url[0]) return 0;
+        }
+        p = next ? nomi_find(next + 2, end, "{") : 0;
+    }
+    return NOMI_E_NOT_FOUND;
 }
 
 /* ---------- 界面 ---------- */
@@ -393,7 +566,9 @@ static void show_dir(const char *dir, const char *title)
 static void show_radio(void)
 {
     push_page("电台");
-    if (g_station_count == 0) ui_text("台单是空的。", NOMI_TEXT_MUTED);
+    if (g_station_count == 0) {
+        ui_text("台单是空的：在网页设置页的「设备 → 应用 → 音乐 → 设置」里添加，或跟它说一个台名去搜。", NOMI_TEXT_MUTED);
+    }
     for (int i = 0; i < g_station_count; i++) {
         add_row(ui_item(g_station_names[i], g_src == SRC_RADIO && i == g_station ? "正在放" : "", ""), ROW_STATION, i,
                 "");
@@ -430,7 +605,7 @@ static void draw_tile(void)
 
 /* ---------- 大模型的指令（顺序和 manifest 的 voice 一致） ---------- */
 
-enum { VOICE_PLAY = 1, VOICE_SKIP, VOICE_MODE, VOICE_PODCAST, VOICE_SUBSCRIBE, VOICE_ONLINE };
+enum { VOICE_PLAY = 1, VOICE_SKIP, VOICE_MODE, VOICE_PODCAST, VOICE_SUBSCRIBE, VOICE_ONLINE, VOICE_RADIO };
 
 // 在 SD 卡里按名字找：先广度优先一层层找文件名、文件夹名里带这个词的
 static int search(const char *word, char *found_dir, char *found_file)
@@ -537,9 +712,114 @@ static void voice(int command)
         nomi_fmt(reply, sizeof(reply), "好的，放《%s》", title);
         REPLY(reply, 1);
     }
+    if (command == VOICE_RADIO) {
+        if (!arg[0]) {  // 接着放（本来在放、对话时暂停着的：说完自动接着放）
+            if (media_mine() && media_state() == 3) media_control(NOMI_MEDIA_RESUME);
+            else if (g_src == SRC_RADIO && resume_last() == 0) REPLY("好的，接着放", 1);
+            else REPLY("还没放过电台，问问主人想听哪个台，或说个类型我去搜", 0);
+        } else if (nomi_equal(arg, "下一个") || nomi_equal(arg, "换台") || nomi_equal(arg, "next") ||
+                   nomi_equal(arg, "上一个") || nomi_equal(arg, "prev")) {
+            if (!g_station_count) REPLY("台单是空的，先在网页设置页里加几个台，或者说一个台名我去搜", 0);
+            int back = nomi_equal(arg, "上一个") || nomi_equal(arg, "prev");
+            int i = ((g_station < 0 ? 0 : g_station) + (back ? -1 : 1) + g_station_count) % g_station_count;
+            if (play_station(i) < 0) REPLY("这个台连不上，换个台试试", 0);
+            nomi_fmt(reply, sizeof(reply), "换到「%s」", g_station_names[g_station]);
+            REPLY(reply, 1);
+        } else if (nomi_equal(arg, "收藏") || nomi_equal(arg, "收藏这个台")) {
+            if (g_station >= 0) REPLY("正在放的这个台已经在台单里了", 0);
+            if (!g_temp_url[0]) REPLY("现在没在放搜来的台（台单里的台本来就在）", 0);
+            add_station(g_temp_name, g_temp_url);  // 同名就是改地址，不一定加在最后：按下标找回来
+            for (int i = 0; i < g_station_count; i++) {
+                if (nomi_equal(g_station_names[i], g_temp_name)) {
+                    g_station = i;
+                    kv_set_int("station", i);
+                    break;
+                }
+            }
+            nomi_fmt(reply, sizeof(reply), "已收藏「%s」", g_temp_name);
+            REPLY(reply, 0);
+        } else {
+            int i;
+            for (i = 0; i < g_station_count; i++) {
+                if (contains(g_station_names[i], arg) || contains(arg, g_station_names[i])) break;
+            }
+            if (i < g_station_count) {
+                if (play_station(i) < 0) REPLY("这个台连不上，换个台试试", 0);
+                nomi_fmt(reply, sizeof(reply), "好的，放「%s」", g_station_names[g_station]);
+                REPLY(reply, 1);
+            }
+            char name[48], url[200];  // 台单里没有：去网上的电台目录搜
+            if (search_station(arg, name, sizeof(name), url, sizeof(url)) < 0) {
+                nomi_fmt(reply, sizeof(reply), "收藏里没有，网上的电台目录也没搜到「%s」；可以换个说法", arg);
+                REPLY(reply, 0);
+            }
+            if (play_temp_station(name, url) < 0) REPLY("搜到了但连不上这个台", 0);
+            nomi_fmt(reply, sizeof(reply), "搜到「%s」，马上放；想以后还听可以说\"收藏这个台\"", name);
+            REPLY(reply, 1);
+        }
+    }
 }
 
 /* ---------- 网页（assets/web） ---------- */
+
+// 台单：列出（顺序就是设备上换台的顺序）、加、删、挪（排序）、放
+static void station_web(const char *body, char *out, int size)
+{
+    const char *end = body + nomi_len(body);
+    char cmd[32];
+    nomi_json_field(body, end, "cmd", cmd, sizeof(cmd));
+    if (nomi_equal(cmd, "station_list")) {
+        nomi_append(out, size, "{\"ok\":true,\"max\":");
+        nomi_fmt(out + nomi_len(out), size - nomi_len(out), "%d", MAX_STATIONS);
+        nomi_append(out, size, ",\"playing\":");
+        nomi_fmt(out + nomi_len(out), size - nomi_len(out), "%d", g_src == SRC_RADIO ? g_station : -1);
+        nomi_append(out, size, ",\"stations\":[");
+        for (int i = 0; i < g_station_count; i++) {
+            if (i) nomi_append(out, size, ",");
+            nomi_append(out, size, "{\"name\":");
+            json_str(out, size, g_station_names[i]);
+            nomi_append(out, size, ",\"url\":");
+            json_str(out, size, g_station_urls[i]);
+            nomi_append(out, size, "}");
+        }
+        nomi_append(out, size, "]}");
+    } else if (nomi_equal(cmd, "station_add")) {
+        char name[64], url[220];
+        nomi_json_field(body, end, "name", name, sizeof(name));
+        nomi_json_field(body, end, "url", url, sizeof(url));
+        if (!name[0] || (!nomi_starts(url, "http://") && !nomi_starts(url, "https://"))) {
+            nomi_fmt(out, size, "{\"ok\":false,\"error\":\"台名要填，地址要以 http:// 或 https:// 开头\"}");
+        } else if (nomi_find(url, url + nomi_len(url), ".m3u8")) {
+            nomi_fmt(out, size, "{\"ok\":false,\"error\":\"不支持 m3u8 分段流，要 MP3 / AAC 直播地址\"}");
+        } else if (add_station(name, url) == NOMI_E_TOO_BIG) {
+            nomi_fmt(out, size, "{\"ok\":false,\"error\":\"最多存 %d 个台，先删掉几个\"}", MAX_STATIONS);
+        } else {
+            nomi_fmt(out, size, "{\"ok\":true}");
+        }
+    } else if (nomi_equal(cmd, "station_delete")) {
+        char idx[16];
+        nomi_json_field(body, end, "index", idx, sizeof(idx));
+        int i = nomi_atoi(idx);
+        if (i < 0 || i >= g_station_count) nomi_fmt(out, size, "{\"ok\":false,\"error\":\"没有这个台\"}");
+        else {
+            remove_station(i);
+            nomi_fmt(out, size, "{\"ok\":true}");
+        }
+    } else if (nomi_equal(cmd, "station_move")) {  // {"index":n,"to":m}：把第 n 个挪到第 m 个的位置（排序）
+        char a[16], b[16];
+        nomi_json_field(body, end, "index", a, sizeof(a));
+        nomi_json_field(body, end, "to", b, sizeof(b));
+        move_station(nomi_atoi(a), nomi_atoi(b));
+        nomi_fmt(out, size, "{\"ok\":true}");
+    } else if (nomi_equal(cmd, "station_play")) {  // 在设备上放台单里的这个台
+        char idx[16];
+        nomi_json_field(body, end, "index", idx, sizeof(idx));
+        if (play_station(nomi_atoi(idx)) < 0) nomi_fmt(out, size, "{\"ok\":false,\"error\":\"放不了这个台\"}");
+        else nomi_fmt(out, size, "{\"ok\":true}");
+    } else {
+        nomi_fmt(out, size, "{\"ok\":false,\"error\":\"不认识的请求\"}");
+    }
+}
 
 static void web(void)
 {
@@ -550,6 +830,7 @@ static void web(void)
     nomi_json_field(body, body + nomi_len(body), "cmd", cmd, sizeof(cmd));
     if (nomi_starts(cmd, "pod_")) pod_web(body, out, sizeof(out));
     else if (nomi_starts(cmd, "online_")) online_web(body, out, sizeof(out));
+    else if (nomi_starts(cmd, "station_")) station_web(body, out, sizeof(out));
     else nomi_fmt(out, sizeof(out), "{\"ok\":false,\"error\":\"不认识的请求\"}");
     web_reply(out);
 }
@@ -610,7 +891,8 @@ int32_t nomi_event(int32_t type, int32_t id, int32_t value)
             online_media(value);
         } else if (g_src == SRC_RADIO) {
             if (value != NOMI_MEDIA_FINISHED && g_station_count) {  // 电台是直播，不会"放完"
-                play_station((g_station + (value == NOMI_MEDIA_PREV ? -1 : 1) + g_station_count) % g_station_count);
+                int i = (g_station < 0 ? 0 : g_station) + (value == NOMI_MEDIA_PREV ? -1 : 1);
+                play_station((i + g_station_count) % g_station_count);
             }
         } else {
             local_step(value == NOMI_MEDIA_PREV ? -1 : 1, value != NOMI_MEDIA_FINISHED);

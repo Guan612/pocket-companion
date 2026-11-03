@@ -21,6 +21,7 @@ button{font:inherit;color:var(--fg);background:#2b3142;border:1px solid var(--li
 button.primary{background:var(--accent);color:#0b1220;border:0;font-weight:600}
 button.danger{color:var(--err)}
 button:disabled{opacity:.5}
+button.sm{padding:4px 9px;font-size:13px}
 .bar{display:flex;gap:8px;margin:8px 0}
 .msg{min-height:1.5em;font-size:13px}
 .msg.err{color:var(--err)}.msg.ok{color:var(--ok)}
@@ -30,6 +31,15 @@ img{width:40px;height:40px;border-radius:6px;object-fit:cover;background:#10141c
 <body>
 <main>
 <h1>音乐 · 设置</h1>
+
+<section>
+  <h2>电台台单</h2>
+  <p class="hint">改了立即生效，↑ ↓ 调顺序（设备上换台按这个顺序）。也可以跟它说「放点音乐」或一个台名，没有的去电台目录搜。</p>
+  <div id="stations"><p class="hint">加载中…</p></div>
+  <div class="bar"><input id="stName" placeholder="台名，比如：轻音乐"><button id="stAdd" class="primary">添加</button></div>
+  <div class="bar"><input id="stUrl" placeholder="MP3 / AAC 直播流地址（http://…）"></div>
+  <div class="msg" id="stMsg"></div>
+</section>
 
 <section>
   <h2>播客订阅</h2>
@@ -59,6 +69,45 @@ async function call(cmd, args) {
   return res.json();
 }
 function msg(el, text, kind) { el.textContent = text || ''; el.className = 'msg' + (kind ? ' ' + kind : ''); }
+
+// 电台台单：↑ ↓ 调顺序，设备上换台按这个顺序
+async function loadStations() {
+  const box = $('#stations');
+  try {
+    const r = await call('station_list');
+    box.innerHTML = r.stations.length ? '' : '<p class="hint">台单是空的。</p>';
+    r.stations.forEach((s, i) => {
+      const row = document.createElement('div');
+      row.className = 'row';
+      row.innerHTML = `<span class="grow">${esc(s.name)}</span><button class="sm">${r.playing === i ? '在放' : '放'}</button><button class="sm">↑</button><button class="sm">↓</button><button class="sm danger">删</button>`;
+      const [play, up, down, del] = row.querySelectorAll('button');
+      play.onclick = async () => {
+        play.disabled = true;
+        const res = await call('station_play', {index: String(i)});
+        if (!res.ok) msg($('#stMsg'), res.error, 'err');
+        play.disabled = false;
+        loadStations();
+      };
+      up.onclick = async () => { if (i > 0) { await call('station_move', {index: String(i), to: String(i - 1)}); loadStations(); } };
+      down.onclick = async () => { if (i < r.stations.length - 1) { await call('station_move', {index: String(i), to: String(i + 1)}); loadStations(); } };
+      del.onclick = async () => { if (confirm(`删除「${s.name}」？`)) { await call('station_delete', {index: String(i)}); loadStations(); } };
+      box.appendChild(row);
+    });
+    $('#stAdd').title = `已存 ${r.stations.length} / ${r.max} 个`;
+  } catch (e) { box.innerHTML = `<p class="msg err">读不到台单：${esc(e.message)}</p>`; }
+}
+$('#stAdd').onclick = async () => {
+  const name = $('#stName').value.trim(), url = $('#stUrl').value.trim();
+  if (!name || !url) return msg($('#stMsg'), '台名和地址都要填', 'err');
+  $('#stAdd').disabled = true;
+  try {
+    const r = await call('station_add', {name, url});
+    msg($('#stMsg'), r.ok ? '' : r.error, r.ok ? '' : 'err');
+    if (r.ok) { $('#stName').value = ''; $('#stUrl').value = ''; loadStations(); }
+  } catch (e) { msg($('#stMsg'), '请求失败：' + e.message, 'err'); }
+  $('#stAdd').disabled = false;
+};
+$('#stUrl').onkeydown = e => { if (e.key === 'Enter') $('#stAdd').click(); };
 
 async function loadSubs() {
   const box = $('#subs');
@@ -160,6 +209,7 @@ $('#songSearch').onclick = async () => {
 };
 $('#songQ').onkeydown = e => { if (e.key === 'Enter') $('#songSearch').click(); };
 
+loadStations();
 loadSubs();
 loadOnline();
 </script>
