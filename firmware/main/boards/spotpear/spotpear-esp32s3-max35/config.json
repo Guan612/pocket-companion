@@ -18,7 +18,11 @@
                 "CONFIG_CUSTOM_WAKE_WORD_THRESHOLD=12",
                 "CONFIG_SR_MN_CN_MULTINET7_QUANT=y",
                 "CONFIG_SR_WN_WN9_NIHAOXIAOZHI_TTS=n",
-                "CONFIG_FATFS_API_ENCODING_UTF_8=y"
+                "CONFIG_FATFS_API_ENCODING_UTF_8=y",
+                "CONFIG_WAMR_ENABLE_AOT=n",
+                "CONFIG_WAMR_ENABLE_LIB_PTHREAD=n",
+                "CONFIG_WAMR_ENABLE_LIBC_WASI=n",
+                "CONFIG_WAMR_ENABLE_APP_FRAMEWORK=n"
             ]
         }
     ]

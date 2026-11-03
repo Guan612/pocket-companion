@@ -1,0 +1,13 @@
+{
+  "id": "nomi.counter",
+  "name": "计数器",
+  "version": "1.0.0",
+  "api": 1,
+  "description": "最小示例：点一下加一，退出再进来还记得点了几次",
+  "icon": {
+    "lines": [[[8, 18], [28, 18]], [[18, 8], [18, 28]]],
+    "circles": [[3, 3, 30]]
+  },
+  "permissions": [],
+  "memory_kb": 64
+}

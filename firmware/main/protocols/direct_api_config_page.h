@@ -175,6 +175,16 @@ body.has-save{padding-bottom:88px}
   <p class="hint">要 FAT32 格式。64GB 以上的卡出厂多是 exFAT，先在电脑上格式化成 FAT32 再插。没有插卡检测，插拔后点「重新检测」。</p>
 </div>
 </div>
+
+<div id="appsCard" hidden>
+<h2>应用</h2>
+<div class="card">
+  <p class="hint">应用包是 .npk 文件（开发见仓库里的 docs/app-sdk.md），现在装在 SD 卡上，装好出现在设备桌面（表盘往上推）。这一栏点了就生效。</p>
+  <div id="appsList"></div>
+  <label>应用包<input id="appFile" type="file" accept=".npk"></label>
+  <div class="row"><button id="appInstall">安装</button><span id="appMsg" class="hint"></span></div>
+</div>
+</div>
 </section>
 </main>
 <div class="save"><div><span id="msg"></span><button class="primary" id="save" disabled>保存</button></div></div>
@@ -535,6 +545,54 @@ $('#radioAdd').onclick = async () => {
   $('#radioAdd').disabled = false;
 };
 loadRadio();
+
+// 应用包：板子没挂 /apps.json 时整块不显示
+const appMsg = (text, cls) => { $('#appMsg').textContent = text; $('#appMsg').className = 'hint ' + (cls || ''); };
+const kb = b => b < 1024 * 1024 ? Math.max(1, Math.round(b / 1024)) + ' KB' : (b / 1048576).toFixed(1) + ' MB';
+async function loadApps() {
+  let r;
+  try {
+    const res = await fetch('/apps.json', {cache: 'no-store'});
+    if (!res.ok) return;
+    r = await res.json();
+  } catch (e) { return; }
+  $('#appsCard').hidden = false;
+  const box = $('#appsList');
+  box.innerHTML = r.apps.length ? '' : '<p class="hint">还没装应用。</p>';
+  for (const a of r.apps) {
+    const row = document.createElement('div');
+    row.className = 'row';
+    row.innerHTML = `<span style="flex:1;overflow-wrap:anywhere">${esc(a.name)} <span class="hint">${esc(a.version)}</span><br><span class="hint">程序 ${kb(a.size)} · 数据 ${kb(a.data)}</span></span><button>打开</button><button class="danger">删除</button>`;
+    const [open, del] = row.querySelectorAll('button');
+    open.onclick = async () => {
+      try {
+        const res = await (await fetch('/apps/open', {method: 'POST', body: JSON.stringify({id: a.id})})).json();
+        appMsg(res.ok ? `已在设备上打开「${a.name}」` : res.error, res.ok ? 'ok' : 'err');
+      } catch (e) { appMsg('请求失败：' + e.message, 'err'); }
+    };
+    del.onclick = async () => {
+      if (!confirm(`删除「${a.name}」？它存的进度也会一起删掉。`)) return;
+      try {
+        const res = await (await fetch('/apps/remove', {method: 'POST', body: JSON.stringify({id: a.id})})).json();
+        appMsg(res.ok ? '已删除' : res.error, res.ok ? 'ok' : 'err');
+      } catch (e) { appMsg('请求失败：' + e.message, 'err'); }
+      loadApps();
+    };
+    box.appendChild(row);
+  }
+}
+$('#appInstall').onclick = async () => {
+  const f = $('#appFile').files[0];
+  if (!f) return appMsg('先选一个 .npk 文件', 'err');
+  $('#appInstall').disabled = true; appMsg('安装中…');
+  try {
+    const r = await (await fetch('/apps/install', {method: 'POST', body: f})).json();
+    appMsg(r.ok ? `${r.updated ? '已更新' : '已安装'}「${r.name}」${r.version}` : r.error, r.ok ? 'ok' : 'err');
+    if (r.ok) { $('#appFile').value = ''; loadApps(); }
+  } catch (e) { appMsg('上传失败：' + e.message, 'err'); }
+  $('#appInstall').disabled = false;
+};
+loadApps();
 
 // SD 卡：板子没挂 /sd.json 时整块不显示；每次读设备都当场检测一遍
 async function loadSd() {

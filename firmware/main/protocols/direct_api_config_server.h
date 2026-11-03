@@ -25,6 +25,11 @@ extern std::function<void()> on_city_changed;
 using JsonHandler = std::function<std::string(const std::string& body)>;
 void AddJsonHandler(const char* uri, bool post, JsonHandler handler);
 
+// 上传大文件（比如应用包）：请求体不先读进内存，handler 拿到总长度和一个读函数自己边收边处理。
+// read(buf, size) 返回这次读到的字节数，<= 0 表示出错或连接断了。返回值规则同 JsonHandler
+using UploadHandler = std::function<std::string(size_t length, const std::function<int(char*, size_t)>& read)>;
+void AddUploadHandler(const char* uri, UploadHandler handler);
+
 }  // namespace DirectApiConfigServer
 
 #endif  // DIRECT_API_CONFIG_SERVER_H

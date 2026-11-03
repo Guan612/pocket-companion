@@ -1480,3 +1480,16 @@ if ("${size}" AND "${offset}")
 else()
     message(STATUS "Assets partition not found, using v1 partition table")
 endif()
+
+# 应用包运行时（espressif/wasm-micro-runtime 2.4，spotpear-esp32s3-max35 用）：它的 esp-idf 平台层里
+# espidf_file.c 是给 WASI（标准 C 库的文件接口）用的，在 ESP-IDF 6 上编不过（缺 <sys/stat.h>、没有 renameat）。
+# 我们关了 WASI（CONFIG_WAMR_ENABLE_LIBC_WASI=n），文件读写走自己的系统接口，用不着它：不改下载来的组件，
+# 只把这个文件从它的编译里拿掉。平台层的其他文件也用 struct stat，给整个组件强制带上 <sys/stat.h>
+idf_build_get_property(_build_components BUILD_COMPONENTS)
+if("espressif__wasm-micro-runtime" IN_LIST _build_components)
+    idf_component_get_property(_wamr_lib espressif__wasm-micro-runtime COMPONENT_LIB)
+    idf_component_get_property(_wamr_dir espressif__wasm-micro-runtime COMPONENT_DIR)
+    set_source_files_properties("${_wamr_dir}/core/shared/platform/esp-idf/espidf_file.c"
+        TARGET_DIRECTORY ${_wamr_lib} PROPERTIES HEADER_FILE_ONLY ON)
+    target_compile_options(${_wamr_lib} PRIVATE -include sys/stat.h)
+endif()

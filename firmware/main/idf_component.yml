@@ -51,6 +51,11 @@ dependencies:
     version: ^2.1.7
     rules:
     - if: target in [esp32s3]
+  # spotpear-esp32s3-max35 的应用包（WebAssembly）运行时，见 docs/app-sdk.md
+  espressif/wasm-micro-runtime:
+    version: ^2.4.0~1
+    rules:
+    - if: target in [esp32s3]
   espressif/esp_video:
     version: ^2.4.1
     rules:

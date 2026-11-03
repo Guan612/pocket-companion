@@ -2058,6 +2058,8 @@ static lv_obj_t *add_tileview(lv_obj_t *parent)
 
 // 桌面上左边缘右划：回表盘
 static void go_home(void) { show_main(true); }
+// 应用层要弹的提示（比如装在 SD 卡上的应用卡没插）
+static void apps_toast(const char *text) { nomi_ui_notify(text, 2500); }
 
 void nomi_ui_create(lv_obj_t *screen, uint16_t *face_buf, const lv_font_t *font,
                     const nomi_ui_callbacks_t *callbacks)
@@ -2152,7 +2154,7 @@ void nomi_ui_create(lv_obj_t *screen, uint16_t *face_buf, const lv_font_t *font,
     lv_obj_align(grip_bottom, LV_ALIGN_BOTTOM_MID, 0, -6);
 
     // 应用层盖在卡片上，对话浮层再盖在应用上（闹钟层响铃时才建，在最上面）
-    nomi_apps_init(screen, s_launcher_tile, font, user_activity, go_home);
+    nomi_apps_init(screen, s_launcher_tile, font, user_activity, go_home, apps_toast);
     create_sheet(screen);
 
     build_settings();

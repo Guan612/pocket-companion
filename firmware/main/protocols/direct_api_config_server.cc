@@ -367,6 +367,31 @@ std::vector<ExtraHandler>& ExtraHandlers() {
     return handlers;
 }
 
+struct UploadHandlerEntry {
+    std::string uri;
+    DirectApiConfigServer::UploadHandler handler;
+};
+std::vector<UploadHandlerEntry>& UploadHandlers() {
+    static std::vector<UploadHandlerEntry> handlers;
+    return handlers;
+}
+
+esp_err_t HandleUpload(httpd_req_t* req) {
+    auto* entry = static_cast<UploadHandlerEntry*>(req->user_ctx);
+    auto read = [req](char* buf, size_t size) -> int {
+        for (int tries = 0; tries < 5; tries++) {  // 网慢时 recv 会超时，多等几次
+            int n = httpd_req_recv(req, buf, size);
+            if (n != HTTPD_SOCK_ERR_TIMEOUT) return n;
+        }
+        return -1;
+    };
+    std::string out = entry->handler(req->content_len, read);
+    if (!out.empty() && out[0] == '!') return SendError(req, out.substr(1));
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    return httpd_resp_send(req, out.data(), out.size());
+}
+
 // 板子挂上来的接口：拿到请求体交给它，返回的 JSON 原样回去；以 "!" 开头的是出错提示
 esp_err_t HandleExtra(httpd_req_t* req) {
     auto* extra = static_cast<ExtraHandler*>(req->user_ctx);
@@ -389,11 +414,15 @@ void AddJsonHandler(const char* uri, bool post, JsonHandler handler) {
     ExtraHandlers().push_back({uri, post, std::move(handler)});
 }
 
+void AddUploadHandler(const char* uri, UploadHandler handler) {
+    UploadHandlers().push_back({uri, std::move(handler)});
+}
+
 std::string Start() {
     if (s_server == nullptr) {
         httpd_config_t config = HTTPD_DEFAULT_CONFIG();
         config.stack_size = 12288;  // /models 里有 HTTPS 请求
-        config.max_uri_handlers = 7 + 16;  // 自己的 7 个 + 板子挂的（超了会注册不上，多留几个）
+        config.max_uri_handlers = 7 + 24;  // 自己的 7 个 + 板子挂的（超了会注册不上，多留几个）
         if (httpd_start(&s_server, &config) != ESP_OK) {
             ESP_LOGE(TAG, "Failed to start config server");
             return "";
@@ -411,6 +440,11 @@ std::string Start() {
         for (auto& extra : ExtraHandlers()) {
             httpd_uri_t u = {.uri = extra.uri.c_str(), .method = extra.post ? HTTP_POST : HTTP_GET,
                              .handler = HandleExtra, .user_ctx = &extra};
+            httpd_register_uri_handler(s_server, &u);
+        }
+        for (auto& upload : UploadHandlers()) {
+            httpd_uri_t u = {.uri = upload.uri.c_str(), .method = HTTP_POST, .handler = HandleUpload,
+                             .user_ctx = &upload};
             httpd_register_uri_handler(s_server, &u);
         }
     }

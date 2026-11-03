@@ -14,9 +14,11 @@
 #include "nomi_clock.h"
 #include "nomi_display.h"
 #include "nomi_music.h"
+#include "nomi_pkg.h"
 #include "nomi_podcast.h"
 #include "nomi_radio.h"
 #include "nomi_sdcard.h"
+#include "nomi_wasm.h"
 #include "nomi_ui.h"
 #include "power_save_timer.h"
 #include "wifi_board.h"
@@ -388,6 +390,19 @@ private:
                    NomiPodcast::GetInstance().PromptContext();
         };
         DirectApiConfigServer::on_city_changed = []() { NomiClock::GetInstance().RefreshWeather(); };
+        // 网页设置页的「应用」卡片：上传 .npk 安装、列出、删除
+        DirectApiConfigServer::AddUploadHandler(
+            "/apps/install", [](size_t length, const std::function<int(char*, size_t)>& read) {
+                return NomiPkg::GetInstance().InstallJson(length, read);
+            });
+        DirectApiConfigServer::AddJsonHandler("/apps.json", false,
+                                              [](const std::string&) { return NomiPkg::GetInstance().ListJson(); });
+        DirectApiConfigServer::AddJsonHandler("/apps/remove", true, [](const std::string& body) {
+            return NomiPkg::GetInstance().RemoveJson(body);
+        });
+        DirectApiConfigServer::AddJsonHandler("/apps/open", true, [](const std::string& body) {
+            return NomiPkg::GetInstance().OpenJson(body);
+        });
         // 网页设置页的「SD 卡」卡片：每次读都当场检测
         DirectApiConfigServer::AddJsonHandler("/sd.json", false,
                                               [](const std::string&) { return NomiSdCard::GetInstance().StatusJson(); });
@@ -477,6 +492,8 @@ public:
         NomiRadio::GetInstance().Start();    // 台单、收流 / 解码任务（平时睡着）
         NomiPodcast::GetInstance().Start();  // 订阅、后台联网任务
         NomiMusic::GetInstance().Start();    // 音乐网站地址、下封面的后台任务
+        NomiWasm::Init(display_);            // 应用包的运行时（docs/app-sdk.md）
+        NomiPkg::GetInstance().Start();      // 扫 SD 卡上装好的应用包，登记到桌面
         GetBacklight()->RestoreBrightness();
     }
 

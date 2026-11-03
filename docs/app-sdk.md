@@ -2,7 +2,7 @@
 
 Pocket Companion 的应用像手机 APK 一样能装、能删、能更新，不用重刷固件。这份文档说明应用包长什么样、应用怎么写、能调哪些系统接口、装在哪、怎么管理。
 
-> 状态：草案，还没实现。标「待验证」的地方要等运行时接上、上机测过才定。
+> 状态：v0.1 部分实现（2026-11-03 上机跑通计数器示例）。已实现的接口见第 13 节，其余是计划；标「待验证」的地方上机测过才定。
 
 ## 1. 分工
 
@@ -68,7 +68,7 @@ int32_t nomi_event(int32_t type, int32_t id, int32_t value);   // 其他所有�
 |---|---|---|
 | `NOMI_EV_CLICK` | 点了按钮、列表项 | 控件 id / 0 |
 | `NOMI_EV_CHANGE` | 开关、滑杆变了 | 控件 id / 新值 |
-| `NOMI_EV_BACK` | 左边缘右划 | 0 / 0。返回 1 表示自己处理了；返回 0 系统就关掉当前页，已经是第一页就关掉应用 |
+| `NOMI_EV_BACK` | 左边缘右划退了一页 | 0 / 剩几页。系统先关掉当前页再通知应用；已经是第一页时右划直接关掉应用（收到 `NOMI_EV_CLOSE`）。应用拦不住返回：那样界面得等应用回话，应用卡住时界面也跟着卡 |
 | `NOMI_EV_PAUSE` / `NOMI_EV_RESUME` | 对话浮层升起 / 收起、睡着 / 醒来 | — |
 | `NOMI_EV_CLOSE` | 要关了（用户退出、装新版本、内存不够） | — 。趁这时候把进度存好 |
 | `NOMI_EV_TIMER` | 定时器到点 | 定时器 id |
@@ -309,4 +309,26 @@ int32_t nomi_event(int32_t type, int32_t id, int32_t value)
 - 解释执行的速度够不够：主要看列表很长时的滚动、阅读器翻页。不够的话试 fast-interp 或 AOT。
 - 小说要完整的中文字体：系统字体只是常用字子集，生僻字会缺，打算从 SD 卡加载完整字体文件。
 - 应用包要不要签名：现在默认信任用户自己装的包。
-- 网页设置页的「应用」页：列表、上传安装、卸载。
+- 网页设置页的「应用」页：列表、上传安装、卸载。（v0.1 已有：设备 → 应用，还能「打开」）
+- 没插 SD 卡时，装在卡上的应用现在不出现在桌面上；规范要的是图标变灰，要在机器内部存一份已装应用的索引。
+
+## 13. 实现进度（v0.1）
+
+| 部分 | 状态 |
+|---|---|
+| 运行时 | ✓ wasm-micro-runtime 2.4 解释执行（fast-interp），关了 AOT、WASI、pthread 库、它自带的应用框架；固件增加约 90KB |
+| 界面 | ✓ `ui_page` `ui_page_close` `ui_text` `ui_item` `ui_button` `ui_set_text` `ui_set_hidden` `ui_remove` `ui_toast`；✗ 开关、滑杆、进度条、图片、阅读器、画布 |
+| 存储 | ✓ `fs_list` `fs_size` `fs_read` `kv_get` `kv_set`（`data/kv.json`）；✗ `fs_write` `fs_remove` |
+| 其他 | ✓ `time_now` `timer_start` `timer_stop` `nomi_log`；✗ 播放、大模型和语音、`keep_awake` |
+| 事件 | ✓ 点击、返回、关闭、定时器；✗ 暂停 / 恢复（浮层、睡眠）、2 秒无响应自动关 |
+| 安装 | ✓ 网页上传 `.npk`、开机扫描、更新保留数据、应用管理和网页删除；✗ 装到机器内部、从 SD 卡上的安装包装、权限确认界面 |
+| 工具 | ✓ `tools/app-sdk/`：`nomi_sdk.h`、`build.py`（编译 + 打包）、`wasm_info.py`（看导入导出）、`examples/counter` |
+
+实测（计数器示例，`app.wasm` 6.6KB）：上传安装约 1～1.6 秒；第一次打开 75ms，之后 8ms；关掉后内存全部收回。
+
+实现上踩过的坑：
+
+- 运行时的 esp-idf 平台层假定跑在 **pthread** 里，加载应用时会调 `pthread_self()`，放在普通 FreeRTOS 任务里会断言失败、整机重启。应用任务要用 `pthread_create` 建（`esp_pthread_cfg_t.stack_alloc_caps` 让栈放 PSRAM）。
+- wasm-micro-runtime 2.4 在 ESP-IDF 6.1 上编不过：平台层缺 `<sys/stat.h>`，WASI 用的 `espidf_file.c` 还用了 6.1 里没有的 `renameat`。在 `main/CMakeLists.txt` 里给它的编译目标强制带上头文件、去掉那个文件，下载来的组件不改。
+- 板子构造函数里不能调 `Board::GetInstance()`（单例还没建完，再进去会自己等自己，开机卡死），显示对象由板子直接传给 `NomiWasm::Init`。
+- zig 的链接器不认 `--allow-undefined`；系统接口都用 `import_module("env")` 标成导入，本来也不需要它。
