@@ -1748,7 +1748,9 @@ lv_obj_t *nomi_ui_now_playing(lv_obj_t *parent, const char *hint)
     // 顶上一排（系统收听页放标签的地方）：应用放自己的入口
     lv_obj_t *bar = lv_obj_create(root);
     lv_obj_remove_style_all(bar);
-    lv_obj_set_size(bar, 244, 36);
+    // 宽度跟着按钮走：可以伸到右半边（歌词从 36 像素往下才开始），四五个入口也放得下
+    lv_obj_set_size(bar, LV_SIZE_CONTENT, 36);
+    lv_obj_set_style_max_width(bar, FACE_W - 32, 0);
     lv_obj_set_pos(bar, 16, 3);
     lv_obj_set_flex_flow(bar, LV_FLEX_FLOW_ROW);
     lv_obj_set_flex_align(bar, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);

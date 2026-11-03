@@ -888,6 +888,8 @@ elseif(CONFIG_BOARD_TYPE_SPOTPEAR_ESP32S3_MAX35)
     set(BUILTIN_TEXT_FONT font_noto_sans_basic_20_4)
     set(BUILTIN_ICON_FONT font_material_symbols_20_4)
     set(DEFAULT_EMOJI_COLLECTION noto-color-emoji_128)
+    # 预装的应用包（.npk）打进资源分区，开机装进机器内部的应用分区（见 nomi_pkg.cc）
+    set(DEFAULT_ASSETS_EXTRA_FILES "${CMAKE_CURRENT_SOURCE_DIR}/boards/spotpear/spotpear-esp32s3-max35/preinstall")
 elseif(CONFIG_BOARD_TYPE_LCDWIKI_ES3C35P)
     set(BOARD_DIR "lcdwiki-es3c35p")
     set(BUILTIN_TEXT_FONT font_noto_sans_basic_20_4)
@@ -1360,6 +1362,9 @@ function(build_default_assets_bin)
     # Add default assets extra files if defined
     if(DEFAULT_ASSETS_EXTRA_FILES)
         list(APPEND BUILD_ARGS "--extra_files" "${DEFAULT_ASSETS_EXTRA_FILES}")
+        # 额外文件变了也要重新打资源包
+        file(GLOB_RECURSE DEFAULT_ASSETS_EXTRA_DEPS CONFIGURE_DEPENDS "${DEFAULT_ASSETS_EXTRA_FILES}/*")
+        list(APPEND DEFAULT_ASSETS_DEPENDENCIES ${DEFAULT_ASSETS_EXTRA_DEPS})
     endif()
 
     list(APPEND BUILD_ARGS "--esp_sr_model_path" "${ESP_SR_MODEL_PATH}")

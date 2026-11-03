@@ -179,7 +179,7 @@ body.has-save{padding-bottom:88px}
 <div id="appsCard" hidden>
 <h2>应用</h2>
 <div class="card">
-  <p class="hint">应用包是 .npk 文件（开发见仓库里的 docs/app-sdk.md），现在装在 SD 卡上，装好出现在设备桌面（表盘往上推）。这一栏点了就生效。</p>
+  <p class="hint">应用包是 .npk 文件（开发见仓库里的 docs/app-sdk.md）。插着 SD 卡装卡上，没插装机器里；装过的新版本装回原处。装好出现在设备桌面（表盘往上推）。预装的应用跟着固件走，不能删。这一栏点了就生效。</p>
   <div id="appsList"></div>
   <label>应用包<input id="appFile" type="file" accept=".npk"></label>
   <div class="row"><button id="appInstall">安装</button><span id="appMsg" class="hint"></span></div>
@@ -562,7 +562,8 @@ async function loadApps() {
   for (const a of r.apps) {
     const row = document.createElement('div');
     row.className = 'row';
-    row.innerHTML = `<span style="flex:1;overflow-wrap:anywhere">${esc(a.name)} <span class="hint">${esc(a.version)}</span><br><span class="hint">程序 ${kb(a.size)} · 数据 ${kb(a.data)}</span></span>${a.web ? `<a class="btn" href="/app/${encodeURIComponent(a.id)}/" target="_blank">设置</a>` : ''}<button>打开</button><button class="danger">删除</button>`;
+    const where = a.builtin ? '预装 · 机器里' : a.location === 'internal' ? '机器里' : 'SD 卡';
+    row.innerHTML = `<span style="flex:1;overflow-wrap:anywhere">${esc(a.name)} <span class="hint">${esc(a.version)}</span><br><span class="hint">${where} · 程序 ${kb(a.size)} · 数据 ${kb(a.data)}</span></span>${a.web ? `<a class="btn" href="/app/${encodeURIComponent(a.id)}/" target="_blank">设置</a>` : ''}<button>打开</button>${a.builtin ? '' : '<button class="danger">删除</button>'}`;
     const [open, del] = row.querySelectorAll('button');
     open.onclick = async () => {
       try {
@@ -570,7 +571,7 @@ async function loadApps() {
         appMsg(res.ok ? `已在设备上打开「${a.name}」` : res.error, res.ok ? 'ok' : 'err');
       } catch (e) { appMsg('请求失败：' + e.message, 'err'); }
     };
-    del.onclick = async () => {
+    if (del) del.onclick = async () => {
       if (!confirm(`删除「${a.name}」？它存的进度也会一起删掉。`)) return;
       try {
         const res = await (await fetch('/apps/remove', {method: 'POST', body: JSON.stringify({id: a.id})})).json();

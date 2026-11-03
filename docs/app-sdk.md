@@ -303,15 +303,18 @@ void    web_reply(const char *text);         // 回给网页
 
 - **更新**：装同一个 `id` 的新版本，覆盖程序，**保留数据**。
 - **卸载**：删程序和数据，删之前确认一次。
-- **预装应用**：在资源分区里只读。「卸载」只是从桌面藏起来，数据照删，应用管理里能恢复。也能装更新的版本盖过预装的那个。
+- **预装应用**：跟着固件走，包（`.npk`）打在资源分区里（板子目录的 `preinstall/`）。开机时，资源分区里的包比机器里装着的新、或者还没装，就装进机器内部的应用分区；SD 卡上装过同一个应用的，把它的 `data/` 搬过来，再删掉卡上那份。现在不能删（应用管理和网页上都没有删除）；从网页装同一个 id 的新版本能盖过它，下次固件里的版本更新时又换回来。
+  - 改了预装应用要重新打包放进去：`python tools/app-sdk/build.py apps/music -o firmware/main/boards/spotpear/spotpear-esp32s3-max35/preinstall/nomi.music.npk`（固件编译时不打包：IDF 的 Python 环境里没有 zig），在 `nomi_pkg.cc` 的 `kPreinstalled` 里登记。
 
 ## 8. 安装位置和存储管理
 
 | | 机器内部 | SD 卡 |
 |---|---|---|
-| 放在 | 新加的应用分区（从资源分区没用的那部分匀出来，暂定 3MB，文件系统待验证） | `sd:/nomi/apps/<id>/` |
-| 拔卡后 | 照常能用 | 桌面图标变灰，点开提示「SD 卡没插」 |
-| 适合 | 常用的小应用 | 大应用、不常用的 |
+| 放在 | 应用分区 `apps`（闪存里 2MB 的 FAT，从资源分区匀出来；挂在 `/int`，`nomi/apps/<id>/`） | `/sd/nomi/apps/<id>/` |
+| 拔卡后 | 照常能用 | 不在桌面上（规范要的是图标变灰，还没做） |
+| 适合 | 预装应用、常用的小应用 | 大应用、不常用的 |
+
+装到哪（现在还不能自己选）：装过的新版本装回原处；新的应用插着 SD 卡就装卡上，没插装机器里。
 
 每个应用目录里是 `manifest.json`、`app.wasm`、`assets/`、`data/`。数据和程序放在一起，挪位置、卸载都一起走。
 
@@ -400,6 +403,7 @@ int32_t nomi_event(int32_t type, int32_t id, int32_t value)
   - 进程对象用 `shared_ptr` 管理；界面回调持有的是 `weak_ptr`，进程没了再点也不会出事。
   - 每 5 秒检查一遍：在后台、又没理由留着的进程，30 秒后结束。
   - 2 秒超时（待做）靠这个任务的看门狗来实现。
+- 内部闪存：读写闪存时 cache 关掉、PSRAM 访问不了，栈在 PSRAM 的任务（应用进程、系统任务）一碰 `/int` 就断言重启。它们的读写（读程序、读写 kv、`data:/` `pkg:/` 的文件）都交给 `NomiFlashIo`：一个栈在内部 RAM 的小任务（6KB）替它们做；调用方自己的栈在内部 RAM（网页服务器）就直接做。
 - 播放：
   - `NomiRadio::Station.owner` 记着是哪个应用放的。
   - 放完时，`on_finished` 把 `NOMI_MEDIA_FINISHED` 送给这个应用。
@@ -435,7 +439,7 @@ int32_t nomi_event(int32_t type, int32_t id, int32_t value)
 | 大模型 | ✓ manifest 的 `voice` + `self.app.command`、`voice_arg` `voice_reply` `assistant_context`；✗ `assistant_say` |
 | 其他 | ✓ `time_now` `timer_start` `timer_stop` `nomi_log`；✗ `keep_awake` |
 | 事件 | ✓ 点击、返回、关闭、定时器、语音、网页、播放、SHOW / HIDE；✗ 暂停 / 恢复（浮层、睡眠） |
-| 安装 | ✓ 网页上传 `.npk`、开机扫描、更新保留数据、应用管理和网页删除；✗ 装到机器内部、从 SD 卡上的安装包装、权限确认界面 |
+| 安装 | ✓ 网页上传 `.npk`、开机扫描、更新保留数据、应用管理和网页删除、机器内部的应用分区、预装应用（开机装、从 SD 卡搬数据）；✗ 自己选装在哪、挪位置、预装应用删了能恢复、从 SD 卡上的安装包装、权限确认界面 |
 | 工具 | ✓ `tools/app-sdk/`：`nomi_sdk.h`、`nomi_text.h`、`build.py`（编译 + 打包，去掉调试信息）、`wasm_info.py`（看导入导出）、`examples/counter` |
 
 | 自带应用 | ✓ `apps/music` v0.3：本地（按文件夹排队列、三种播放模式）、电台、播客（订阅、最新 10 期、每个播客记听到哪）、在线点歌（搜、歌词、封面）、首页卡片、自带网页（订阅、音乐网站）、`play` `skip` `mode` `podcast` `subscribe` `online` 六个指令 |

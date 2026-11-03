@@ -1,8 +1,12 @@
 // 应用包（.npk）的安装、删除和开机登记。包的格式、manifest 字段见 docs/app-sdk.md。
 //
-// 现在只装在 SD 卡上（sd:/nomi/apps/<id>/，里面 manifest.json、app.wasm、assets/、data/）；
-// 机器内部的应用分区还没做。开机后在应用任务里扫一遍卡上装好的包，登记到桌面（nomi_apps_add）。
-// 装同一个 id 的新版本：换掉程序和 assets，保留 data/（进度）。删除连 data/ 一起删。
+// 装在两个地方，目录里都是 manifest.json、app.wasm、assets/、data/：
+// - 机器内部的应用分区（闪存里 2MB 的 FAT，挂在 /int；nomi/apps/<id>/）：预装应用，不插 SD 卡也能用
+// - SD 卡（/sd/nomi/apps/<id>/）
+// 预装应用的包（.npk）编在资源分区里（板子目录的 preinstall/），开机时比内部装着的新（或者还没装）就装进去；
+// SD 卡上有同一个应用的老安装，把它的 data/ 搬过来、删掉卡上那份。预装应用现在不能删，只能被新版本盖过。
+// 开机后在应用任务里扫一遍两个地方，登记到桌面（nomi_apps_add）。
+// 装同一个 id 的新版本：装回原来的位置，换掉程序和 assets，保留 data/（进度）。删除连 data/ 一起删。
 #pragma once
 
 #include <functional>
@@ -18,6 +22,8 @@ struct NomiPackage {
     std::string dir;  // 设备上的目录
     std::vector<std::string> permissions;
     int memory_kb = 256;
+    bool internal = false;  // 装在机器内部（不是 SD 卡）
+    bool builtin = false;   // 预装的（跟着固件走）
     bool tile = false;  // 占首页的收听卡片（开机后在后台跑起来画）
     // 大模型能调的指令（self.app.command）：NOMI_EV_VOICE 的 id 是第几个（从 1 起）
     struct Voice {
@@ -37,6 +43,8 @@ struct NomiPackage {
 class NomiPkg {
 public:
     static constexpr const char* kAppsDir = "/sd/nomi/apps";
+    static constexpr const char* kInternalMount = "/int";
+    static constexpr const char* kInternalAppsDir = "/int/nomi/apps";
 
     static NomiPkg& GetInstance();
 
@@ -65,8 +73,17 @@ private:
     std::vector<std::unique_ptr<NomiPackage>> packages_;
     // 换下来的旧包对象不删：应用任务可能还在收尾、引用着它（一个几百字节，留着无所谓）
     std::vector<std::unique_ptr<NomiPackage>> retired_;
+    bool internal_ok_ = false;  // 内部应用分区挂上了
 
     NomiPkg() = default;
+    void MountInternal();
+    void Preinstall();
+    // 装一个包（tar 流）。base 空 = 按规则选（装过的装回原处；新的 SD 卡在就装卡上，不在装机器里）。
+    // web 为 true 时装好登记到桌面、弹提示；false（开机预装）只装文件，等扫描登记
+    std::string Install(const std::string& base, size_t length, const std::function<int(char*, size_t)>& read,
+                        bool web);
+    // 一个地方装着的包（不登记）；内部分区的要在 NomiFlashIo::Run 里调
+    std::vector<std::unique_ptr<NomiPackage>> CollectDir(const std::string& base, bool internal);
     void Scan();
     const NomiPackage* Register(std::unique_ptr<NomiPackage> pkg);
 };

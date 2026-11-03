@@ -1,6 +1,6 @@
 # 闪存分区与固件余量
 
-16 MB 闪存按 `firmware/partitions/v2/16m.csv` 分区：
+16 MB 闪存按 `firmware/partitions/v2/16m_apps.csv` 分区（这块板子专用，在 config.json 里指定；别的板子还是 16m.csv）：
 
 | 分区 | 位置 | 大小 | 放什么 |
 |---|---|---|---|
@@ -9,7 +9,10 @@
 | phy_init | 0xf000 | 4 KB | 射频校准数据 |
 | ota_0 | 0x20000 | 3.94 MB | 程序槽 A（USB 烧录写这里） |
 | ota_1 | 紧跟 ota_0 | 3.94 MB | 程序槽 B，远程升级（OTA）时用来 A/B 切换 |
-| assets | 0x800000 | 8 MB | 字体、表情、唤醒词模型等资源 |
+| assets | 0x800000 | 6 MB | 字体、表情、唤醒词模型等资源，还有预装应用的包（.npk） |
+| apps | 0xE00000 | 2 MB | 应用分区（FAT，挂在 /int）：预装应用、装在机器里的应用和它们的数据（订阅、进度这些） |
+
+2026-11-03 从 16m.csv 改过来：资源分区原来 8 MB、只用了 4 MB 多，匀了 2 MB 给应用分区；nvs 没动。改分区表只能 USB 烧录（OTA 换不了分区表）。
 
 ## “应用分区还剩 x%” 是什么
 
@@ -23,15 +26,17 @@ xiaozhi.bin binary size 0x383a50 bytes. Smallest app partition is 0x3f0000 bytes
 
 2026-11 加完在线音乐时（提交 06cfdf1）的数字：程序 3.51 MB / 程序槽 3.94 MB（89%），余量 433 KB；整个在线音乐功能（含界面和网页卡片）只让程序增大了 18.6 KB。资源分区用了约 4 MB / 8 MB。
 
+2026-11-03 加完应用包运行时、预装应用后：程序 3.70 MB（余量约 240 KB，6%）；资源分区用了 4.1 MB / 6 MB（预装的音乐应用包 80 KB）。
+
 ## 哪些操作会清掉数据
 
-用户数据都在 nvs 分区里：
+用户数据在 nvs 分区和应用分区里：
 
-| 操作 | nvs 里的数据 |
-|---|---|
-| 平时的烧录（`scripts/build.py` 编译后 `idf.py flash` / `app-flash`） | 不动：只写引导程序、分区表、otadata、程序和资源 |
-| 屏幕设置里的「恢复出厂」 | 清空（`nvs_flash_erase()` 后重启） |
-| `idf.py erase-flash`、`esptool erase_flash` | 清空（整片擦除） |
+| 操作 | nvs 里的数据 | 应用分区（应用和它们的数据） |
+|---|---|---|
+| 平时的烧录（`scripts/build.py` 编译后 `idf.py flash` / `app-flash`） | 不动：只写引导程序、分区表、otadata、程序和资源 | 不动（烧录不写这个分区） |
+| 屏幕设置里的「恢复出厂」 | 清空（`nvs_flash_erase()` 后重启） | 不动 |
+| `idf.py erase-flash`、`esptool erase_flash` | 清空（整片擦除） | 清空，开机重新格式化、重装预装应用 |
 
 nvs 只有 16 KB（4 页，扣掉整理用的一页实际能存约 12 KB）。`Settings::SetString` 是用 `ESP_ERROR_CHECK` 写的，真写满了会直接重启，所以别往 nvs 里放大块数据（长期记忆已经限制在 2 KB 以内）。
 

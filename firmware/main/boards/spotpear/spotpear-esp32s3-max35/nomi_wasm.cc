@@ -1,6 +1,7 @@
 #include "nomi_wasm.h"
 
 #include "display/display.h"
+#include "nomi_flash_io.h"
 #include "nomi_music.h"
 #include "nomi_pkg.h"
 #include "nomi_radio.h"
@@ -665,6 +666,14 @@ int32_t ui_player(wasm_exec_env_t env) {
 
 /* ---------- 存储 ---------- */
 
+// SD 卡上的路径：先挂上卡（已经挂着就只是计个数）；别的路径什么都不做（没插卡时别白等一次挂载）
+struct SdIfNeeded {
+    std::unique_ptr<NomiSdCard::Use> use;
+    explicit SdIfNeeded(const std::string& path) {
+        if (path.rfind("/sd/", 0) == 0) use = std::make_unique<NomiSdCard::Use>();
+    }
+};
+
 // 应用给的路径换成设备上的；不许 ..；权限不够、写只读的地方返回空，err 里是原因
 std::string Resolve(Proc* p, const char* path, bool write, int32_t* err) {
     std::string s = path ? path : "";
@@ -687,49 +696,68 @@ int32_t fs_list(wasm_exec_env_t env, const char* dir, char* buf, uint32_t size) 
     std::string path = Resolve(Ctx(env), dir, false, &err);
     if (path.empty()) return err;
     if (path.back() == '/') path.pop_back();
-    DIR* d = opendir(path.c_str());
-    if (!d) return NomiSdCard::GetInstance().GetState() == NomiSdCard::kReady ? E_NOT_FOUND : E_NO_SD;
-    uint32_t n = 0;
-    while (dirent* e = readdir(d)) {
-        std::string line = std::string(e->d_name) + (e->d_type == DT_DIR ? "/" : "") + "\n";
-        if (n + line.size() + 1 > size) break;
-        memcpy(buf + n, line.data(), line.size());
-        n += line.size();
-    }
-    closedir(d);
-    if (size) buf[n < size ? n : size - 1] = '\0';
-    return n;
+    SdIfNeeded sd(path);
+    int32_t result = 0;
+    NomiFlashIo::ForPath(path, [&] {
+        DIR* d = opendir(path.c_str());
+        if (!d) {
+            result = sd.use && !*sd.use ? E_NO_SD : E_NOT_FOUND;  // 卡上的路径、卡又没挂上：没插卡
+            return;
+        }
+        uint32_t n = 0;
+        while (dirent* e = readdir(d)) {
+            std::string line = std::string(e->d_name) + (e->d_type == DT_DIR ? "/" : "") + "\n";
+            if (n + line.size() + 1 > size) break;
+            memcpy(buf + n, line.data(), line.size());
+            n += line.size();
+        }
+        closedir(d);
+        if (size) buf[n < size ? n : size - 1] = '\0';
+        result = n;
+    });
+    return result;
 }
 
 int32_t fs_size(wasm_exec_env_t env, const char* path) {
     int32_t err;
     std::string s = Resolve(Ctx(env), path, false, &err);
     if (s.empty()) return err;
-    struct stat st;
-    return stat(s.c_str(), &st) == 0 ? static_cast<int32_t>(st.st_size) : E_NOT_FOUND;
+    SdIfNeeded sd(s);
+    int32_t result = E_NOT_FOUND;
+    NomiFlashIo::ForPath(s, [&] {
+        struct stat st;
+        if (stat(s.c_str(), &st) == 0) result = static_cast<int32_t>(st.st_size);
+    });
+    return result;
 }
 
 int32_t fs_read(wasm_exec_env_t env, const char* path, int32_t offset, void* buf, uint32_t size) {
     int32_t err;
     std::string s = Resolve(Ctx(env), path, false, &err);
     if (s.empty()) return err;
-    FILE* f = fopen(s.c_str(), "rb");
-    if (!f) return E_NOT_FOUND;
+    SdIfNeeded sd(s);
     if (size > kMaxRead) size = kMaxRead;
-    size_t n = fseek(f, offset, SEEK_SET) == 0 ? fread(buf, 1, size, f) : 0;
-    fclose(f);
-    return static_cast<int32_t>(n);
+    int32_t result = E_NOT_FOUND;
+    NomiFlashIo::ForPath(s, [&] {
+        FILE* f = fopen(s.c_str(), "rb");
+        if (!f) return;
+        result = fseek(f, offset, SEEK_SET) == 0 ? static_cast<int32_t>(fread(buf, 1, size, f)) : 0;
+        fclose(f);
+    });
+    return result;
 }
 
 // 小设置和进度：data/kv.json，一个 JSON 对象，改一次写一次（不占设备那 16KB 的 NVS）
 void LoadKv(Proc* p) {
-    std::string text;
-    if (FILE* f = fopen((p->pkg->dir + "/data/kv.json").c_str(), "rb")) {
-        char tmp[512];
-        size_t n;
-        while ((n = fread(tmp, 1, sizeof(tmp), f)) > 0 && text.size() < 64 * 1024) text.append(tmp, n);
-        fclose(f);
-    }
+    std::string text, path = p->pkg->dir + "/data/kv.json";
+    NomiFlashIo::ForPath(path, [&] {
+        if (FILE* f = fopen(path.c_str(), "rb")) {
+            char tmp[512];
+            size_t n;
+            while ((n = fread(tmp, 1, sizeof(tmp), f)) > 0 && text.size() < 64 * 1024) text.append(tmp, n);
+            fclose(f);
+        }
+    });
     p->kv = cJSON_Parse(text.c_str());
     if (!cJSON_IsObject(p->kv)) {
         cJSON_Delete(p->kv);
@@ -752,11 +780,14 @@ int32_t kv_set(wasm_exec_env_t env, const char* key, const char* value) {
     if (cJSON_HasObjectItem(p->kv, key)) cJSON_ReplaceItemInObjectCaseSensitive(p->kv, key, item);
     else cJSON_AddItemToObject(p->kv, key, item);
     std::string dir = p->pkg->dir + "/data";
-    mkdir(dir.c_str(), 0775);
     char* json = cJSON_PrintUnformatted(p->kv);
-    FILE* f = fopen((dir + "/kv.json").c_str(), "wb");
-    bool ok = f && json && fwrite(json, 1, strlen(json), f) == strlen(json);
-    if (f) fclose(f);
+    bool ok = false;
+    NomiFlashIo::ForPath(dir, [&] {
+        mkdir(dir.c_str(), 0775);
+        FILE* f = fopen((dir + "/kv.json").c_str(), "wb");
+        ok = f && json && fwrite(json, 1, strlen(json), f) == strlen(json);
+        if (f) fclose(f);
+    });
     cJSON_free(json);
     return ok ? 0 : E_FAIL;
 }
@@ -803,6 +834,7 @@ int32_t media_play(wasm_exec_env_t env, const char* src, const char* title, cons
         int32_t err;
         url = Resolve(p, src, false, &err);
         if (url.empty() || url.rfind("/sd/", 0) != 0) return url.empty() ? err : E_FAIL;
+        NomiSdCard::Use sd;
         struct stat st;
         if (stat(url.c_str(), &st) != 0) return E_NOT_FOUND;
     }
@@ -867,6 +899,7 @@ int32_t media_info(wasm_exec_env_t env, const char* path, char* buf, uint32_t si
     int32_t err;
     std::string s = Resolve(Ctx(env), path, false, &err);
     if (s.empty()) return err;
+    SdIfNeeded sd(s);
     NomiMusic::Track t;
     int duration = 0;
     NomiMusic::ReadInfo(s, t, duration);
@@ -1053,19 +1086,27 @@ void Fail(Proc* p, const std::string& msg) {
 
 void RunProc(Proc* p) {
     const NomiPackage* pkg = p->pkg;
-    NomiSdCard::Use sd;  // 应用和它的数据在 SD 卡上，跑着的时候一直挂着
-    if (!sd) return Fail(p, "SD 卡没插，打不开「" + pkg->name + "」");
+    // 装在 SD 卡上的：程序和数据都在卡上，跑着的时候卡一直挂着。装在机器里的不占着卡（sd:/ 的读写每次自己挂）
+    std::unique_ptr<NomiSdCard::Use> sd;
+    if (!pkg->internal) {
+        sd = std::make_unique<NomiSdCard::Use>();
+        if (!*sd) return Fail(p, "SD 卡没插，打不开「" + pkg->name + "」");
+    }
 
     std::string path = pkg->dir + "/app.wasm";
     struct stat st;
-    if (stat(path.c_str(), &st) != 0 || st.st_size <= 0 || static_cast<size_t>(st.st_size) > kMaxWasm) {
-        return Fail(p, "「" + pkg->name + "」的程序文件不见了，重新装一下");
-    }
-    // 运行时要一直引用这块（解释器会在里面改写），卸载后才能放
-    auto* buf = static_cast<uint8_t*>(heap_caps_malloc(st.st_size, MALLOC_CAP_SPIRAM));
-    FILE* f = fopen(path.c_str(), "rb");
-    bool read_ok = buf && f && fread(buf, 1, st.st_size, f) == static_cast<size_t>(st.st_size);
-    if (f) fclose(f);
+    bool found = false, read_ok = false;
+    uint8_t* buf = nullptr;
+    NomiFlashIo::ForPath(path, [&] {
+        found = stat(path.c_str(), &st) == 0 && st.st_size > 0 && static_cast<size_t>(st.st_size) <= kMaxWasm;
+        if (!found) return;
+        // 运行时要一直引用这块（解释器会在里面改写），卸载后才能放
+        buf = static_cast<uint8_t*>(heap_caps_malloc(st.st_size, MALLOC_CAP_SPIRAM));
+        FILE* f = fopen(path.c_str(), "rb");
+        read_ok = buf && f && fread(buf, 1, st.st_size, f) == static_cast<size_t>(st.st_size);
+        if (f) fclose(f);
+    });
+    if (!found) return Fail(p, "「" + pkg->name + "」的程序文件不见了，重新装一下");
     if (!read_ok) {
         heap_caps_free(buf);
         return Fail(p, "读不了「" + pkg->name + "」的程序文件");
