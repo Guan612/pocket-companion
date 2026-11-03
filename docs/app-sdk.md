@@ -442,7 +442,7 @@ int32_t nomi_event(int32_t type, int32_t id, int32_t value)
 | 安装 | ✓ 网页上传 `.npk`、开机扫描、更新保留数据、应用管理和网页删除、机器内部的应用分区、预装应用（开机装、从 SD 卡搬数据）；✗ 自己选装在哪、挪位置、预装应用删了能恢复、从 SD 卡上的安装包装、权限确认界面 |
 | 工具 | ✓ `tools/app-sdk/`：`nomi_sdk.h`、`nomi_text.h`、`build.py`（编译 + 打包，去掉调试信息）、`wasm_info.py`（看导入导出）、`examples/counter` |
 
-| 自带应用 | ✓ `apps/music` v0.3：本地（按文件夹排队列、三种播放模式）、电台、播客（订阅、最新 10 期、每个播客记听到哪）、在线点歌（搜、歌词、封面）、首页卡片、自带网页（订阅、音乐网站）、`play` `skip` `mode` `podcast` `subscribe` `online` 六个指令 |
+| 自带应用 | ✓ `apps/music` v0.4：本地（按文件夹排队列、三种播放模式）、电台（台单在 kv 里、自带网页上增删排序、radio-browser 搜台）、播客（订阅、最新 10 期、每个播客记听到哪）、在线点歌（搜、歌词、封面）、首页卡片、自带网页（台单、订阅、音乐网站）、`play` `skip` `mode` `podcast` `subscribe` `online` `radio` 七个指令。固件里的台单 / 播客 / 在线业务已删（2026-11-03 第 ④ 步），老固件留在 NVS 里的数据不迁移（要腾地方用 `tools/erase_legacy_nvs.py` 清一次） |
 
 源码和安装包放在哪：
 

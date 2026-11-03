@@ -16,7 +16,7 @@ Pocket Companion 是一个桌面语音伙伴：底座是小智 xiaozhi-esp32 v2.
 | ② 音乐应用 v1 | 本地 + 电台，收听卡片换成应用的 | ✓ `1b9cdde` |
 | ③ 播客、在线 | 搬进音乐应用；应用自带网页设置页 | ✓ `0bf21ee` |
 | 预装 | 机器内部的应用分区（2MB FAT）、预装应用、从 SD 卡搬数据 | ✓ `3edbf6e` |
-| ④ 删固件里的旧业务 | 删固件的电台台单 / 播客 / 在线，迁 NVS 数据进音乐应用 | **待做**，见下 |
+| ④ 删固件里的旧业务 | 删固件的电台台单 / 播客 / 在线，老 NVS 数据不迁移（用 `tools/erase_legacy_nvs.py` 清一次） | ✓（应用 0.4.0：台单进 kv 可在网页增删排序、radio-browser 搜台、电台语音） |
 
 ## 仓库地图
 
@@ -26,13 +26,12 @@ Pocket Companion 是一个桌面语音伙伴：底座是小智 xiaozhi-esp32 v2.
 | `nomi_wasm.cc/.h` | 应用运行时：进程、所有系统接口（`ui_*` `media_*` `net_*` `kv_*` `voice_*` `web_*`）、语音 / 网页请求转给应用 |
 | `nomi_pkg.cc/.h` | 包管理：安装（tar 流）、扫描、预装、删除、应用网页 `/app/<id>/`、内部分区挂载 |
 | `nomi_flash_io.cc/.h` | 替栈在 PSRAM 的任务读写内部闪存（见「踩过的坑」） |
-| `nomi_radio.cc/.h` | 播放器：收流、本地文件（FLAC / WAV / MP3）、m4a、解码、对话时让路。**还带着电台台单和搜台（第 ④ 步要删）** |
-| `nomi_music.cc` / `nomi_music_local.cc` | 「正在放」的封面、歌词；本地文件读标签。**nomi_music.cc 里还有固件的在线点歌（第 ④ 步要删）** |
-| `nomi_podcast.cc/.h` | **固件的播客（第 ④ 步整个删）** |
-| `nomi_ui.c/.h` | 主界面（表情、卡片、设置、对话浮层）；`ui_now_playing` 组件（系统收听页和应用卡片共用的「正在放」） |
+| `nomi_radio.cc/.h` | 系统播放器：收流、本地文件（FLAC / WAV / MP3）、m4a、解码、对话时让路；放什么归应用（`Station.owner`），大模型工具只留 `self.radio.stop` |
+| `nomi_music.cc` / `nomi_music_local.cc` | 「正在放」的封面、歌词；本地文件读标签。放哪首、音乐网站都归应用 |
+| `nomi_ui.c/.h` | 主界面（表情、卡片、设置、对话浮层）；`ui_now_playing` 组件（系统收听页和应用卡片共用的「正在放」）；系统收听页只剩「正在放」（没装音乐应用时给提示） |
 | `nomi_app.c/.h` | 桌面和应用层（打开、右划返回、应用管理） |
 | `nomi_display.cc` | 界面和系统的胶水：界面要的文字、图片、按钮动作 |
-| `spotpear_esp32s3_max35.cc` | 板子初始化、大模型工具注册（含 `self.app.command`）、网页接口挂载 |
+| `spotpear_esp32s3_max35.cc` | 板子初始化、大模型工具注册（含 `self.app.command`）、网页接口挂载（应用、SD 卡） |
 | `preinstall/nomi.music.npk` | 预装的音乐应用包（**手动打的，改了应用要重打**） |
 | `firmware/main/protocols/direct_api_config_*` | 网页设置页（页面 HTML 在 `direct_api_config_page.h`） |
 | `firmware/partitions/v2/16m_apps.csv` | 这块板子的分区表 |
@@ -65,9 +64,10 @@ python tools/app-sdk/wasm_info.py apps/music/build/app.wasm   # 看导入导出�
 `build.py` 要 zig（`pip install ziglang`，系统 Python 里有）。IDF 的 Python 环境里没有，所以固件编译时不自动打应用包。
 
 上机测试（这台电脑的环境）：
-- 串口 COM11。用 IDF venv 的 Python（有 pyserial）：`C:\Espressif\tools\python\v6.1\venv\Scripts\python.exe`。打开串口前先把 DTR、RTS 设成 False，不然会复位芯片；要从开机收日志就主动拉一下 RTS。
+- 串口 COM11。用 IDF venv 的 Python（有 pyserial）：`C:\Espressif\tools\python_env\idf6.1_py3.12_env\Scripts\python.exe`。打开串口前先把 DTR、RTS 设成 False，不然会复位芯片；要从开机收日志就主动拉一下 RTS。
 - 设备在局域网 192.168.1.40（会变，看屏幕下拉设置或串口日志 `Config page:`）。网页设置页就是这个地址。
-- 常用接口：`POST /apps/install`（请求体是 .npk）、`GET /apps.json`、`POST /app/<id>/call`（应用自己的网页请求，比如 `{"cmd":"pod_play","feed":"…"}`）、`GET /app/<id>/`、`POST /radio/play {"stop":true}`、`GET /podcast.json`、`GET /music.json`。
+- 常用接口：`POST /apps/install`（请求体是 .npk）、`GET /apps.json`、`POST /app/<id>/call`（应用自己的网页请求，比如 `{"cmd":"pod_play","feed":"…"}`、`{"cmd":"station_list"}`）、`GET /app/<id>/`。固件的 `/radio/*` `/podcast/*` `/music.json` 第 ④ 步删掉了。
+- 清老固件的 NVS 数据（只做一次）：IDF 环境里 `python tools/erase_legacy_nvs.py --port COM11`（先加 `--dry-run` 看会删什么；会自动留备份，恢复 `esptool write-flash 0x9000 备份.bin`）。
 - 测 CPU：板子上临时加 `SystemInfo::PrintTaskCpuUsage(pdMS_TO_TICKS(2000))`（`system_info.h`），测完删。
 - **用户经常同时在用这台机器。上机测试会出声、切歌、重启的，先跟用户说一声。**
 
@@ -94,22 +94,14 @@ python tools/app-sdk/wasm_info.py apps/music/build/app.wasm   # 看导入导出�
 - 首页左右翻：历史、表情、收听卡片、时钟；往上推是桌面（应用网格）；下拉是设置；任何地方叫它说话从底下升起对话浮层，不翻页。
 - 收听卡片：装了带 `tile` 的应用就盖上一层（`nomi_ui_listen_slot`），系统收听页整层藏起来。音乐应用在卡片里用 `ui_now_playing`（和系统收听页同一个组件：左边封面、控制、进度，右边 7 行歌词），顶上一排放「本地 / 电台 / 播客 / 在线」入口。
 
-## 第 ④ 步：要做的事
+## 第 ④ 步：完成情况（2026-11-03）
 
-目标：固件里不再有电台台单、播客、在线点歌的业务，全在音乐应用里；用户的数据一次迁过去。
+目标达成：固件里不再有电台台单、播客、在线点歌的业务，全在音乐应用里；用户的数据开机一次迁过去。
 
-1. **迁数据**（开机一次，迁完清掉旧的）：固件 NVS 里的
-   - 电台台单（`nomi_radio` 命名空间 `list`，JSON 数组 `[{"n":台名,"u":地址}]`，顺序就是用户调好的）和上次放的台（`last`，下标）
-   - 播客订阅（`nomi_pod` 的 `list`）、每个播客的进度（`p<哈希>`）、`last`
-   - 音乐网站（`nomi_music` 的 `site`，应用里已经手动填过了）
-
-   写进 `/int/nomi/apps/nomi.music/data/kv.json`（格式见 `apps/music/podcast.c` `online.c` 开头的注释）。应用在跑时要让它重新读（结束进程再起、或者加个事件）。
-2. **应用补功能**：
-   - 台单进 kv、可编辑：网页上增删、**排序**（用户一开始就要的功能，现在在固件网页「收听 → 电台」）；`assets/stations.txt` 只当默认值。
-   - 按台名去网上电台目录搜台（固件 `NomiRadio::Search`，radio-browser）。
-   - 电台的「接着放」「换台」语音（现在是固件的 `self.radio.play`）。
-3. **删固件**：`nomi_podcast.*` 整个、`nomi_music.cc` 里的在线点歌、`nomi_radio.cc` 的台单 / 搜台 / 网页接口 / 工具，网页设置页「收听」菜单下的三页，对应的大模型工具（`self.radio.*` `self.podcast.*` `self.music.play`），系统收听页的标签和列表（只留「正在放」，没装音乐应用时给提示）。「停 / 暂停」留成系统工具。表情页左上角的小条、放歌时的表情跟着系统播放状态走，不动。
-4. 更新 `docs/app-sdk.md`、`docs/flash-partitions.md`（nvs 里不再有台单、播客）、README。
+- **应用（0.4.0）**：台单进 kv `stations`（没动过就用 `assets/stations.txt` 的默认值，一改整个存进 kv），应用网页上增删、**排序**（↑↓）、试播；台单里没有的台名去 radio-browser 目录搜（语音里说台名 / 类型也走它，满意说「收藏这个台」进台单）；语音加了 `radio` 指令（空 = 接着放、「下一个 / 上一个」= 换台、台名 = 放 / 搜、「收藏」）。
+- **老 NVS 数据不迁移**（用户定的）：固件里一行清理代码都没有——只跑一次的事不放固件。要腾 nvs 的地方就在电脑上跑一次 `tools/erase_legacy_nvs.py --port COM11`（esptool 读下 nvs 分区留备份 → 删 `nomi_radio` `nomi_pod` `nomi_music` 三个命名空间 → 别的原样写回，离线测过往返无损）。台单、订阅在音乐应用里重新加。
+- **删掉的**：`nomi_podcast.*` 整个；`nomi_music.cc` 的在线点歌（Search/Play/网页接口/`self.music.play`）；`nomi_radio.cc` 的台单、搜台、网页接口和 `self.radio.play/save/remove`（留 `self.radio.stop`）；网页设置页「收听」三页和菜单项；系统收听页的标签、台单 / 订阅 / 节目单列表（只剩「正在放」+ 歌词，`NomiMusic::Hint` 提示装音乐应用）；`on_progress` 回调（进度归应用）。表情页左上角小条、放歌表情、闹钟让路都没动。
+- 上机还没验：`tools/erase_legacy_nvs.py` 对真机跑一遍、收听卡片、搜台。
 
 ## 已知问题和风险
 
@@ -118,22 +110,22 @@ python tools/app-sdk/wasm_info.py apps/music/build/app.wasm   # 看导入导出�
 | PSRAM 紧 | 音乐应用常驻约占 750KB（内存 512KB + 运行时），装上后剩 1.3MB、最大块 1.3MB。m4a 节目要把整个 moov 读进 PSRAM（1.5 小时的节目约 1MB），更长的可能放不了。根治：m4a 不整块缓存 moov，按需读 |
 | CPU 满载 | 唤醒词 + 收音一直 ~38%；放 96k/24 位 FLAC 解码 + 读卡 ~22%；表情页放歌时的动画 ~30%。三样叠在一起会卡（用户接受「到上限就算了」）。已做：解码优先级降到界面之下、放歌时表情隔帧画 |
 | 内部 RAM | 平时空闲 ~50KB，开机联网那阵最低到过 4.8KB。TLS 一条要 ~30KB，同时只能一条（`HoldForHttps`） |
-| 程序槽 | 余量 ~240KB（6%）。第 ④ 步删代码会腾出一些 |
 | 音乐网站慢 | inmp3.com 搜一次 ~15 秒，取歌曲页 + 探格式又十几秒 |
-| 两套工具并存 | 第 ④ 步前，大模型同时看到固件的 `self.radio/podcast/music.*` 和应用的 `self.app.command`，都能用 |
-| 没验证 | 拔掉 SD 卡开机音乐应用能不能起来（远程做不了）；首页卡片顶上四个入口改宽后是否都显示全（没看屏幕） |
+| 没验证 | 第 ④ 步的迁移（台单顺序、播客进度接着放）、搜台、收听卡片；拔掉 SD 卡开机音乐应用能不能起来（远程做不了）；首页卡片顶上四个入口改宽后是否都显示全（没看屏幕） |
 | 小毛病 | 随机播放时「上一首」也是随机；预装应用删不了也没有「恢复」；网页装应用不能自己选装在哪；SD 卡上的应用拔卡后不在桌面（规范要的是变灰） |
 
 ## 踩过的坑（速查）
 
-- **栈在 PSRAM 的任务不能读写内部闪存（含 NVS）**：读写闪存时 cache 关掉、访问不了 PSRAM，`esp_task_stack_is_sane_cache_disabled` 断言重启。应用进程、`nomi_jobs`、播客 / 音乐后台任务的栈都在 PSRAM：碰 `/int` 走 `NomiFlashIo::Run` / `ForPath`，写 NVS 排到主循环（`Application::Schedule`）。
+- **栈在 PSRAM 的任务不能读写内部闪存（含 NVS）**：读写闪存时 cache 关掉、访问不了 PSRAM，`esp_task_stack_isane_cache_disabled` 断言重启。应用进程、`nomi_jobs`、播客 / 音乐后台任务的栈都在 PSRAM：碰 `/int` 走 `NomiFlashIo::Run` / `ForPath`，写 NVS 排到主循环（`Application::Schedule`）。
+- **Windows 上全量重编会撞 CreateProcess 的 32767 字符上限**：`project_elf_src` 那条编译命令带全部组件的 include（WAMR 又加了几个目录），超了就报 `CreateProcess failed / The parameter is incorrect`。修法（已写进 build 缓存）：`idf.py reconfigure -DCMAKE_NINJA_FORCE_RESPONSE_FILE=1`，include 进 @rsp 文件。
+- **拉了新代码别只 `idf.py reconfigure`**：sdkconfig 是旧的，新组件（比如 WAMR）会按自己的默认值补进去（WASI 默认开，链接就报 `os_openat` 未定义）。要跑 `python scripts/build.py spotpear/spotpear-esp32s3-max35 --name spotpear-esp32s3-max35` 按 config.json 重新生成 sdkconfig。
 - WAMR 必须在 pthread 里跑（加载时调 `pthread_self`），普通 FreeRTOS 任务里断言重启。
 - 板子构造函数里别调 `Board::GetInstance()`（单例没建完，自己等自己）。显示对象由板子传给 `NomiWasm::Init`。
 - LVGL 字体声明（`LV_FONT_DECLARE`）别写进匿名命名空间，链接找不到。
 - zig 默认带调试信息，app.wasm 大三倍：`build.py` 已加 `-g0 -Wl,--strip-all`。
 - 应用内存别开太大：开到 1MB 时 PSRAM 不够读 m4a 的 moov，连固件自己的播客都放不了（当时 moov 分配失败没有日志，已补）。
 - 首页卡片顶上那排入口宽度写死 244 像素时，第四个按钮被截掉；现在跟着按钮走。
-- 网页设置页的接口最多 7 + 32 个（`max_uri_handlers`），再加接口注意别超。
+- 网页设置页的接口最多 7 + 32 个（`max_uri_handlers`），再加接口注意别超（第 ④ 步删掉 14 个固件的，现在余量多了）。
 - 更多（唤醒词、SD 卡引脚、屏幕 SPI 别上 80MHz 等）见各 docs 和提交说明。
 
 ## 约定和用户偏好
