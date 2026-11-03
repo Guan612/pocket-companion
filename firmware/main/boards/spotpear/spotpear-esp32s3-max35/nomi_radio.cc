@@ -6,12 +6,7 @@
 #include "nomi_mp4.h"
 #include "nomi_sdcard.h"
 #include "nomi_util.h"
-#include "settings.h"
-#if CONFIG_DIRECT_API
-#include "direct_api_protocol.h"
-#endif
 
-#include <cJSON.h>
 #include <esp_audio_simple_dec.h>
 #include <esp_audio_simple_dec_default.h>
 #include <esp_crt_bundle.h>
@@ -32,26 +27,12 @@
 
 namespace {
 
-constexpr const char* kNs = "nomi_radio";
-constexpr size_t kMaxStations = 20;
 constexpr size_t kBufferBytes = 64 * 1024;    // 网络数据缓冲：64kbps 约 8 秒
 constexpr size_t kPrebufferBytes = 12 * 1024;  // 攒够这么多再开始放：64kbps 约 1.5 秒
 constexpr size_t kReadChunk = 2048;
 constexpr int kMaxBadChunks = 64;  // 连着这么多块（128KB）一帧都解不出来就放弃
 constexpr int64_t kResumeDelayUs = 800 * 1000;  // 回到待机多久后接着放（连续对话一轮轮之间别忽停忽放）
 enum { kCodecMp3 = 1, kCodecAac = 2, kCodecFlac = 3, kCodecWav = 4 };
-
-// 默认台单：千听（蜻蜓）的直播 MP3 走 http 不占 TLS 内存；AsiaFM 是 AAC，流里带歌名
-const NomiRadio::Station kDefaults[] = {
-    {"华语经典", "http://lhttp.qingting.fm/live/5022308/64k.mp3"},
-    {"AsiaFM 高清", "http://asiafm.hk:8000/asiahd"},
-    {"怀集音乐", "http://lhttp.qingting.fm/live/4804/64k.mp3"},
-    {"两广音乐", "http://lhttp.qingting.fm/live/20500149/64k.mp3"},
-    {"中国之声", "http://lhttp.qingting.fm/live/15318317/64k.mp3"},
-    {"第一财经", "http://lhttp.qingting.fm/live/276/64k.mp3"},
-    {"故事广播", "http://lhttp.qingting.fm/live/20500182/64k.mp3"},
-    {"评书", "http://lhttp.qingting.fm/live/1951/64k.mp3"},
-};
 
 // 千听的 https 地址换成 http：同一个 CDN，http 不用 TLS，省内部 RAM
 std::string PreferHttp(std::string url) {
@@ -219,47 +200,9 @@ NomiRadio& NomiRadio::GetInstance() {
     return instance;
 }
 
-/* ---------- 台单 ---------- */
-
-void NomiRadio::LoadList() {
-    std::lock_guard<std::mutex> lock(mutex_);
-    list_.clear();
-    Settings s(kNs);
-    std::string json = s.GetString("list");
-    cJSON* root = cJSON_Parse(json.c_str());
-    cJSON* item = nullptr;
-    cJSON_ArrayForEach(item, root) {
-        cJSON* name = cJSON_GetObjectItem(item, "n");
-        cJSON* url = cJSON_GetObjectItem(item, "u");
-        if (cJSON_IsString(name) && cJSON_IsString(url)) list_.push_back({name->valuestring, url->valuestring});
-    }
-    cJSON_Delete(root);
-    if (json.empty()) list_.assign(std::begin(kDefaults), std::end(kDefaults));  // 从没改过就用默认的
-    int last = s.GetInt("last", 0);
-    current_index_ = last >= 0 && last < static_cast<int>(list_.size()) ? last : 0;
-    if (!list_.empty()) current_ = list_[current_index_];
-}
-
-void NomiRadio::SaveList() {
-    cJSON* root = cJSON_CreateArray();
-    for (const auto& st : list_) {
-        cJSON* item = cJSON_CreateObject();
-        cJSON_AddStringToObject(item, "n", st.name.c_str());
-        cJSON_AddStringToObject(item, "u", st.url.c_str());
-        cJSON_AddItemToArray(root, item);
-    }
-    char* json = cJSON_PrintUnformatted(root);
-    Settings s(kNs, true);
-    s.SetString("list", json ? json : "[]");
-    if (current_index_ >= 0) s.SetInt("last", current_index_);
-    cJSON_free(json);
-    cJSON_Delete(root);
-}
-
 /* ---------- 开始 / 停止 ---------- */
 
 void NomiRadio::Start() {
-    LoadList();
     reader_go_ = xSemaphoreCreateBinary();
     decoder_go_ = xSemaphoreCreateBinary();
     static StaticStreamBuffer_t sb;
@@ -313,7 +256,6 @@ void NomiRadio::Monitor() {
                 reached_end_ = false;
                 wanted_ = false;
                 state_ = kOff;
-                ReportProgress(true);
                 position_ = 0;
                 if (on_finished) {
                     Application::GetInstance().Schedule([this, cur]() { on_finished(cur); });
@@ -371,31 +313,19 @@ void NomiRadio::EndSession() {
     if (running_) stopping_ = true;
 }
 
-void NomiRadio::Select(const Station& station, int index) {
+void NomiRadio::Select(const Station& station) {
     {
         std::lock_guard<std::mutex> lock(mutex_);
         current_ = station;
-        current_index_ = index;
         title_.clear();
     }
     position_ = station.episode ? station.start : 0;
-    if (index >= 0) Settings(kNs, true).SetInt("last", index);
     failures_ = 0;
     retry_at_us_ = 0;
     state_ = kConnecting;
-    EndSession();  // 正在放别的台：停掉，监视定时器会按新台重开
+    EndSession();  // 正在放别的：停掉，监视定时器会按新的这个重开
     wanted_ = true;
     ESP_LOGI(TAG, "Play %s (%s)", station.name.c_str(), station.url.c_str());
-}
-
-void NomiRadio::Play(int index) {
-    Station st;
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        if (index < 0 || index >= static_cast<int>(list_.size())) return;
-        st = list_[index];
-    }
-    Select(st, index);
 }
 
 void NomiRadio::Toggle() {
@@ -404,32 +334,16 @@ void NomiRadio::Toggle() {
         return;
     }
     Station st;
-    int index;
     {
         std::lock_guard<std::mutex> lock(mutex_);
         st = current_;
-        index = current_index_;
     }
-    if (st.url.empty()) Play(0);
-    else {
-        if (st.episode) st.start = position_;  // 节目从暂停的地方接着放
-        Select(st, index);
-    }
-}
-
-void NomiRadio::Step(int delta) {
-    int n, index;
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        n = static_cast<int>(list_.size());
-        index = current_index_;
-    }
-    if (n == 0) return;
-    Play(((index < 0 ? 0 : index) + delta + n) % n);
+    if (st.url.empty()) return;  // 还没有放过的东西（放什么由应用决定）
+    if (st.episode) st.start = position_;  // 节目从暂停的地方接着放
+    Select(st);
 }
 
 void NomiRadio::Stop() {
-    if (wanted_ && IsEpisode()) ReportProgress(false);  // 记住放到哪了
     wanted_ = false;
     EndSession();
     state_ = kOff;
@@ -447,11 +361,10 @@ void NomiRadio::ReleaseHttpsHold() {
     if (https_hold_ > 0) https_hold_--;
 }
 
-/* ---------- 播客节目 ---------- */
+/* ---------- 应用包放的节目 / 歌 ---------- */
 
 void NomiRadio::PlayEpisode(const Station& episode) {
-    if (wanted_ && IsEpisode()) ReportProgress(false);  // 换节目前把上一期的位置记下
-    Select(episode, -1);
+    Select(episode);
 }
 
 bool NomiRadio::IsEpisode() {
@@ -483,7 +396,7 @@ void NomiRadio::SeekTo(int second) {
     }
 }
 
-// 节目进度交给 NomiPodcast 存（写 NVS 要在主循环里：这里可能在 PSRAM 栈的任务里）
+// 网上的音频按文件头认格式：给放它的应用先探好用哪个地址
 NomiRadio::Station::Format NomiRadio::SniffFormat(const std::string& head) {
     if (head.size() < 12) return Station::kAuto;
     const auto* b = reinterpret_cast<const uint8_t*>(head.data());
@@ -492,14 +405,6 @@ NomiRadio::Station::Format NomiRadio::SniffFormat(const std::string& head) {
     if (memcmp(b, "ID3", 3) == 0 || (sync && (b[1] & 0x06) != 0)) return Station::kMp3;
     if (sync) return Station::kAdts;  // 帧头里 layer 为 0 的是 ADTS
     return Station::kAuto;
-}
-
-void NomiRadio::ReportProgress(bool finished) {
-    if (!on_progress) return;
-    Station st = Current();
-    if (!st.episode || st.song || !st.owner.empty()) return;  // 应用放的节目，进度归应用自己记
-    int pos = position_;
-    Application::GetInstance().Schedule([this, st, pos, finished]() { on_progress(st, pos, finished); });
 }
 
 void NomiRadio::UpdateMeta(const std::string& url, const std::string& name, const std::string& artist) {
@@ -1044,7 +949,7 @@ void NomiRadio::DecoderLoop() {
         int rate = 0, channels = 1, bytes_per_sample = 2;
         bool buffering = true;
         bool episode = IsEpisode();
-        int base = position_, reported = position_;
+        int base = position_;
         uint64_t played = 0;  // 这次播放送出去的采样数
         int bad_chunks = 0;   // 连着多少块一帧都没解出来
         while (!stopping_) {
@@ -1139,13 +1044,9 @@ void NomiRadio::DecoderLoop() {
                                 state_ = kPlaying;
                                 failures_ = 0;
                             }
-                            if (episode && !stopping_) {
+                            if (episode && !stopping_) {  // 节目的进度（应用自己来问，Position()）
                                 played += chunk;
                                 position_ = base + static_cast<int>(played / rate);
-                                if (position_ - reported >= 30) {  // 每放 30 秒记一次进度
-                                    reported = position_;
-                                    ReportProgress(false);
-                                }
                             }
                         }
                     }
@@ -1168,7 +1069,7 @@ void NomiRadio::DecoderLoop() {
     }
 }
 
-/* ---------- 给界面、网页、大模型 ---------- */
+/* ---------- 给界面 ---------- */
 
 NomiRadio::State NomiRadio::GetState() { return state_; }
 
@@ -1182,254 +1083,17 @@ std::string NomiRadio::Title() {
     return title_;
 }
 
-int NomiRadio::CurrentIndex() {
-    std::lock_guard<std::mutex> lock(mutex_);
-    return current_index_;
-}
-
-std::string NomiRadio::ListText() {
-    std::lock_guard<std::mutex> lock(mutex_);
-    std::string text;
-    for (const auto& st : list_) text += (text.empty() ? "" : "\n") + st.name;
-    return text;
-}
-
-std::string NomiRadio::PromptContext() {
-    std::lock_guard<std::mutex> lock(mutex_);
-    std::string ctx;
-    if (wanted_ && current_.episode) {
-        char pos[48];
-        int p = position_;
-        snprintf(pos, sizeof(pos), "（放到 %d:%02d", p / 60, p % 60);
-        ctx = (current_.song ? "正在放歌《" + current_.name + "》- " + current_.podcast
-                             : "正在放播客《" + current_.podcast + "》：" + current_.name) +
-              pos +
-              (current_.duration > 0 ? " / 共 " + std::to_string(current_.duration / 60) + " 分钟）" : std::string("）")) +
-              "。电台";
-    } else {
-        ctx = wanted_ ? "电台：正在放「" + current_.name + "」" : std::string("电台：没在放");
-        if (wanted_ && !title_.empty()) ctx += "（这首是 " + title_ + "）";
-    }
-    ctx += "。收藏的台：";
-    for (size_t i = 0; i < list_.size(); i++) ctx += (i ? "、" : "") + list_[i].name;
-    return ctx + "。";
-}
-
-std::string NomiRadio::ListJson() {
-    std::lock_guard<std::mutex> lock(mutex_);
-    cJSON* root = cJSON_CreateObject();
-    cJSON* arr = cJSON_AddArrayToObject(root, "stations");
-    for (const auto& st : list_) {
-        cJSON* item = cJSON_CreateObject();
-        cJSON_AddStringToObject(item, "name", st.name.c_str());
-        cJSON_AddStringToObject(item, "url", st.url.c_str());
-        cJSON_AddItemToArray(arr, item);
-    }
-    cJSON_AddNumberToObject(root, "max", kMaxStations);
-    cJSON_AddNumberToObject(root, "playing", wanted_ && !current_.episode ? current_index_ : -2);  // -1 是搜来没收藏的台
-    char* json = cJSON_PrintUnformatted(root);
-    std::string out = json ? json : "{}";
-    cJSON_free(json);
-    cJSON_Delete(root);
-    return out;
-}
-
-std::string NomiRadio::AddFromJson(const std::string& body) {
-    cJSON* root = cJSON_Parse(body.c_str());
-    cJSON* name = cJSON_GetObjectItem(root, "name");
-    cJSON* url = cJSON_GetObjectItem(root, "url");
-    std::string n = cJSON_IsString(name) ? name->valuestring : "";
-    std::string u = cJSON_IsString(url) ? url->valuestring : "";
-    cJSON_Delete(root);
-    if (n.empty() || n.size() > 60) return "!台名要填，最多 20 个字";
-    if ((u.rfind("http://", 0) != 0 && u.rfind("https://", 0) != 0) || u.size() > 300) {
-        return "!地址要以 http:// 或 https:// 开头";
-    }
-    if (u.find(".m3u8") != std::string::npos) return "!不支持 m3u8 分段流，要 MP3 / AAC 直播地址";
-    std::lock_guard<std::mutex> lock(mutex_);
-    for (auto& st : list_) {
-        if (st.name == n) {  // 同名就是改地址
-            st.url = u;
-            SaveList();
-            return "{\"ok\":true}";
-        }
-    }
-    if (list_.size() >= kMaxStations) return "!最多存 20 个台，先删掉几个";
-    list_.push_back({n, u});
-    SaveList();
-    return "{\"ok\":true}";
-}
-
-std::string NomiRadio::DeleteFromJson(const std::string& body) {
-    cJSON* root = cJSON_Parse(body.c_str());
-    cJSON* index = cJSON_GetObjectItem(root, "index");
-    int i = cJSON_IsNumber(index) ? index->valueint : -1;
-    cJSON_Delete(root);
-    std::lock_guard<std::mutex> lock(mutex_);
-    if (i < 0 || i >= static_cast<int>(list_.size())) return "!没有这个台";
-    list_.erase(list_.begin() + i);
-    if (current_index_ == i) current_index_ = -1;  // 正在放的还接着放，只是不在台单里了
-    else if (current_index_ > i) current_index_--;
-    SaveList();
-    return "{\"ok\":true}";
-}
-
-std::string NomiRadio::MoveFromJson(const std::string& body) {
-    cJSON* root = cJSON_Parse(body.c_str());
-    cJSON* index = cJSON_GetObjectItem(root, "index");
-    cJSON* to = cJSON_GetObjectItem(root, "to");
-    int from = cJSON_IsNumber(index) ? index->valueint : -1;
-    int dest = cJSON_IsNumber(to) ? to->valueint : -1;
-    cJSON_Delete(root);
-    std::lock_guard<std::mutex> lock(mutex_);
-    int n = static_cast<int>(list_.size());
-    if (from < 0 || from >= n) return "!没有这个台";
-    if (dest < 0 || dest >= n) return "!挪不到那里";
-    if (from == dest) return "{\"ok\":true}";
-    Station st = std::move(list_[from]);
-    list_.erase(list_.begin() + from);
-    list_.insert(list_.begin() + dest, std::move(st));
-    // 正在放（或上次放）的台跟着挪：下标改过来，屏幕上的换台、重启后接着放的都还是它
-    if (current_index_ == from) current_index_ = dest;
-    else if (from < current_index_ && current_index_ <= dest) current_index_--;
-    else if (dest <= current_index_ && current_index_ < from) current_index_++;
-    SaveList();
-    return "{\"ok\":true}";
-}
-
-std::string NomiRadio::PlayFromJson(const std::string& body) {
-    cJSON* root = cJSON_Parse(body.c_str());
-    cJSON* index = cJSON_GetObjectItem(root, "index");
-    bool stop = cJSON_IsTrue(cJSON_GetObjectItem(root, "stop"));
-    int i = cJSON_IsNumber(index) ? index->valueint : -1;
-    cJSON_Delete(root);
-    if (stop) {
-        Stop();
-        return "{\"ok\":true}";
-    }
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        if (i < 0 || i >= static_cast<int>(list_.size())) return "!没有这个台";
-    }
-    Play(i);
-    return "{\"ok\":true}";
-}
-
-// 电台目录（radio-browser）按名字搜，取票数最高的一个能直接放的（MP3 / AAC，不要 m3u8）
-bool NomiRadio::Search(const std::string& query, Station& found) {
-    auto http = Board::GetInstance().GetNetwork()->CreateHttp(3);
-    http->SetTimeout(8000);
-    http->SetHeader("User-Agent", "PocketCompanion/1.0");
-    std::string url = "http://all.api.radio-browser.info/json/stations/search?hidebroken=true&order=votes"
-                      "&reverse=true&limit=8&name=" + nomi::UrlEncode(query);
-    if (!http->Open("GET", url)) return false;
-    auto status = http->GetStatusCode();
-    std::string body = http->ReadAll();
-    http->Close();
-    if (!status || *status != 200) return false;
-    size_t pos = 0;
-    while ((pos = body.find('{', pos)) != std::string::npos) {
-        size_t end = body.find("},{", pos);
-        std::string obj = body.substr(pos, end == std::string::npos ? std::string::npos : end - pos + 1);
-        pos = end == std::string::npos ? body.size() : end + 2;
-        std::string codec = nomi::JsonField(obj, "codec"), u = nomi::JsonField(obj, "url_resolved");
-        if (nomi::JsonField(obj, "hls") == "1" || u.empty() || u.find(".m3u8") != std::string::npos) continue;
-        if (codec != "MP3" && codec != "AAC" && codec != "AAC+") continue;
-        found.name = nomi::JsonField(obj, "name");
-        found.url = PreferHttp(u);
-        if (found.name.size() > 60) found.name.resize(60);
-        while (!found.name.empty() && !nomi::ValidUtf8(found.name)) found.name.pop_back();
-        return true;
-    }
-    return false;
-}
+/* ---------- 大模型的工具 ---------- */
 
 void NomiRadio::RegisterTools() {
-    auto& mcp = McpServer::GetInstance();
-    mcp.AddTool(
-        "self.radio.play",
-        "放网络电台 / 音乐。主人说\"放点音乐\"\"来点轻音乐\"\"听新闻\"\"放中国之声\"\"换个台\"时调用；"
-        "点名要听哪首歌、哪个歌手的歌用 self.music.play。\n"
-        "station：台名（收藏的台见系统提示），也可以是想听的类型或别的台名（会去网上的电台目录搜）；"
-        "\"下一个\"\"上一个\"换台；空字符串接着放上次的台。调用后把这句回答说完，设备就安静下来开始放。",
-        PropertyList({Property("station", kPropertyTypeString, std::string("")).SetMaxLength(60)}),
+    // 放什么、放哪个、换哪个都归应用（self.app.command）；系统只留停 / 暂停这一个
+    McpServer::GetInstance().AddTool(
+        "self.radio.stop",
+        "停掉正在放的音乐、电台或播客（应用会记住进度）。主人说\"关掉音乐\"\"别放了\"\"暂停\"\"停\"时调用。",
+        PropertyList(),
         [this](const PropertyList& p) -> ToolResult {
-            std::string q = p["station"].value<std::string>();
-            std::string result;
-            if (q.empty()) {
-                if (!wanted_) Toggle();  // 本来就在放（对话时暂停着）：说完自动接着放
-                result = "好的，接着放「" + StationName() + "」";
-            } else if (q == "下一个" || q == "next" || q == "上一个" || q == "prev") {
-                Step(q == "下一个" || q == "next" ? 1 : -1);
-                result = "换到「" + StationName() + "」";
-            } else {
-                int match = -1;
-                {
-                    std::lock_guard<std::mutex> lock(mutex_);
-                    std::string lq = nomi::Lower(q);
-                    for (size_t i = 0; i < list_.size() && match < 0; i++) {
-                        if (nomi::Lower(list_[i].name) == lq) match = i;
-                    }
-                    for (size_t i = 0; i < list_.size() && match < 0; i++) {
-                        std::string ln = nomi::Lower(list_[i].name);
-                        if (ln.find(lq) != std::string::npos || lq.find(ln) != std::string::npos) match = i;
-                    }
-                }
-                if (match >= 0) {
-                    Play(match);
-                    result = "好的，放「" + StationName() + "」";
-                } else {
-                    Station found;
-                    if (!Search(q, found)) {
-                        return std::unexpected(std::string("收藏里没有，网上的电台目录也没搜到「") + q +
-                                               "」；可以换个说法，或在网页设置页添加电台地址");
-                    }
-                    Select(found, -1);
-                    result = "搜到「" + found.name + "」，马上放；主人想以后还听可以说\"收藏这个台\"";
-                }
-            }
-#if CONFIG_DIRECT_API
-            DirectApiProtocol::ExitAfterReply();  // 这句说完就回待机，电台才放得出来
-#endif
-            return result;
+            (void)p;
+            Stop();
+            return std::string("已停止");
         });
-
-    mcp.AddTool("self.radio.stop", "停掉电台、音乐或播客（播客会记住放到哪）。主人说\"关掉音乐\"\"别放了\"\"暂停\"\"停\"时调用。",
-                PropertyList(),
-                [this](const PropertyList& p) -> ToolResult {
-                    (void)p;
-                    Stop();
-                    return std::string("已停止");
-                });
-
-    mcp.AddTool("self.radio.save", "把正在放的台收藏进台单（主人说\"收藏这个台\"）。", PropertyList(),
-                [this](const PropertyList& p) -> ToolResult {
-                    (void)p;
-                    std::lock_guard<std::mutex> lock(mutex_);
-                    if (current_.url.empty()) return std::unexpected(std::string("现在没在放电台"));
-                    for (size_t i = 0; i < list_.size(); i++) {
-                        if (list_[i].url == current_.url) return std::string("这个台已经在收藏里了");
-                    }
-                    if (list_.size() >= kMaxStations) return std::unexpected(std::string("收藏满了（20 个）"));
-                    list_.push_back(current_);
-                    current_index_ = static_cast<int>(list_.size()) - 1;
-                    SaveList();
-                    return "已收藏「" + current_.name + "」";
-                });
-
-    mcp.AddTool("self.radio.remove", "从台单里删掉一个台。station 是台名。",
-                PropertyList({Property("station", kPropertyTypeString).SetMaxLength(60)}),
-                [this](const PropertyList& p) -> ToolResult {
-                    std::string q = p["station"].value<std::string>();
-                    int index = -1;
-                    {
-                        std::lock_guard<std::mutex> lock(mutex_);
-                        for (size_t i = 0; i < list_.size() && index < 0; i++) {
-                            if (list_[i].name == q || list_[i].name.find(q) != std::string::npos) index = i;
-                        }
-                    }
-                    if (index < 0) return std::unexpected("台单里没有「" + q + "」");
-                    DeleteFromJson("{\"index\":" + std::to_string(index) + "}");
-                    return "已删除「" + q + "」";
-                });
 }

@@ -69,8 +69,7 @@ body.has-save{padding-bottom:88px}
 <h1>Pocket Companion 设置</h1>
 <nav class="menu">
   <a href="#ai"><b>大模型</b><small id="sum_ai">供应商 · 用途 · 人设 · 记忆</small><i>›</i></a>
-  <a href="#listen" id="menu_listen" hidden><b>收听</b><small id="sum_listen">电台 · 播客 · 在线音乐</small><i>›</i></a>
-  <a href="#device"><b>设备</b><small id="sum_device">Wi-Fi · 天气 · SD 卡</small><i>›</i></a>
+  <a href="#device"><b>设备</b><small id="sum_device">Wi-Fi · 天气 · SD 卡 · 应用</small><i>›</i></a>
 </nav>
 </div>
 
@@ -108,46 +107,6 @@ body.has-save{padding-bottom:88px}
 <h2>长期记忆</h2>
 <p class="hint">对话里它会自己往里记（一行一条）；这里能看到全部并手改，删掉就不记得了。<span id="memSize"></span></p>
 <textarea id="memory" rows="5"></textarea>
-</section>
-
-<section id="pg-listen" hidden>
-<a class="back" href="#">‹ 设置</a>
-<h1>收听</h1>
-<div id="radioCard" hidden>
-<h2>电台</h2>
-<div class="card">
-  <p class="hint">改了立即生效，↑ ↓ 调顺序（设备上换台按这个顺序）。也可以跟它说「放点音乐」「收藏这个台」。</p>
-  <div id="radioList"></div>
-  <label>台名<input id="radioName" maxlength="20" autocomplete="off" placeholder="比如：轻音乐"></label>
-  <label>地址<input id="radioUrl" autocomplete="off" placeholder="MP3 / AAC 直播流地址"></label>
-  <div class="row"><button id="radioAdd">添加 / 改地址</button><span id="radioMsg" class="hint"></span></div>
-</div>
-</div>
-
-<div id="podCard" hidden>
-<h2>播客</h2>
-<div class="card">
-  <p class="hint">也可以跟它说「放《忽左忽右》最新一期」「订阅这个播客」。</p>
-  <div id="podList"></div>
-  <label>搜索<input id="podQuery" autocomplete="off" placeholder="播客名，比如：忽左忽右"></label>
-  <div class="row"><button id="podSearch">搜索</button><span id="podMsg" class="hint"></span></div>
-  <div id="podResults"></div>
-  <label>或者直接填 RSS 地址<input id="podFeed" autocomplete="off" placeholder="https://…"></label>
-  <div class="row"><button id="podAdd">订阅</button></div>
-</div>
-</div>
-
-<div id="musicCard" hidden>
-<h2>在线音乐</h2>
-<div class="card">
-  <p class="hint">跟它说「放一首晴天」「来首周杰伦的歌」「换一首」，就在这个网站上搜歌来放，收听页的「音乐」标签显示封面和歌词。网站要是特定格式的（见仓库里的 docs/online-music.md），失效了换一个同款的填上就行。</p>
-  <label>音乐网站<input id="musicSite" autocomplete="off" placeholder="http://…（网站支持的话用 http，省设备内存）"></label>
-  <div class="row"><button id="musicSave">保存</button><span id="musicMsg" class="hint"></span></div>
-  <label>试一下<input id="musicQuery" autocomplete="off" placeholder="歌名，可以带歌手：晴天 周杰伦"></label>
-  <div class="row"><button id="musicSearch">搜索</button></div>
-  <div id="musicResults"></div>
-</div>
-</div>
 </section>
 
 <section id="pg-device" hidden>
@@ -229,11 +188,6 @@ function drawMenu() {
     el.textContent = sum.missing.length ? '还没选：' + sum.missing.join('、') : '对话 · 识别 · 合成都选好了';
     el.className = sum.missing.length ? 'err' : '';
   }
-  const listen = [];
-  if (sum.radio !== undefined) listen.push(`电台 ${sum.radio}`);
-  if (sum.pod !== undefined) listen.push(`播客 ${sum.pod}`);
-  if (sum.music !== undefined) listen.push(sum.music ? '在线音乐' : '在线音乐没设');
-  if (listen.length) $('#sum_listen').textContent = listen.join(' · ');
   const dev = [];
   if (sum.wifi !== undefined) dev.push(sum.wifi ? '已连 ' + sum.wifi : 'Wi-Fi 没连');
   if (sum.city) dev.push(sum.city);
@@ -493,59 +447,6 @@ $('#wifiAdd').onclick = async () => {
 };
 loadWifi();
 
-// 电台台单：板子没挂 /radio.json（没有电台功能）时整块不显示
-const radioMsg = (text, cls) => { $('#radioMsg').textContent = text; $('#radioMsg').className = 'hint ' + (cls || ''); };
-async function loadRadio() {
-  let r;
-  try {
-    const res = await fetch('/radio.json', {cache: 'no-store'});
-    if (!res.ok) return;
-    r = await res.json();
-  } catch (e) { return; }
-  $('#radioCard').hidden = false;
-  const box = $('#radioList');
-  box.innerHTML = r.stations.length ? '' : '<p class="hint">台单是空的。</p>';
-  const last = r.stations.length - 1;
-  r.stations.forEach((s, index) => {
-    const on = index === r.playing;
-    const row = document.createElement('div');
-    row.className = 'row';
-    row.innerHTML = `<span style="flex:1;overflow-wrap:anywhere">${esc(s.name)}<br><span class="hint">${esc(s.url)}</span></span>` +
-      `<button class="mini" title="上移" aria-label="上移"${index ? '' : ' disabled'}>↑</button>` +
-      `<button class="mini" title="下移" aria-label="下移"${index < last ? '' : ' disabled'}>↓</button>` +
-      `<button>${on ? '停止' : '播放'}</button><button class="danger">删除</button>`;
-    const [up, down, play, del] = row.querySelectorAll('button');
-    // 挪一下整张表的下标就变了：先全锁住，等重新读回来（失败了也重读，台单可能被语音改过）
-    const move = async to => {
-      box.querySelectorAll('button').forEach(b => b.disabled = true);
-      if (!await radioPost('/radio/move', {index, to})) await loadRadio();
-    };
-    up.onclick = () => move(index - 1);
-    down.onclick = () => move(index + 1);
-    play.onclick = () => radioPost('/radio/play', on ? {stop: true} : {index});
-    del.onclick = async () => { if (confirm(`删除「${s.name}」？`)) await radioPost('/radio/delete', {index}); };
-    box.appendChild(row);
-  });
-  $('#radioAdd').title = `已存 ${r.stations.length} / ${r.max} 个`;
-  $('#menu_listen').hidden = false; sum.radio = r.stations.length; drawMenu();
-}
-async function radioPost(path, body) {
-  try {
-    const r = await (await fetch(path, {method: 'POST', body: JSON.stringify(body)})).json();
-    radioMsg(r.ok ? '' : r.error, r.ok ? 'ok' : 'err');
-    if (r.ok) await loadRadio();
-    return r.ok;
-  } catch (e) { radioMsg('请求失败：' + e.message, 'err'); return false; }
-}
-$('#radioAdd').onclick = async () => {
-  const name = $('#radioName').value.trim(), url = $('#radioUrl').value.trim();
-  if (!name || !url) return radioMsg('台名和地址都要填', 'err');
-  $('#radioAdd').disabled = true;
-  if (await radioPost('/radio/add', {name, url})) { $('#radioName').value = ''; $('#radioUrl').value = ''; }
-  $('#radioAdd').disabled = false;
-};
-loadRadio();
-
 // 应用包：板子没挂 /apps.json 时整块不显示
 const appMsg = (text, cls) => { $('#appMsg').textContent = text; $('#appMsg').className = 'hint ' + (cls || ''); };
 const kb = b => b < 1024 * 1024 ? Math.max(1, Math.round(b / 1024)) + ' KB' : (b / 1048576).toFixed(1) + ' MB';
@@ -618,110 +519,9 @@ $('#sdRescan').onclick = async () => {
 };
 loadSd();
 
-// 播客订阅：板子没挂 /podcast.json 时整块不显示
-const podMsg = (text, cls) => { $('#podMsg').textContent = text; $('#podMsg').className = 'hint ' + (cls || ''); };
-async function loadPod() {
-  let r;
-  try {
-    const res = await fetch('/podcast.json', {cache: 'no-store'});
-    if (!res.ok) return;
-    r = await res.json();
-  } catch (e) { return; }
-  $('#podCard').hidden = false;
-  const box = $('#podList');
-  box.innerHTML = r.podcasts.length ? '' : '<p class="hint">还没订阅。</p>';
-  r.podcasts.forEach((p, index) => {
-    const row = document.createElement('div');
-    row.className = 'row';
-    row.innerHTML = `<span style="flex:1;overflow-wrap:anywhere">${esc(p.name)}</span><button>播最新一期</button><button class="danger">删除</button>`;
-    const [play, del] = row.querySelectorAll('button');
-    play.onclick = async () => { podMsg('读节目单…'); await podPost('/podcast/play', {index}, '开始放了'); };
-    del.onclick = async () => { if (confirm(`取消订阅「${p.name}」？`)) await podPost('/podcast/delete', {index}); };
-    box.appendChild(row);
-  });
-  $('#podSearch').title = `已订阅 ${r.podcasts.length} / ${r.max} 个`;
-  $('#menu_listen').hidden = false; sum.pod = r.podcasts.length; drawMenu();
-}
-async function podPost(path, body, done) {
-  try {
-    const r = await (await fetch(path, {method: 'POST', body: JSON.stringify(body)})).json();
-    podMsg(r.ok ? (done || '') : r.error, r.ok ? 'ok' : 'err');
-    if (r.ok) await loadPod();
-    return r;
-  } catch (e) { podMsg('请求失败：' + e.message, 'err'); return {}; }
-}
-$('#podSearch').onclick = async () => {
-  const q = $('#podQuery').value.trim();
-  if (!q) return podMsg('先填播客名', 'err');
-  $('#podSearch').disabled = true; podMsg('搜索中…');
-  const r = await podPost('/podcast/search', {q});
-  $('#podSearch').disabled = false;
-  const box = $('#podResults');
-  box.innerHTML = '';
-  if (!r.ok) return;
-  if (!r.results.length) return podMsg('没搜到，换个名字试试', 'err');
-  for (const p of r.results) {
-    const row = document.createElement('div');
-    row.className = 'row';
-    row.innerHTML = `<span style="flex:1;overflow-wrap:anywhere">${esc(p.name)}</span><button>订阅</button>`;
-    row.querySelector('button').onclick = async () => { if ((await podPost('/podcast/subscribe', p, '已订阅')).ok) box.innerHTML = ''; };
-    box.appendChild(row);
-  }
-};
-$('#podAdd').onclick = async () => {
-  const feed = $('#podFeed').value.trim();
-  if (!feed) return podMsg('先填 RSS 地址', 'err');
-  $('#podAdd').disabled = true; podMsg('读取中…');
-  if ((await podPost('/podcast/subscribe', {feed}, '已订阅')).ok) $('#podFeed').value = '';
-  $('#podAdd').disabled = false;
-};
-loadPod();
-
-// 在线音乐：板子没挂 /music.json 时整块不显示
-const musicMsg = (text, cls) => { $('#musicMsg').textContent = text; $('#musicMsg').className = 'hint ' + (cls || ''); };
-async function musicPost(path, body, done) {
-  try {
-    const r = await (await fetch(path, {method: 'POST', body: JSON.stringify(body)})).json();
-    musicMsg(r.ok ? (done || '') : r.error, r.ok ? 'ok' : 'err');
-    return r;
-  } catch (e) { musicMsg('请求失败：' + e.message, 'err'); return {}; }
-}
-(async () => {
-  try {
-    const res = await fetch('/music.json', {cache: 'no-store'});
-    if (!res.ok) return;
-    $('#musicSite').value = (await res.json()).site || '';
-  } catch (e) { return; }
-  $('#musicCard').hidden = false;
-  $('#menu_listen').hidden = false; sum.music = !!$('#musicSite').value; drawMenu();
-})();
-$('#musicSave').onclick = async () => {
-  $('#musicSave').disabled = true;
-  if ((await musicPost('/music/site', {site: $('#musicSite').value.trim()}, '已保存')).ok) { sum.music = !!$('#musicSite').value.trim(); drawMenu(); }
-  $('#musicSave').disabled = false;
-};
-$('#musicSearch').onclick = async () => {
-  const q = $('#musicQuery').value.trim();
-  if (!q) return musicMsg('先填歌名', 'err');
-  $('#musicSearch').disabled = true; musicMsg('搜索中…');
-  const r = await musicPost('/music/search', {q});
-  $('#musicSearch').disabled = false;
-  const box = $('#musicResults');
-  box.innerHTML = '';
-  if (!r.ok) return;
-  if (!r.results.length) return musicMsg('没搜到，换个歌名试试', 'err');
-  r.results.forEach((s, index) => {
-    const row = document.createElement('div');
-    row.className = 'row';
-    row.innerHTML = `<span style="flex:1;overflow-wrap:anywhere">${esc(s.title)}<br><span class="hint">${esc(s.artist)}</span></span><button>播放</button>`;
-    row.querySelector('button').onclick = async () => { musicMsg('取歌曲页…'); await musicPost('/music/play', {index}, '开始放了'); };
-    box.appendChild(row);
-  });
-};
-
-// 一级菜单 / 二级页面：用地址里的 #ai / #listen / #device 切换，手机的返回键也能回菜单。
-// 底部「保存」只在有要它保存的东西的页面出现（大模型；设备页的天气城市），收听页的东西都是点了就生效
-const PAGES = ['ai', 'listen', 'device'], SAVE_PAGES = ['ai', 'device'];
+// 一级菜单 / 二级页面：用地址里的 #ai / #device 切换，手机的返回键也能回菜单。
+// 底部「保存」只在有要它保存的东西的页面出现（大模型；设备页的天气城市），别的都点了就生效
+const PAGES = ['ai', 'device'], SAVE_PAGES = ['ai', 'device'];
 let fromHome = false;
 function route() {
   const cur = PAGES.includes(location.hash.slice(1)) ? location.hash.slice(1) : '';

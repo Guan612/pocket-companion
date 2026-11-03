@@ -15,7 +15,6 @@
 #include "nomi_display.h"
 #include "nomi_music.h"
 #include "nomi_pkg.h"
-#include "nomi_podcast.h"
 #include "nomi_radio.h"
 #include "nomi_sdcard.h"
 #include "nomi_wasm.h"
@@ -374,10 +373,8 @@ private:
             display_->HideAlarm();
             NomiRadio::GetInstance().SetAlarmHold(false);
         };
-        // 电台：放、停、换台、收藏；播客：放、订阅、快进快退；在线音乐：点歌
+        // 播放器：系统只留「停 / 暂停」这一个工具，放什么、换哪个都归应用（self.app.command）
         NomiRadio::GetInstance().RegisterTools();
-        NomiPodcast::GetInstance().RegisterTools();
-        NomiMusic::GetInstance().RegisterTools();
         // 应用包的指令：哪些应用有哪些指令写在每轮的系统提示里（NomiPkg::PromptContext），这里只一个通用入口，
         // 装、删应用不用改工具列表
         mcp_server.AddTool(
@@ -403,10 +400,10 @@ private:
             gpio_set_level(AUDIO_CODEC_PA_PIN, GetAudioCodec()->output_enabled() ? 1 : 0);
         };
 #if CONFIG_DIRECT_API
-        // 每轮对话的系统提示词里带上现在几点、天气、已设的闹钟、电台（设"明早 7 点"要知道今天是哪天）
+        // 每轮对话的系统提示词里带上现在几点、天气、已设的闹钟（设"明早 7 点"要知道今天是哪天）、
+        // 装好的应用能做什么（放歌、电台、播客都在里面）
         DirectApiProtocol::context_provider = []() {
-            return NomiClock::GetInstance().PromptContext() + "\n" + NomiRadio::GetInstance().PromptContext() + "\n" +
-                   NomiPodcast::GetInstance().PromptContext() + "\n" + NomiPkg::GetInstance().PromptContext() +
+            return NomiClock::GetInstance().PromptContext() + "\n" + NomiPkg::GetInstance().PromptContext() + "\n" +
                    NomiWasm::PromptContext();
         };
         DirectApiConfigServer::on_city_changed = []() { NomiClock::GetInstance().RefreshWeather(); };
@@ -430,48 +427,6 @@ private:
         // 网页设置页的「SD 卡」卡片：每次读都当场检测
         DirectApiConfigServer::AddJsonHandler("/sd.json", false,
                                               [](const std::string&) { return NomiSdCard::GetInstance().StatusJson(); });
-        // 网页设置页的「电台」卡片
-        DirectApiConfigServer::AddJsonHandler("/radio.json", false,
-                                              [](const std::string&) { return NomiRadio::GetInstance().ListJson(); });
-        DirectApiConfigServer::AddJsonHandler("/radio/add", true, [](const std::string& body) {
-            return NomiRadio::GetInstance().AddFromJson(body);
-        });
-        DirectApiConfigServer::AddJsonHandler("/radio/delete", true, [](const std::string& body) {
-            return NomiRadio::GetInstance().DeleteFromJson(body);
-        });
-        DirectApiConfigServer::AddJsonHandler("/radio/move", true, [](const std::string& body) {
-            return NomiRadio::GetInstance().MoveFromJson(body);
-        });
-        DirectApiConfigServer::AddJsonHandler("/radio/play", true, [](const std::string& body) {
-            return NomiRadio::GetInstance().PlayFromJson(body);
-        });
-        // 「播客」卡片：搜索订阅、删除、放最新一期
-        DirectApiConfigServer::AddJsonHandler("/podcast.json", false,
-                                              [](const std::string&) { return NomiPodcast::GetInstance().ListJson(); });
-        DirectApiConfigServer::AddJsonHandler("/podcast/search", true, [](const std::string& body) {
-            return NomiPodcast::GetInstance().SearchJson(body);
-        });
-        DirectApiConfigServer::AddJsonHandler("/podcast/subscribe", true, [](const std::string& body) {
-            return NomiPodcast::GetInstance().SubscribeJson(body);
-        });
-        DirectApiConfigServer::AddJsonHandler("/podcast/delete", true, [](const std::string& body) {
-            return NomiPodcast::GetInstance().DeleteJson(body);
-        });
-        DirectApiConfigServer::AddJsonHandler("/podcast/play", true, [](const std::string& body) {
-            return NomiPodcast::GetInstance().PlayJson(body);
-        });
-        // 「在线音乐」卡片：填音乐网站、试搜、试放
-        DirectApiConfigServer::AddJsonHandler("/music.json", false,
-                                              [](const std::string&) { return NomiMusic::GetInstance().InfoJson(); });
-        DirectApiConfigServer::AddJsonHandler("/music/site", true, [](const std::string& body) {
-            return NomiMusic::GetInstance().SetSiteJson(body);
-        });
-        DirectApiConfigServer::AddJsonHandler("/music/search", true, [](const std::string& body) {
-            return NomiMusic::GetInstance().SearchJson(body);
-        });
-        DirectApiConfigServer::AddJsonHandler("/music/play", true, [](const std::string& body) {
-            return NomiMusic::GetInstance().PlayJson(body);
-        });
         DirectApiProtocol::face_prompt = NomiDisplay::FacePrompt();
         DirectApiProtocol::face_handler = [this](const std::string& json, std::string& error) {
             return display_->PlayFace(json, error);
@@ -513,11 +468,10 @@ public:
         InitializeButtons();
         InitializeTools();
         NomiClock::GetInstance().Start();  // 时区、闹钟；联网后自己对时、拉天气
-        NomiRadio::GetInstance().Start();    // 台单、收流 / 解码任务（平时睡着）
-        NomiPodcast::GetInstance().Start();  // 订阅、后台联网任务
-        NomiMusic::GetInstance().Start();    // 音乐网站地址、下封面的后台任务
-        NomiWasm::Init(display_);            // 应用包的运行时（docs/app-sdk.md）
-        NomiPkg::GetInstance().Start();      // 扫 SD 卡上装好的应用包，登记到桌面
+        NomiRadio::GetInstance().Start();  // 收流 / 解码任务（平时睡着）；放什么由应用决定
+        NomiMusic::GetInstance().Start();  // 下封面的后台任务
+        NomiWasm::Init(display_);          // 应用包的运行时（docs/app-sdk.md）
+        NomiPkg::GetInstance().Start();    // 预装应用、迁老数据、扫装好的应用包，登记到桌面
         GetBacklight()->RestoreBrightness();
     }
 

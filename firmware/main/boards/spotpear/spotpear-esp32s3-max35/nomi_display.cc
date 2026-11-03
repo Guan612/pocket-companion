@@ -7,7 +7,6 @@
 #include "face_script.h"
 #include "nomi_clock.h"
 #include "nomi_music.h"
-#include "nomi_podcast.h"
 #include "nomi_radio.h"
 #include "nomi_ui.h"
 #include "nomi_wasm.h"
@@ -172,12 +171,9 @@ int GetInt(const char* key, int def) {
     }
     if (!strcmp(key, "weather_code")) return NomiClock::GetInstance().WeatherCode();
     if (!strcmp(key, "radio_state")) return NomiRadio::GetInstance().GetState();
-    if (!strcmp(key, "radio_index")) return NomiRadio::GetInstance().CurrentIndex();
     if (!strcmp(key, "pod_playing")) return NomiRadio::GetInstance().IsEpisode();
     if (!strcmp(key, "pod_pos")) return NomiRadio::GetInstance().Position();
     if (!strcmp(key, "pod_dur")) return NomiRadio::GetInstance().Current().duration;
-    if (!strcmp(key, "pod_opened")) return NomiPodcast::GetInstance().Opened();
-    if (!strcmp(key, "pod_load")) return NomiPodcast::GetInstance().LoadState();
     if (!strcmp(key, "music_playing")) return NomiMusic::GetInstance().Playing();
     if (!strcmp(key, NOMI_KEY_PERSONA)) {
         // 按当前提示词反查是哪个预设；网页里改过就算自定义
@@ -305,12 +301,6 @@ const char* GetText(const char* key) {
         text = NomiRadio::GetInstance().StationName();
     } else if (!strcmp(key, "radio_title")) {
         text = NomiRadio::GetInstance().Title();
-    } else if (!strcmp(key, "radio_list")) {
-        text = NomiRadio::GetInstance().ListText();
-    } else if (!strcmp(key, "pod_list")) {
-        text = NomiPodcast::GetInstance().ListText();
-    } else if (!strcmp(key, "pod_episodes")) {
-        text = NomiPodcast::GetInstance().EpisodesText();
     } else if (!strcmp(key, "pod_name") || !strcmp(key, "pod_title")) {
         auto st = NomiRadio::GetInstance().Current();
         if (st.episode) text = !strcmp(key, "pod_name") ? st.podcast : st.name;
@@ -322,17 +312,9 @@ const char* GetText(const char* key) {
     return text.c_str();
 }
 
-// 封面：播客、歌各自两块缓冲轮着用，换图时 version 加一
+// 封面：歌和应用给的节目封面（media_meta）都在 NomiMusic，两块缓冲轮着用，换图时 version 加一
 const uint16_t* GetImage(const char* key, int* size, int* version) {
-    if (!strcmp(key, "pod_cover")) {
-        if (!NomiRadio::GetInstance().Current().owner.empty()) {  // 应用放的节目：封面是应用给的（media_meta）
-            *size = NomiMusic::kCoverSize;
-            return NomiMusic::GetInstance().Cover(*version);
-        }
-        *size = NomiPodcast::kCoverSize;
-        return NomiPodcast::GetInstance().Cover(*version);
-    }
-    if (!strcmp(key, "music_cover")) {
+    if (!strcmp(key, "pod_cover") || !strcmp(key, "music_cover")) {
         *size = NomiMusic::kCoverSize;
         return NomiMusic::GetInstance().Cover(*version);
     }
@@ -352,26 +334,10 @@ void Action(const char* name) {
     } else if (!strcmp(name, "tile_toggle")) {
         NomiWasm::TileToggle();
     } else if (!strcmp(name, "radio_next") || !strcmp(name, "radio_prev")) {
-        // 应用放的电台：换台交给那个应用（台单是它的）；系统自己的电台在系统台单里换
-        bool next = !strcmp(name, "radio_next");
-        if (!NomiWasm::MediaCommand(next ? 2 : 3)) NomiRadio::GetInstance().Step(next ? 1 : -1);
-    } else if (!strcmp(name, "music_next") || !strcmp(name, "music_prev")) {
-        // 应用放的歌：上一首 / 下一首交给那个应用（队列是它的）；系统自己点的在线歌没有队列，退回快进快退
-        bool next = !strcmp(name, "music_next");
-        if (!NomiWasm::MediaCommand(next ? 2 : 3)) NomiRadio::GetInstance().Seek(next ? 30 : -15);
-    } else if (!strncmp(name, "radio_play:", 11)) {
-        NomiRadio::GetInstance().Play(atoi(name + 11));
-    } else if (!strncmp(name, "pod_open:", 9)) {
-        NomiPodcast::GetInstance().Open(atoi(name + 9));  // 拉节目单在后台任务里
-    } else if (!strcmp(name, "pod_back")) {
-        NomiPodcast::GetInstance().Back();
-    } else if (!strncmp(name, "pod_play:", 9)) {
-        NomiPodcast::GetInstance().PlayOpened(atoi(name + 9));
-    } else if (!strncmp(name, "pod_seek:", 9)) {
-        auto& radio = NomiRadio::GetInstance();
-        radio.Seek(atoi(name + 9));
-        if (!radio.Wanted()) radio.Toggle();
+        // 上一首 / 下一首（电台换台、歌换一首、播客快进快退）交给放这个的应用：队列、台单都是它的
+        NomiWasm::MediaCommand(!strcmp(name, "radio_next") ? 2 : 3);
     } else if (!strncmp(name, "pod_seek_to:", 12)) {
+        // 进度条拖到哪：节目直接跳过去（放它的应用下次来问位置就是新的）
         auto& radio = NomiRadio::GetInstance();
         radio.SeekTo(atoi(name + 12));
         if (!radio.Wanted()) radio.Toggle();

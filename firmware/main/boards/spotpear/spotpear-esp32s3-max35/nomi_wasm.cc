@@ -487,13 +487,8 @@ struct Player {
     std::string owner_id;
 };
 
-// 上一首 / 下一首：交给放这个的应用（队列是它的）；系统自己放的电台换台、节目快进快退
-void PlayerStep(bool next) {
-    if (NomiWasm::MediaCommand(next ? MEDIA_NEXT : MEDIA_PREV)) return;
-    auto& radio = NomiRadio::GetInstance();
-    if (radio.Current().episode) radio.Seek(next ? 30 : -15);
-    else radio.Step(next ? 1 : -1);
-}
+// 上一首 / 下一首：交给放这个的应用（队列、台单都是它的）
+void PlayerStep(bool next) { NomiWasm::MediaCommand(next ? MEDIA_NEXT : MEDIA_PREV); }
 
 // 放 / 停：在放就停；停着的是这个应用自己的就接着放；别的（或什么都没有）交给应用决定放什么
 void PlayerToggle(Player* p) {

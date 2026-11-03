@@ -53,11 +53,9 @@ typedef struct {
 #define MAX_APP_VIEWS 2
 static now_view_t s_now;                       // 系统收听页的
 static now_view_t *s_app_views[MAX_APP_VIEWS];  // 应用卡片的
-// 收听页（电台 / 播客 / 音乐）
+// 收听页（「正在放」；装了带卡片的应用——比如音乐应用——整页被它的卡片盖住，这页留给没装的时候）
 static lv_obj_t *s_listen_sys;  // 系统收听页的全部控件：应用卡片盖上来时整个藏起来，翻页时不用白画一遍
-static lv_obj_t *s_tab_btns[3], *s_radio_list;
 static lv_obj_t *s_radio_mini, *s_radio_mini_label;  // 表情页左上角"♪ 名字"小条
-static int s_listen_tab = 2;  // 右边：0 电台台单，1 播客，2 歌词（标签从左到右是音乐、播客、电台，默认最左边）
 static int s_now_kind = -1;  // 放的是什么：0 电台，1 播客节目，2 歌（换了就跟着切标签）
 static bool s_music_face;     // 表情页正在放"跟着音乐晃"那段表演
 static uint32_t s_radio_refresh_at;  // 下次对收听页的时刻
@@ -1206,14 +1204,13 @@ static void create_dots(void)
     lv_obj_align(s_dots, LV_ALIGN_BOTTOM_MID, 0, -16);  // 让开最底下提示往上推的小横条
 }
 
-/* ---------- 第三页：收听（电台 / 播客 / 音乐） ---------- */
+/* ---------- 第三页：收听（「正在放」） ---------- */
 
-// 左边是"正在放"：不管右边切到哪个标签，都显示现在放的东西（电台、一期播客或一首歌）；
-// 右边跟着标签变：电台台单，播客订阅 → 点进去是最新几期，或者正在放的歌的歌词
+// 左半边是"正在放"（封面、标题、播放控制、音量或进度），右半边歌词；
+// 放什么、上一首下一首都归应用（音乐应用装上后这整页被它的卡片盖住）
 
 enum { RADIO_OFF, RADIO_CONNECTING, RADIO_PLAYING, RADIO_HELD, RADIO_ERROR, RADIO_LOADING };  // 同 NomiRadio::State
-enum { ITEM_STATION, ITEM_PODCAST, ITEM_BACK, ITEM_EPISODE, ITEM_RETRY };
-#define COVER_SIZE 88  // 同 NomiPodcast::kCoverSize
+#define COVER_SIZE 88  // 同 NomiMusic::kCoverSize
 
 static void fmt_clock(char *buf, size_t size, int seconds)
 {
@@ -1222,41 +1219,13 @@ static void fmt_clock(char *buf, size_t size, int seconds)
     else snprintf(buf, size, "%d:%02d", seconds / 60, seconds % 60);
 }
 
-static void on_listen_tab(lv_event_t *e)
-{
-    user_activity();
-    s_listen_tab = (int)(intptr_t)lv_event_get_user_data(e);
-    radio_refresh(true);
-}
-
 static void on_radio_button(lv_event_t *e)
 {
     const char *name = lv_event_get_user_data(e);
     user_activity();
-    // 左右两个键：电台是换台，播客是倒回 15 秒 / 快进 30 秒，歌是上一首 / 下一首（播放队列）
-    if (s_now_kind == 1 && !strcmp(name, "radio_prev")) name = "pod_seek:-15";
-    else if (s_now_kind == 1 && !strcmp(name, "radio_next")) name = "pod_seek:30";
-    else if (s_now_kind == 2 && !strcmp(name, "radio_prev")) name = "music_prev";
-    else if (s_now_kind == 2 && !strcmp(name, "radio_next")) name = "music_next";
+    // 左右两个键：电台换台、歌上一首下一首、播客倒回 15 秒 / 快进 30 秒，都交给放这个的应用
     action(name);
     radio_refresh(false);
-}
-
-static void on_list_item(lv_event_t *e)
-{
-    int data = (int)(intptr_t)lv_obj_get_user_data(lv_event_get_target(e));
-    int kind = data >> 16, index = data & 0xFFFF;
-    char name[32];
-    switch (kind) {
-    case ITEM_STATION: snprintf(name, sizeof(name), "radio_play:%d", index); break;
-    case ITEM_PODCAST:
-    case ITEM_RETRY: snprintf(name, sizeof(name), "pod_open:%d", index); break;
-    case ITEM_BACK: snprintf(name, sizeof(name), "pod_back"); break;
-    default: snprintf(name, sizeof(name), "pod_play:%d", index); break;
-    }
-    user_activity();
-    action(name);
-    radio_refresh(true);
 }
 
 static void on_progress(lv_event_t *e)
@@ -1283,139 +1252,6 @@ static lv_obj_t *add_round_button(lv_obj_t *parent, int size, const char *icon, 
     return btn;
 }
 
-// 右边列表的一项；meta 不空时下面再写一行小字（节目的日期、时长）
-static void add_list_item(const char *text, const char *meta, int kind, int index, bool on)
-{
-    lv_obj_t *btn = lv_button_create(s_radio_list);
-    lv_obj_set_size(btn, LV_PCT(100), meta ? 58 : 42);
-    lv_obj_set_style_radius(btn, 10, 0);
-    lv_obj_set_style_shadow_width(btn, 0, 0);
-    lv_obj_set_style_pad_hor(btn, 10, 0);
-    lv_obj_set_style_pad_ver(btn, 4, 0);
-    lv_obj_set_style_bg_color(btn, lv_color_hex(on ? C_ACCENT : kind == ITEM_BACK ? C_PANEL : C_CONTROL), 0);
-    lv_obj_set_flex_flow(btn, LV_FLEX_FLOW_COLUMN);
-    lv_obj_set_flex_align(btn, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
-    lv_obj_set_user_data(btn, (void *)(intptr_t)((kind << 16) | (index & 0xFFFF)));
-    lv_obj_add_event_cb(btn, on_list_item, LV_EVENT_CLICKED, NULL);
-    if (kind == ITEM_BACK) {
-        // 返回：箭头用图标字体画（中文字库里没有这个符号）
-        lv_obj_set_flex_flow(btn, LV_FLEX_FLOW_ROW);
-        lv_obj_set_flex_align(btn, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-        lv_obj_set_style_pad_column(btn, 8, 0);
-        lv_obj_t *arrow = lv_label_create(btn);
-        lv_obj_set_style_text_font(arrow, &lv_font_montserrat_14, 0);
-        lv_label_set_text(arrow, LV_SYMBOL_LEFT);
-        set_color(arrow, C_MUTED);
-    }
-    // 一行，放不下就省略号（省略号只在高度固定时起作用，不定高度会折成好几行）
-    const int line = lv_font_get_line_height(s_font);
-    lv_obj_t *label = lv_label_create(btn);
-    lv_obj_set_size(label, LV_PCT(100), line);
-    lv_label_set_long_mode(label, LV_LABEL_LONG_MODE_DOTS);
-    lv_label_set_text(label, text);
-    set_color(label, on ? 0x0b1220 : C_TEXT);
-    if (meta) {
-        lv_obj_t *m = lv_label_create(btn);
-        lv_obj_set_size(m, LV_PCT(100), line);
-        lv_label_set_long_mode(m, LV_LABEL_LONG_MODE_DOTS);
-        lv_label_set_text(m, meta);
-        set_color(m, on ? 0x0b1220 : C_MUTED);
-    }
-}
-
-static void add_list_hint(const char *text)
-{
-    lv_obj_t *hint = lv_label_create(s_radio_list);
-    lv_obj_set_width(hint, LV_PCT(100));
-    lv_label_set_text(hint, text);
-    set_color(hint, C_MUTED);
-}
-
-// 一行一项（'\n' 分隔）挨个交给 fn；each 返回 false 就停
-static void for_each_line(const char *text, void (*fn)(char *line, int index, void *ctx), void *ctx)
-{
-    enum { SIZE = 2048 };
-    static char *buf;  // 放堆上（设备上大块走 PSRAM），别占内部 RAM
-    if (!buf && !(buf = malloc(SIZE))) return;
-    snprintf(buf, SIZE, "%s", text);
-    int index = 0;
-    for (char *p = buf; p && *p; index++) {
-        char *nl = strchr(p, '\n');
-        if (nl) *nl = '\0';
-        fn(p, index, ctx);
-        p = nl ? nl + 1 : NULL;
-    }
-}
-
-static void add_station_line(char *line, int index, void *ctx)
-{
-    add_list_item(line, NULL, ITEM_STATION, index, index == *(int *)ctx);
-}
-
-static void add_podcast_line(char *line, int index, void *ctx)
-{
-    (void)ctx;
-    add_list_item(line, NULL, ITEM_PODCAST, index, false);
-}
-
-static void add_episode_line(char *line, int index, void *ctx)
-{
-    char *tab = strchr(line, '\t');
-    if (tab) *tab++ = '\0';
-    add_list_item(line, tab && *tab ? tab : NULL, ITEM_EPISODE, index, !strcmp(line, (const char *)ctx));
-}
-
-// 右边列表：内容（标签、台单 / 订阅 / 节目单、正在放的是哪个）变了才重建
-static void sync_listen_list(bool force)
-{
-    enum { SIZE = 2600 };
-    static char *sig, *now;  // 放堆上（设备上大块走 PSRAM）：静态数组占内部 RAM，放栈上会撑爆界面任务的栈
-    if (s_listen_tab == 2) return;  // 音乐标签右边是歌词；切回来时 force 会重建列表
-    if (!sig && !(sig = calloc(1, SIZE))) return;
-    if (!now && !(now = malloc(SIZE))) return;
-    int len;
-    if (s_listen_tab == 0) {
-        len = snprintf(now, SIZE, "R%d|%s", get_int("radio_index", -1), get_text("radio_list"));
-    } else {
-        int opened = get_int("pod_opened", -1), load = get_int("pod_load", 0);
-        len = snprintf(now, SIZE, "P%d|%d|", opened, load);
-        if (len < SIZE) len += snprintf(now + len, SIZE - len, "%s|", get_text(opened < 0 ? "pod_list" : "pod_episodes"));
-        if (len < SIZE) snprintf(now + len, SIZE - len, "%s", get_text("pod_title"));
-    }
-    if (!force && !strcmp(now, sig)) return;
-    if (lv_obj_is_scrolling(s_radio_list)) return;  // 正在滑：等停了再换
-    snprintf(sig, SIZE, "%s", now);
-    lv_obj_clean(s_radio_list);
-    lv_obj_scroll_to_y(s_radio_list, 0, LV_ANIM_OFF);
-
-    if (s_listen_tab == 0) {
-        int current = get_int("radio_index", -1);
-        const char *list = get_text("radio_list");
-        if (!list[0]) add_list_hint("台单是空的，在网页设置页添加");
-        else for_each_line(list, add_station_line, &current);
-        return;
-    }
-    int opened = get_int("pod_opened", -1);
-    if (opened < 0) {
-        const char *list = get_text("pod_list");
-        if (!list[0]) add_list_hint("还没订阅。跟它说「订阅忽左忽右」，或者在网页设置页搜索订阅");
-        else for_each_line(list, add_podcast_line, NULL);
-        return;
-    }
-    // 打开了一个订阅：第一行返回，下面是最新几期
-    add_list_item("订阅", NULL, ITEM_BACK, 0, false);
-    int load = get_int("pod_load", 0);
-    if (load == 1) {
-        add_list_hint("加载中…");
-    } else if (load == 2) {
-        add_list_item("加载失败，点这里重试", NULL, ITEM_RETRY, opened, false);
-    } else {
-        static char current[160];
-        snprintf(current, sizeof(current), "%s", get_text("pod_title"));
-        for_each_line(get_text("pod_episodes"), add_episode_line, current);
-    }
-}
-
 // 右边歌词：7 行，唱到的那句在第 4 行；没歌词时中间那行是提示
 static void sync_lyrics(now_view_t *v, int kind, int state)
 {
@@ -1425,13 +1261,13 @@ static void sync_lyrics(now_view_t *v, int kind, int state)
     snprintf(buf, SIZE, "%s", kind == 2 ? get_text("music_lyrics") : "");
     if (!buf[0]) {
         const char *mid;
-        if (kind == 2) {
-            mid = "这首没有歌词";
-        } else if (!v->app) {
-            mid = get_text("music_hint");
-        } else if (kind == 0 && state != RADIO_OFF) {  // 应用卡片放着电台：流里带的歌名
+        if (kind == 0 && state != RADIO_OFF) {  // 放着电台（系统页、应用卡片都是）：流里带的歌名
             const char *song = get_text("radio_title");
             mid = song[0] ? song : "直播中";
+        } else if (kind != 0 && state != RADIO_OFF) {
+            mid = "这首没有歌词";
+        } else if (!v->app) {
+            mid = get_text("music_hint");  // 系统收听页没在放：提醒装音乐应用
         } else {
             mid = v->hint;
         }
@@ -1532,30 +1368,16 @@ static void now_view_refresh(now_view_t *v, int state, int kind, bool force)
     }
 }
 
-// 对一次收听页、应用卡片和左上角小条。force 时列表也重建、音量条也对一下
+// 对一次收听页、应用卡片和左上角小条。force 时音量条也对一下
 static void radio_refresh(bool force)
 {
     if (!s_music_tile) return;
     int state = get_int("radio_state", RADIO_OFF);
     int kind = get_int("music_playing", 0) ? 2 : get_int("pod_playing", 0) ? 1 : 0;
 
-    // 换了放的东西（电台 / 播客 / 歌）：右边标签跟过去
     if (kind != s_now_kind) {
         s_now_kind = kind;
-        if (state != RADIO_OFF) s_listen_tab = kind;
         force = true;
-    }
-
-    // 标签按钮；音乐标签右边换成歌词
-    for (int i = 0; i < 3; i++) {
-        bool on = i == s_listen_tab;
-        lv_obj_set_style_bg_color(s_tab_btns[i], lv_color_hex(on ? C_ACCENT : C_CONTROL), 0);
-        set_color(lv_obj_get_child(s_tab_btns[i], 0), on ? 0x0b1220 : C_MUTED);
-    }
-    bool lyrics = s_listen_tab == 2;
-    if (lv_obj_has_flag(s_now.lyrics, LV_OBJ_FLAG_HIDDEN) == lyrics) {
-        lv_obj_set_flag(s_now.lyrics, LV_OBJ_FLAG_HIDDEN, !lyrics);
-        lv_obj_set_flag(s_radio_list, LV_OBJ_FLAG_HIDDEN, lyrics);
     }
     now_view_refresh(&s_now, state, kind, force);
     for (int i = 0; i < MAX_APP_VIEWS; i++) {
@@ -1585,8 +1407,6 @@ static void radio_refresh(bool force)
                                                 : kind == 1 ? get_text("pod_name")
                                                             : get_text("radio_name"));
     }
-
-    sync_listen_list(force);
 }
 
 static void on_radio_mini(lv_event_t *e)
@@ -1596,22 +1416,7 @@ static void on_radio_mini(lv_event_t *e)
     show_page(PAGE_MUSIC, true);
 }
 
-// index 是标签号（s_listen_tab），slot 是从左数第几个
-static lv_obj_t *add_tab_button(const char *text, int index, int slot)
-{
-    lv_obj_t *btn = lv_button_create(s_listen_sys);
-    lv_obj_set_size(btn, 64, 30);
-    lv_obj_set_style_radius(btn, 15, 0);
-    lv_obj_set_style_shadow_width(btn, 0, 0);
-    lv_obj_set_pos(btn, 16 + slot * 70, 6);
-    lv_obj_add_event_cb(btn, on_listen_tab, LV_EVENT_CLICKED, (void *)(intptr_t)index);
-    lv_obj_t *label = lv_label_create(btn);
-    lv_label_set_text(label, text);
-    lv_obj_center(label);
-    return btn;
-}
-
-// 在 parent 里建一份「正在放」（坐标按整页 480×320 摆：左半边播放，右半边歌词；顶上 36 像素留给标签）
+// 在 parent 里建一份「正在放」（坐标按整页 480×320 摆：左半边播放，右半边歌词）
 static void now_view_build(now_view_t *v, lv_obj_t *parent, bool app)
 {
     memset(v, 0, sizeof(*v));
@@ -1704,7 +1509,6 @@ static void now_view_build(now_view_t *v, lv_obj_t *parent, bool app)
     lv_obj_set_flex_align(v->lyrics, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
     lv_obj_set_style_pad_row(v->lyrics, 10, 0);
     lv_obj_remove_flag(v->lyrics, LV_OBJ_FLAG_SCROLLABLE);
-    if (!app) lv_obj_add_flag(v->lyrics, LV_OBJ_FLAG_HIDDEN);  // 系统收听页：音乐标签才显示
     const int line = lv_font_get_line_height(s_font);
     for (int i = 0; i < 7; i++) {
         lv_obj_t *l = lv_label_create(v->lyrics);
@@ -1772,23 +1576,7 @@ static void build_music_page(void)
     lv_obj_set_size(s_listen_sys, LV_PCT(100), LV_PCT(100));
     lv_obj_remove_flag(s_listen_sys, (lv_obj_flag_t)(LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE));
 
-    // 从左到右：音乐、播客、电台
-    s_tab_btns[2] = add_tab_button("音乐", 2, 0);
-    s_tab_btns[1] = add_tab_button("播客", 1, 1);
-    s_tab_btns[0] = add_tab_button("电台", 0, 2);
-
     now_view_build(&s_now, s_listen_sys, false);
-
-    // 右半边：台单 / 订阅 / 节目单，上下滑（左右滑还是翻页）
-    s_radio_list = lv_obj_create(s_listen_sys);
-    lv_obj_remove_style_all(s_radio_list);
-    lv_obj_set_size(s_radio_list, 206, FACE_H - 36);  // 一直到屏幕底（翻页小圆点是浮在上面的）
-    lv_obj_set_pos(s_radio_list, 260, 36);
-    lv_obj_set_flex_flow(s_radio_list, LV_FLEX_FLOW_COLUMN);
-    lv_obj_set_style_pad_row(s_radio_list, 6, 0);
-    lv_obj_set_style_pad_bottom(s_radio_list, 12, 0);
-    lv_obj_set_scroll_dir(s_radio_list, LV_DIR_VER);
-    lv_obj_set_scrollbar_mode(s_radio_list, LV_SCROLLBAR_MODE_ACTIVE);
 
     lv_obj_add_flag(s_music_tile, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_add_event_cb(s_music_tile, on_face_pressed, LV_EVENT_PRESSED, NULL);

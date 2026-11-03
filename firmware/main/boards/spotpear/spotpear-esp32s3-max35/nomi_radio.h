@@ -1,10 +1,11 @@
-// 网络电台和播客节目的播放器：http(s) 上的 MP3 / AAC 直播流，或者一期播客（MP3 / m4a），边收边解边放。
+// 系统播放器：应用包交给它的一路音频（电台直播流、一期播客、SD 卡上的文件），收流、解码、送播放。
+// http(s) 上的 MP3 / AAC 直播流，或者一期节目（MP3 / m4a）、本地文件（FLAC / WAV / MP3），边收边解边放。
 //
 // 收流和解码各一个常驻任务，栈都在 PSRAM；网络数据先进 PSRAM 环形缓冲，攒够一点再开始放，
 // 网络抖一下不至于断音。设备不在待机（有人叫它说话）或闹钟在响时停掉、连接也断开，
-// 把内部 RAM 让给语音识别；回到待机后自动接着放（电台是直播，播客从停下的地方接着放）。
-// 电台台单存 NVS（nomi_radio 命名空间的 list，JSON），网页设置页和大模型工具都能增删；
-// 播客的订阅、节目单、进度归 NomiPodcast 管，它只把要放的那期交给这里；在线音乐的歌（NomiMusic）也一样。
+// 把内部 RAM 让给语音识别；回到待机后自动接着放（电台是直播，节目从停下的地方接着放）。
+// 放什么、上一首下一首是应用的事（Station.owner 记着是哪个应用放的，放完 / 换首通知它）；
+// 固件自己不放任何东西，只留「停 / 暂停」一个大模型工具。
 #pragma once
 
 #include <esp_timer.h>
@@ -16,7 +17,6 @@
 #include <functional>
 #include <mutex>
 #include <string>
-#include <vector>
 
 class NomiRadio {
 public:
@@ -30,10 +30,9 @@ public:
         int duration = 0;       // 总长（秒），不知道为 0
         int bytes_per_sec = 0;  // MP3 按时间跳转用：文件大小 / 时长；不知道按 128kbps 算
         std::string podcast;    // 节目所属播客名（显示用）；歌是歌手
-        std::string key;        // 进度记在哪（NomiPodcast 用）
-        bool song = false;      // 一首歌（NomiMusic，在线或本地）：不记进度，放完交给 on_finished 接下一首
+        bool song = false;      // 一首歌（在线或本地）：不记进度，放完交给 on_finished 接下一首
         bool local = false;     // SD 卡上的文件：url 是设备上的路径（/sd/…），不用联网；对话时只暂停不断开
-        std::string owner;      // 哪个应用包放的（应用 id）；空 = 系统自己的电台、播客、在线点歌
+        std::string owner;      // 哪个应用包放的（应用 id）
         // 地址和响应头看不出真实格式时（m4a 的扩展名写成 .aac、类型是 octet-stream），调用方先探好填这里
         enum Format { kAuto, kMp3, kAdts, kMp4, kFlac, kWav } format = kAuto;
     };
@@ -43,13 +42,11 @@ public:
     // 认不出（不是 MP3 / AAC / m4a）返回 kAuto
     static Station::Format SniffFormat(const std::string& head);
 
-    void Start();  // 读台单、建任务和监视定时器；板子构造时调用一次
-    void RegisterTools();
+    void Start();  // 建任务和监视定时器；板子构造时调用一次
+    void RegisterTools();  // 只有大模型的「停」（放什么、换哪个都归应用）
 
     // 屏幕上的按钮
-    void Play(int index);  // 放台单里的第几个
-    void Toggle();         // 放 / 停（节目是暂停，记住位置）
-    void Step(int delta);  // 下一个 / 上一个台
+    void Toggle();  // 放 / 停（节目是暂停，停着的还是它）
     void Stop();
     // 闹钟响时先停，关了闹钟接着放
     void SetAlarmHold(bool hold) { alarm_hold_ = hold; }
@@ -59,15 +56,13 @@ public:
     bool HoldForHttps();
     void ReleaseHttpsHold();
 
-    // 播客
+    // 应用放一路音频（电台直播 / 节目 / 歌曲）
     void PlayEpisode(const Station& episode);
     void Seek(int delta_seconds);  // 快进 / 快退（只对节目有用）
     void SeekTo(int second);
     bool IsEpisode();
     Station Current();
     int Position() { return position_; }  // 节目放到第几秒
-    // 节目的进度：每 30 秒、暂停、放完时在主循环里调（finished 为放完）
-    std::function<void(const Station& episode, int position, bool finished)> on_progress;
     // 一首歌 / 一期节目从头放到尾放完了：在主循环里调（应用包放的，通知那个应用接下一首）
     std::function<void(const Station& item)> on_finished;
 
@@ -76,23 +71,11 @@ public:
     // 还在放 url 这个的话，换显示的名字 / 歌手（本地歌读到标签后用；空的不换）
     void UpdateMeta(const std::string& url, const std::string& name, const std::string& artist);
     std::string StationName();
-    std::string Title();     // 流里带的歌名（ICY StreamTitle），没有就空
-    int CurrentIndex();      // 台单里的下标；搜来还没收藏的台、播客节目是 -1
-    std::string ListText();  // 台名，一行一个
-    std::string PromptContext();
-
-    // 网页设置页：GET /radio.json、POST /radio/add、POST /radio/delete、POST /radio/move、POST /radio/play
-    std::string ListJson();
-    std::string AddFromJson(const std::string& body);     // 出错时返回 "!原因"
-    std::string DeleteFromJson(const std::string& body);  // 同上
-    std::string MoveFromJson(const std::string& body);    // {"index":n,"to":m} 把第 n 个挪到第 m 个（排序）
-    std::string PlayFromJson(const std::string& body);    // {"index":n} 放第几个，{"stop":true} 停
+    std::string Title();  // 流里带的歌名（ICY StreamTitle），没有就空
 
 private:
     std::mutex mutex_;
-    std::vector<Station> list_;
     Station current_;
-    int current_index_ = 0;
     std::string title_;
     std::atomic<bool> wanted_{false};      // 主人要它放着（对话、闹钟时暂停，之后接着放）
     std::atomic<bool> alarm_hold_{false};
@@ -123,8 +106,6 @@ private:
     size_t moov_size_ = 0;
 
     NomiRadio() = default;
-    void LoadList();
-    void SaveList();  // 调用方持有 mutex_；上次放的下标一起存，台单改了顺序重启后还是同一个台
     void Monitor();
     void BeginSession();
     void EndSession();
@@ -135,8 +116,6 @@ private:
     bool ReadEpisode(const std::string& url, int start);
     bool ReadLocal(const std::string& path, int start);
     bool WriteAudio(const void* data, size_t size);
-    void Select(const Station& station, int index);
+    void Select(const Station& station);
     void SetDuration(const std::string& url, int seconds);  // 节目没给时长时补上（还是放着的这个才写）
-    void ReportProgress(bool finished);
-    bool Search(const std::string& query, Station& found);
 };

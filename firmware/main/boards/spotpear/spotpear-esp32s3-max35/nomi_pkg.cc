@@ -268,8 +268,6 @@ bool CopyTree(const std::string& from, const std::string& to) {
     return ok;
 }
 
-bool IsSdPath(const std::string& path) { return path.rfind("/sd/", 0) == 0; }
-
 /* 应用管理（nomi_app.c）的钩子：只有应用包能删，编进固件的不能 */
 bool CanUninstall(const nomi_app_t* app) {
     return app->open == NomiWasm::Open && !static_cast<const NomiPackage*>(app->user)->builtin;
