@@ -41,6 +41,7 @@ button:disabled{opacity:.5}
 .chip{display:inline-flex;gap:6px;align-items:center;padding:3px 4px 3px 10px;border-radius:999px;background:#232838;font-size:13px;max-width:100%}
 .chip span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .chip button{padding:0 6px;border:0;background:none;color:var(--muted)}
+button.mini{padding:7px 10px}
 .picker{max-height:260px;overflow:auto;margin-top:8px;border:1px solid var(--line);border-radius:8px}
 .picker div{display:flex;justify-content:space-between;gap:8px;padding:7px 10px;border-bottom:1px solid var(--line);cursor:pointer;font-size:13px}
 .picker div.on{background:#20304d}
@@ -99,7 +100,7 @@ button:disabled{opacity:.5}
 <div id="radioCard" hidden>
 <h2>电台</h2>
 <div class="card">
-  <p class="hint">改了立即生效。也可以跟它说「放点音乐」「收藏这个台」。</p>
+  <p class="hint">改了立即生效，↑ ↓ 调顺序（设备上换台按这个顺序）。也可以跟它说「放点音乐」「收藏这个台」。</p>
   <div id="radioList"></div>
   <label>台名<input id="radioName" maxlength="20" autocomplete="off" placeholder="比如：轻音乐"></label>
   <label>地址<input id="radioUrl" autocomplete="off" placeholder="MP3 / AAC 直播流地址"></label>
@@ -434,12 +435,23 @@ async function loadRadio() {
   $('#radioCard').hidden = false;
   const box = $('#radioList');
   box.innerHTML = r.stations.length ? '' : '<p class="hint">台单是空的。</p>';
+  const last = r.stations.length - 1;
   r.stations.forEach((s, index) => {
     const on = index === r.playing;
     const row = document.createElement('div');
     row.className = 'row';
-    row.innerHTML = `<span style="flex:1;overflow-wrap:anywhere">${esc(s.name)}<br><span class="hint">${esc(s.url)}</span></span><button>${on ? '停止' : '播放'}</button><button class="danger">删除</button>`;
-    const [play, del] = row.querySelectorAll('button');
+    row.innerHTML = `<span style="flex:1;overflow-wrap:anywhere">${esc(s.name)}<br><span class="hint">${esc(s.url)}</span></span>` +
+      `<button class="mini" title="上移" aria-label="上移"${index ? '' : ' disabled'}>↑</button>` +
+      `<button class="mini" title="下移" aria-label="下移"${index < last ? '' : ' disabled'}>↓</button>` +
+      `<button>${on ? '停止' : '播放'}</button><button class="danger">删除</button>`;
+    const [up, down, play, del] = row.querySelectorAll('button');
+    // 挪一下整张表的下标就变了：先全锁住，等重新读回来（失败了也重读，台单可能被语音改过）
+    const move = async to => {
+      box.querySelectorAll('button').forEach(b => b.disabled = true);
+      if (!await radioPost('/radio/move', {index, to})) await loadRadio();
+    };
+    up.onclick = () => move(index - 1);
+    down.onclick = () => move(index + 1);
     play.onclick = () => radioPost('/radio/play', on ? {stop: true} : {index});
     del.onclick = async () => { if (confirm(`删除「${s.name}」？`)) await radioPost('/radio/delete', {index}); };
     box.appendChild(row);

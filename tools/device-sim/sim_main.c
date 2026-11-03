@@ -680,6 +680,14 @@ void sim_radio_play(int index)
     radio_select(index);
 }
 
+// 网页上调了台单顺序：正在放（或上次放）的台跟着挪下标，不重连（和 NomiRadio::MoveFromJson 一致）
+void sim_radio_moved(int from, int to)
+{
+    if (s_radio_index == from) s_radio_index = to;
+    else if (from < s_radio_index && s_radio_index <= to) s_radio_index--;
+    else if (to <= s_radio_index && s_radio_index < from) s_radio_index++;
+}
+
 void sim_radio_step(int delta)
 {
     int n = radio_count();

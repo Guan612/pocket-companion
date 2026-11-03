@@ -391,6 +391,9 @@ private:
         DirectApiConfigServer::AddJsonHandler("/radio/delete", true, [](const std::string& body) {
             return NomiRadio::GetInstance().DeleteFromJson(body);
         });
+        DirectApiConfigServer::AddJsonHandler("/radio/move", true, [](const std::string& body) {
+            return NomiRadio::GetInstance().MoveFromJson(body);
+        });
         DirectApiConfigServer::AddJsonHandler("/radio/play", true, [](const std::string& body) {
             return NomiRadio::GetInstance().PlayFromJson(body);
         });

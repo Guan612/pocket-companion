@@ -242,7 +242,9 @@ void NomiRadio::SaveList() {
         cJSON_AddItemToArray(root, item);
     }
     char* json = cJSON_PrintUnformatted(root);
-    Settings(kNs, true).SetString("list", json ? json : "[]");
+    Settings s(kNs, true);
+    s.SetString("list", json ? json : "[]");
+    if (current_index_ >= 0) s.SetInt("last", current_index_);
     cJSON_free(json);
     cJSON_Delete(root);
 }
@@ -997,6 +999,29 @@ std::string NomiRadio::DeleteFromJson(const std::string& body) {
     list_.erase(list_.begin() + i);
     if (current_index_ == i) current_index_ = -1;  // 正在放的还接着放，只是不在台单里了
     else if (current_index_ > i) current_index_--;
+    SaveList();
+    return "{\"ok\":true}";
+}
+
+std::string NomiRadio::MoveFromJson(const std::string& body) {
+    cJSON* root = cJSON_Parse(body.c_str());
+    cJSON* index = cJSON_GetObjectItem(root, "index");
+    cJSON* to = cJSON_GetObjectItem(root, "to");
+    int from = cJSON_IsNumber(index) ? index->valueint : -1;
+    int dest = cJSON_IsNumber(to) ? to->valueint : -1;
+    cJSON_Delete(root);
+    std::lock_guard<std::mutex> lock(mutex_);
+    int n = static_cast<int>(list_.size());
+    if (from < 0 || from >= n) return "!没有这个台";
+    if (dest < 0 || dest >= n) return "!挪不到那里";
+    if (from == dest) return "{\"ok\":true}";
+    Station st = std::move(list_[from]);
+    list_.erase(list_.begin() + from);
+    list_.insert(list_.begin() + dest, std::move(st));
+    // 正在放（或上次放）的台跟着挪：下标改过来，屏幕上的换台、重启后接着放的都还是它
+    if (current_index_ == from) current_index_ = dest;
+    else if (from < current_index_ && current_index_ <= dest) current_index_--;
+    else if (dest <= current_index_ && current_index_ < from) current_index_++;
     SaveList();
     return "{\"ok\":true}";
 }

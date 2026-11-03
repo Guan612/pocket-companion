@@ -1006,7 +1006,7 @@ class StaHandler(Handler):
             return self.models(req)
         if path in ("/wifi/add", "/wifi/delete"):
             return self.wifi(path, req)
-        if path in ("/radio/add", "/radio/delete", "/radio/play"):
+        if path in ("/radio/add", "/radio/delete", "/radio/move", "/radio/play"):
             return self.radio(path, req)
         if path.startswith("/podcast/"):
             return self.podcast(path, req)
@@ -1061,21 +1061,25 @@ class StaHandler(Handler):
         self.send(200, {"ok": True})
 
     def radio(self, path, req):
-        """和 NomiRadio::AddFromJson / DeleteFromJson / PlayFromJson 一致。"""
+        """和 NomiRadio::AddFromJson / DeleteFromJson / MoveFromJson / PlayFromJson 一致。"""
         err = lambda msg: self.send(200, {"ok": False, "error": msg})
+        if path == "/radio/play":  # push_event 自己拿锁，别放进 with lock（Lock 不可重入，整个模拟器会卡死）
+            i = req.get("index")
+            with lock:
+                stations = radio_list()
+                if req.get("stop") is True:
+                    radio_now.update(index=-2)
+                elif isinstance(i, int) and 0 <= i < len(stations):
+                    radio_now.update(index=i, name=stations[i]["name"])
+                else:
+                    return err("没有这个台")
+            if req.get("stop") is True:
+                push_event("radio_stop")
+            else:
+                push_event("radio_play", index=i)
+            return self.send(200, {"ok": True})
         with lock:
             stations = radio_list()
-            if path == "/radio/play":
-                if req.get("stop") is True:
-                    push_event("radio_stop")
-                    radio_now.update(index=-2)
-                    return self.send(200, {"ok": True})
-                i = req.get("index")
-                if not isinstance(i, int) or not 0 <= i < len(stations):
-                    return err("没有这个台")
-                push_event("radio_play", index=i)
-                radio_now.update(index=i, name=stations[i]["name"])
-                return self.send(200, {"ok": True})
             if path == "/radio/add":
                 name, url = str(req.get("name") or "").strip(), str(req.get("url") or "").strip()
                 if not name or len(name.encode()) > 60:
@@ -1091,6 +1095,16 @@ class StaHandler(Handler):
                     return err("最多存 20 个台，先删掉几个")
                 else:
                     stations.append({"name": name, "url": url})
+            elif path == "/radio/move":
+                i, to = req.get("index"), req.get("to")
+                if not isinstance(i, int) or not 0 <= i < len(stations):
+                    return err("没有这个台")
+                if not isinstance(to, int) or not 0 <= to < len(stations):
+                    return err("挪不到那里")
+                stations.insert(to, stations.pop(i))
+                p = radio_now["index"]  # 正在放的跟着挪（sim.html 随后也会报上来，这里先改好免得网页读到旧的）
+                radio_now["index"] = to if p == i else p - 1 if i < p <= to else p + 1 if to <= p < i else p
+                moved = [i, to]
             else:
                 i = req.get("index")
                 if not isinstance(i, int) or not 0 <= i < len(stations):
@@ -1098,7 +1112,7 @@ class StaHandler(Handler):
                 stations.pop(i)
             snapshot = [dict(s) for s in stations]
         save_nvs()
-        push_event("radio_list", stations=snapshot)
+        push_event("radio_list", stations=snapshot, **({"moved": moved} if path == "/radio/move" else {}))
         self.send(200, {"ok": True})
 
     def wifi(self, path, req):

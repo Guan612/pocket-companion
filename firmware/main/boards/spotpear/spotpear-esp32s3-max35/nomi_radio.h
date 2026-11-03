@@ -72,10 +72,11 @@ public:
     std::string ListText();  // 台名，一行一个
     std::string PromptContext();
 
-    // 网页设置页：GET /radio.json、POST /radio/add、POST /radio/delete、POST /radio/play
+    // 网页设置页：GET /radio.json、POST /radio/add、POST /radio/delete、POST /radio/move、POST /radio/play
     std::string ListJson();
     std::string AddFromJson(const std::string& body);     // 出错时返回 "!原因"
     std::string DeleteFromJson(const std::string& body);  // 同上
+    std::string MoveFromJson(const std::string& body);    // {"index":n,"to":m} 把第 n 个挪到第 m 个（排序）
     std::string PlayFromJson(const std::string& body);    // {"index":n} 放第几个，{"stop":true} 停
 
 private:
@@ -112,7 +113,7 @@ private:
 
     NomiRadio() = default;
     void LoadList();
-    void SaveList();  // 调用方持有 mutex_
+    void SaveList();  // 调用方持有 mutex_；上次放的下标一起存，台单改了顺序重启后还是同一个台
     void Monitor();
     void BeginSession();
     void EndSession();

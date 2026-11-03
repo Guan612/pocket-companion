@@ -35,7 +35,7 @@ EXPORTS = [
     "sim_set_time", "sim_alarm_demo", "sim_alarm_ring",
     # 电台：<audio> 跟着设备状态放 / 停
     "sim_radio_audible", "sim_radio_wanted", "sim_radio_index", "sim_radio_set_state", "sim_radio_stop",
-    "sim_radio_play", "sim_radio_step",
+    "sim_radio_play", "sim_radio_step", "sim_radio_moved",
     # 播客：屏幕上点出来的请求、开始放、进度、封面
     "sim_pod_open_request", "sim_pod_play_request", "sim_pod_seek_request", "sim_pod_seek_to_request",
     "sim_pod_loaded", "sim_pod_episode", "sim_pod_start", "sim_pod_progress", "sim_cover_buffer", "sim_cover_ready",

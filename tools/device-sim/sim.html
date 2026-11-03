@@ -376,7 +376,7 @@ button{font:inherit;color:var(--fg)}
         else if(ev.type==='wifi_list'){setText(6,(ev.saved||[]).join(String.fromCharCode(10)))}
         else if(ev.type==='ap_exit')e.sim_ap_exit();
         else if(ev.type==='settings_saved'){apiOk=ev.api_ok;setText(5,(ev.voices||[]).join(String.fromCharCode(10)));setText(7,ev.city||'');e.sim_settings_saved(ev.api_ok?1:0)}
-        else if(ev.type==='radio_list'){radioStations=ev.stations||[];setText(8,radioStations.map(s=>s.name).join(String.fromCharCode(10)))}
+        else if(ev.type==='radio_list'){radioStations=ev.stations||[];setText(8,radioStations.map(s=>s.name).join(String.fromCharCode(10)));if(ev.moved)e.sim_radio_moved(ev.moved[0],ev.moved[1])}
         else if(ev.type==='radio_play')e.sim_radio_play(ev.index);
         else if(ev.type==='radio_stop')e.sim_radio_stop();
         else if(ev.type==='pod_list'){podcasts=ev.podcasts||[];setText(9,podcasts.map(p=>p.name).join(String.fromCharCode(10)))}
