@@ -43,6 +43,19 @@ def check_manifest(m):
     mem = m.get("memory_kb", 256)
     if not isinstance(mem, int) or not 64 <= mem <= 1024:
         errors.append("memory_kb 在 64～1024")
+    if "tile" in m and not isinstance(m["tile"], bool):
+        errors.append("tile 是 true / false")
+    voice = m.get("voice", [])
+    if voice and "assistant" not in m.get("permissions", []):
+        errors.append("有 voice 指令要申请 assistant 权限")
+    if len(voice) > 8:
+        errors.append("voice 指令最多 8 个")
+    for v in voice:
+        name, desc = str(v.get("name", "")), v.get("description")
+        if not re.fullmatch(r"[a-z0-9_]{1,24}", name):
+            errors.append(f"voice 指令的 name 只能用小写字母、数字、下划线（最多 24 个）：{name!r}")
+        if not isinstance(desc, str) or not desc or len(desc.encode("utf-8")) > 300:
+            errors.append(f"voice 指令「{name}」要写 description（UTF-8 最多 300 字节）")
     return errors
 
 

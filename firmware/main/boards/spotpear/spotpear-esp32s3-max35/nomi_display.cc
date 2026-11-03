@@ -10,6 +10,7 @@
 #include "nomi_podcast.h"
 #include "nomi_radio.h"
 #include "nomi_ui.h"
+#include "nomi_wasm.h"
 #include "settings.h"
 #include "wifi_board.h"
 #if CONFIG_DIRECT_API
@@ -344,8 +345,16 @@ void Action(const char* name) {
         NomiClock::GetInstance().DeleteAlarm(atoi(name + 13));
     } else if (!strcmp(name, "radio_toggle")) {
         NomiRadio::GetInstance().Toggle();
+    } else if (!strcmp(name, "tile_toggle")) {
+        NomiWasm::TileToggle();
     } else if (!strcmp(name, "radio_next") || !strcmp(name, "radio_prev")) {
-        NomiRadio::GetInstance().Step(!strcmp(name, "radio_next") ? 1 : -1);
+        // 应用放的电台：换台交给那个应用（台单是它的）；系统自己的电台在系统台单里换
+        bool next = !strcmp(name, "radio_next");
+        if (!NomiWasm::MediaCommand(next ? 2 : 3)) NomiRadio::GetInstance().Step(next ? 1 : -1);
+    } else if (!strcmp(name, "music_next") || !strcmp(name, "music_prev")) {
+        // 应用放的歌：上一首 / 下一首交给那个应用（队列是它的）；系统自己点的在线歌没有队列，退回快进快退
+        bool next = !strcmp(name, "music_next");
+        if (!NomiWasm::MediaCommand(next ? 2 : 3)) NomiRadio::GetInstance().Seek(next ? 30 : -15);
     } else if (!strncmp(name, "radio_play:", 11)) {
         NomiRadio::GetInstance().Play(atoi(name + 11));
     } else if (!strncmp(name, "pod_open:", 9)) {

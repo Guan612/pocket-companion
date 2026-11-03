@@ -31,9 +31,11 @@ public:
         int bytes_per_sec = 0;  // MP3 按时间跳转用：文件大小 / 时长；不知道按 128kbps 算
         std::string podcast;    // 节目所属播客名（显示用）；歌是歌手
         std::string key;        // 进度记在哪（NomiPodcast 用）
-        bool song = false;      // 在线音乐的一首歌（NomiMusic）：放完就停，不记进度
+        bool song = false;      // 一首歌（NomiMusic，在线或本地）：不记进度，放完交给 on_finished 接下一首
+        bool local = false;     // SD 卡上的文件：url 是设备上的路径（/sd/…），不用联网；对话时只暂停不断开
+        std::string owner;      // 哪个应用包放的（应用 id）；空 = 系统自己的电台、播客、在线点歌
         // 地址和响应头看不出真实格式时（m4a 的扩展名写成 .aac、类型是 octet-stream），调用方先探好填这里
-        enum Format { kAuto, kMp3, kAdts, kMp4 } format = kAuto;
+        enum Format { kAuto, kMp3, kAdts, kMp4, kFlac, kWav } format = kAuto;
     };
 
     static NomiRadio& GetInstance();
@@ -63,9 +65,13 @@ public:
     int Position() { return position_; }  // 节目放到第几秒
     // 节目的进度：每 30 秒、暂停、放完时在主循环里调（finished 为放完）
     std::function<void(const Station& episode, int position, bool finished)> on_progress;
+    // 一首歌 / 一期节目从头放到尾放完了：在主循环里调（应用包放的，通知那个应用接下一首）
+    std::function<void(const Station& item)> on_finished;
 
     State GetState();
     bool Wanted() { return wanted_; }
+    // 还在放 url 这个的话，换显示的名字 / 歌手（本地歌读到标签后用；空的不换）
+    void UpdateMeta(const std::string& url, const std::string& name, const std::string& artist);
     std::string StationName();
     std::string Title();     // 流里带的歌名（ICY StreamTitle），没有就空
     int CurrentIndex();      // 台单里的下标；搜来还没收藏的台、播客节目是 -1
@@ -104,7 +110,9 @@ private:
     int failures_ = 0;
     SemaphoreHandle_t reader_go_ = nullptr, decoder_go_ = nullptr;
     StreamBufferHandle_t stream_ = nullptr;
-    std::atomic<int> codec_{0};  // 1 MP3，2 AAC（ADTS）
+    std::atomic<int> codec_{0};  // 1 MP3，2 AAC（ADTS），3 FLAC，4 WAV
+    std::atomic<bool> paused_{false};  // 本地文件对话、闹钟时：解码停住不送声音，不断开、不丢位置
+    std::atomic<bool> decode_failed_{false};  // 这次播放一直解不出来，解码任务放弃了
     esp_timer_handle_t timer_ = nullptr;
     // m4a 的目录（moov）：同一期节目快进快退时不用再下一遍
     std::string moov_url_;
@@ -122,6 +130,7 @@ private:
     bool ReadStream(const std::string& url, int redirects, int start, bool live);
     bool ReadMp4(const std::string& url, int start);
     bool ReadEpisode(const std::string& url, int start);
+    bool ReadLocal(const std::string& path, int start);
     bool WriteAudio(const void* data, size_t size);
     void Select(const Station& station, int index);
     void SetDuration(const std::string& url, int seconds);  // 节目没给时长时补上（还是放着的这个才写）

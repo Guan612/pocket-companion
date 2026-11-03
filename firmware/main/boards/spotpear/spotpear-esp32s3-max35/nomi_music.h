@@ -3,7 +3,11 @@
 // 只认一种站点格式（网址在网页设置页填，存 NVS nomi_music 命名空间的 site），详见 docs/online-music.md：
 // 搜索页 {网站}/so/{关键词}/ 每条结果带 data-rid；歌曲页 {网站}/song/{rid}/ 里有 base64 编码的音频地址、
 // id="album-cover" 的封面和 data-time 的歌词。网站失效了换一个同款的填上就行，不用改固件。
-// 音频、封面先试 http（不占 TLS 的内部 RAM）；格式看文件头认（有的站把 m4a 也写成 .aac）。歌放完就停，不记进度。
+// 音频、封面先试 http（不占 TLS 的内部 RAM）；格式看文件头认（有的站把 m4a 也写成 .aac）。在线的歌放完就停，不记进度。
+//
+// 应用包放的歌（nomi_music_local.cc）：放哪首、下一首放什么归应用（音乐应用），这里只管"正在放的这首"的
+// 显示——SD 卡上的歌读文件里的标签（FLAC 的 Vorbis 注释、MP3 的 ID3）、内嵌 JPEG 封面、同名 .lrc 歌词；
+// 网上的歌用应用给的封面地址和 LRC 歌词。收听页的「音乐」标签、ui_player 控件都用这一份。
 #pragma once
 
 #include <freertos/FreeRTOS.h>
@@ -27,6 +31,19 @@ public:
     static NomiMusic& GetInstance();
     void Start();  // 读网站地址、建后台任务
     void RegisterTools();
+
+    // 应用包放的歌
+    struct Track {
+        std::string path;           // 设备上的路径（/sd/…）
+        std::string title, artist;  // 读到标签前是文件名、空
+    };
+    // 应用放了一首 SD 卡上的歌：后台读它的标签（换掉显示的歌名歌手）、内嵌封面、同名 .lrc 歌词
+    void ShowLocal(const std::string& path);
+    // 应用放了一首网上的歌：封面地址（JPEG，可以空）、LRC 格式的歌词（可以空）
+    void ShowRemote(const std::string& url, const std::string& cover_url, const std::string& lrc);
+    // 文件的标题、歌手、时长（秒，不知道为 0）；cover 不为空时顺便取内嵌的 JPEG 封面
+    static void ReadInfo(const std::string& path, Track& track, int& duration, std::string* cover = nullptr);
+    static bool IsAudioFile(const std::string& name);
 
     // 收听页的"音乐"标签
     bool Playing();  // 正在放（或暂停着）的是一首歌
@@ -68,6 +85,9 @@ private:
     std::string cover_url_;  // 只在后台任务里用
 
     NomiMusic() = default;
+    void LoadLocalExtras(const std::string& path);  // 后台任务里：标签、封面、歌词
+    void SetLyrics(const std::string& url, const std::string& lrc);  // 解析 LRC，还在放 url 这首才换上
+    void SetCover(const std::string& jpg);          // 后台任务里：换封面（空 = 没有封面）
     void Post(std::function<void()> job);
     void WorkerLoop();
     std::string Site();

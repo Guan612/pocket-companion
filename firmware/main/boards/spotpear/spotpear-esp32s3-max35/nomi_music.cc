@@ -221,13 +221,15 @@ void NomiMusic::LoadCover(const std::string& art) {
     for (const auto& u : url.empty() ? std::vector<std::string>() : Candidates(url)) {
         if ((ok = Get(u, jpg, 256 * 1024))) break;
     }
+    if (!ok) jpg.clear();
+    if (!ok && !url.empty()) ESP_LOGW(TAG, "Cover failed: %s", url.c_str());
+    SetCover(jpg);
+}
+
+void NomiMusic::SetCover(const std::string& jpg) {
     int next = cover_active_ == 0 ? 1 : 0;
-    if (ok && nomi::DecodeCover(jpg, covers_[next], kCoverSize)) {
-        cover_active_ = next;
-    } else {
-        cover_active_ = -1;  // 这首没有封面：别还显示上一首的
-        if (!url.empty()) ESP_LOGW(TAG, "Cover failed: %s", url.c_str());
-    }
+    if (!jpg.empty() && nomi::DecodeCover(jpg, covers_[next], kCoverSize)) cover_active_ = next;
+    else cover_active_ = -1;  // 这首没有封面：别还显示上一首的
     cover_version_++;
 }
 

@@ -105,6 +105,17 @@ void nomi_ui_alarm_hide(void);
 // 播放一段表情脚本（JSON，格式见 face_script.h）；不合格返回 false，原因写进 err
 bool nomi_ui_play_face(const char *json, char *err, size_t err_size);
 
+// 首页「收听」那张卡片交给应用包画（音乐应用的卡片，像 Wear OS 的 tile）：返回盖住系统收听页的全屏容器
+// （第一次调时建）。release 清空、藏起来，露出系统自己的收听页（没装音乐应用时就是它）
+lv_obj_t *nomi_ui_listen_slot(void);
+void nomi_ui_listen_slot_release(void);
+
+// 在 parent（一般是上面那个卡片容器）里建一份「正在放」：和系统收听页一个样——左半边封面、标题、
+// 上一首 / 放停 / 下一首、进度或音量，右半边歌词——跟着系统一起刷新。hint 是没歌词可显示时右边中间那行。
+// 返回顶上一排的容器（系统收听页放标签的地方），应用往里放自己的入口按钮；控件删掉时自动注销。
+// 同时最多两份，超了返回 NULL
+lv_obj_t *nomi_ui_now_playing(lv_obj_t *parent, const char *hint);
+
 #ifdef __cplusplus
 }
 #endif

@@ -378,6 +378,25 @@ private:
         NomiRadio::GetInstance().RegisterTools();
         NomiPodcast::GetInstance().RegisterTools();
         NomiMusic::GetInstance().RegisterTools();
+        // 应用包的指令：哪些应用有哪些指令写在每轮的系统提示里（NomiPkg::PromptContext），这里只一个通用入口，
+        // 装、删应用不用改工具列表
+        mcp_server.AddTool(
+            "self.app.command",
+            "让装好的应用做事（比如音乐应用放歌）。能用的 app、command 见系统提示里「装好的应用能做的事」；"
+            "arg 按指令说明填，没有就空字符串。",
+            PropertyList({Property("app", kPropertyTypeString), Property("command", kPropertyTypeString),
+                          Property("arg", kPropertyTypeString, std::string("")).SetMaxLength(200)}),
+            [](const PropertyList& p) -> ToolResult {
+                bool end = false;
+                std::string r = NomiWasm::VoiceCommand(p["app"].value<std::string>(),
+                                                       p["command"].value<std::string>(),
+                                                       p["arg"].value<std::string>(), &end);
+                if (!r.empty() && r[0] == '!') return std::unexpected(r.substr(1));
+#if CONFIG_DIRECT_API
+                if (end) DirectApiProtocol::ExitAfterReply();  // 开始放了：这句说完就回待机，声音才出得来
+#endif
+                return r;
+            });
         // TF 卡卸载后把 GPIO43 还给功放（R30 焊上的板子它是功放开关），电平按现在出不出声来
         NomiSdCard::GetInstance().on_bus_released = [this]() {
             gpio_set_direction(AUDIO_CODEC_PA_PIN, GPIO_MODE_OUTPUT);
@@ -387,7 +406,8 @@ private:
         // 每轮对话的系统提示词里带上现在几点、天气、已设的闹钟、电台（设"明早 7 点"要知道今天是哪天）
         DirectApiProtocol::context_provider = []() {
             return NomiClock::GetInstance().PromptContext() + "\n" + NomiRadio::GetInstance().PromptContext() + "\n" +
-                   NomiPodcast::GetInstance().PromptContext();
+                   NomiPodcast::GetInstance().PromptContext() + "\n" + NomiPkg::GetInstance().PromptContext() +
+                   NomiWasm::PromptContext();
         };
         DirectApiConfigServer::on_city_changed = []() { NomiClock::GetInstance().RefreshWeather(); };
         // 网页设置页的「应用」卡片：上传 .npk 安装、列出、删除

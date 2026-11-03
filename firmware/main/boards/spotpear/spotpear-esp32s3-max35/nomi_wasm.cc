@@ -1,11 +1,13 @@
 #include "nomi_wasm.h"
 
-#include "board.h"
 #include "display/display.h"
+#include "nomi_music.h"
 #include "nomi_pkg.h"
+#include "nomi_radio.h"
 #include "nomi_sdcard.h"
 #include "nomi_style.h"
 #include "nomi_ui.h"
+#include "nomi_util.h"
 
 #include <cJSON.h>
 #include <dirent.h>
@@ -15,6 +17,7 @@
 #include <esp_timer.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/queue.h>
+#include <freertos/semphr.h>
 #include <freertos/task.h>
 #include <pthread.h>
 #include <sys/stat.h>
@@ -25,107 +28,210 @@
 #include <atomic>
 #include <cstring>
 #include <map>
+#include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
 
 #define TAG "NomiWasm"
 
+LV_FONT_DECLARE(nomi_font_icon_36);  // 放在全局：写进匿名命名空间就成了另一个符号，链接时找不到
+
 namespace {
 
-constexpr uint32_t kWasmStack = 16 * 1024;  // 解释器给应用开的栈（运行时从 PSRAM 分）
-constexpr uint32_t kTaskStack = 32 * 1024;  // 常驻任务的栈（PSRAM）
-constexpr int kMaxRead = 32 * 1024;         // 一次读文件最多多少
+constexpr uint32_t kWasmStack = 16 * 1024;      // 解释器给应用开的栈（运行时从 PSRAM 分）
+constexpr uint32_t kThreadStack = 32 * 1024;    // 每个进程的 pthread 栈（PSRAM）
+constexpr int kMaxRead = 32 * 1024;             // 一次读文件最多多少
+constexpr size_t kMaxNet = 256 * 1024;          // 一次 net_get 最多多少
 constexpr size_t kMaxWasm = 1024 * 1024;
+constexpr size_t kMaxProcs = 4;                 // 同时跑着的应用最多几个
+constexpr int64_t kIdleExitUs = 30 * 1000000LL;  // 在后台、没理由留着多久后结束
+constexpr int kVoiceWaitMs = 5000;               // 语音指令等应用回话最多多久（工具在主循环里跑，别等太久）
 
 // 和 tools/app-sdk/nomi_sdk.h 一致
-enum { EV_CLICK = 1, EV_CHANGE, EV_BACK, EV_PAUSE, EV_RESUME, EV_CLOSE, EV_TIMER };
+enum {
+    EV_CLICK = 1, EV_CHANGE, EV_BACK, EV_PAUSE, EV_RESUME, EV_CLOSE, EV_TIMER, EV_VOICE, EV_READER, EV_MEDIA,
+    EV_SHOW, EV_HIDE
+};
 enum { TEXT_TITLE = 0, TEXT_BODY, TEXT_MUTED };
-constexpr int32_t E_FAIL = -1, E_DENIED = -2, E_NO_SD = -3, E_NOT_FOUND = -4;
+enum { MEDIA_FINISHED = 1, MEDIA_NEXT = 2, MEDIA_PREV = 3, MEDIA_PLAY = 4 };
+constexpr int32_t E_FAIL = -1, E_DENIED = -2, E_NO_SD = -3, E_NOT_FOUND = -4, E_NO_UI = -6, E_NO_NET = -7;
 
 struct Event {
     int32_t type, id, value;
 };
 
-struct AppRun;
+struct Proc;
 struct TimerSlot {
-    AppRun* run;
+    Proc* proc;
     int32_t id;
     esp_timer_handle_t handle;
 };
 
-// 开着的一个应用
-struct AppRun {
+// 一个跑着的应用。线程、界面回调、语音指令都可能拿着它，所以用 shared_ptr 管
+struct Proc : std::enable_shared_from_this<Proc> {
     const NomiPackage* pkg = nullptr;
-    lv_obj_t* root = nullptr;  // 应用关了就置空（界面由应用层删）
-    lv_obj_t* loading = nullptr;
-    std::vector<lv_obj_t*> objs;   // 控件 id - 1 → 控件（删掉的为空）
-    std::vector<lv_obj_t*> pages;  // 页面栈
+    // 界面（显示锁里读写）
+    lv_obj_t* root = nullptr;     // 界面挂着时：应用层给的全屏容器
+    lv_obj_t* tile = nullptr;     // 首页卡片（占着收听卡片时）
+    lv_obj_t* target = nullptr;   // 接下来建的控件放哪：当前页，或卡片
+    lv_obj_t* loading = nullptr;  // "打开中…"
+    std::vector<lv_obj_t*> objs;  // 控件 id - 1 → 控件（删掉的为空）
+    std::vector<lv_obj_t*> pages;
+    std::atomic<bool> shown{false};
+    // 线程
     QueueHandle_t queue = nullptr;
-    std::atomic<bool> closed{false};
+    std::atomic<bool> exiting{false};
+    bool show_after_main = false;
+    int64_t idle_since = 0;  // s_procs_mutex 里读写
     cJSON* kv = nullptr;
-    std::map<int32_t, TimerSlot*> timers;
-};
+    std::map<int32_t, TimerSlot*> timers;  // 只在进程自己的线程里动
+    // 大模型相关（text_mutex）
+    std::mutex text_mutex;
+    std::string context;
+    SemaphoreHandle_t voice_done = nullptr;
+    std::string voice_arg, voice_reply;
+    bool voice_end = false;
 
-struct Job {
-    AppRun* run;  // 要跑的应用；为空时跑 fn
-    void (*fn)(void*);
-    void* arg;
+    ~Proc() {
+        if (queue) vQueueDelete(queue);
+        if (voice_done) vSemaphoreDelete(voice_done);
+        cJSON_Delete(kv);
+    }
 };
+using ProcPtr = std::shared_ptr<Proc>;
 
-QueueHandle_t s_jobs;
-AppRun* s_current;  // 正开着的（LVGL 锁里读写）
+std::mutex s_procs_mutex;  // 拿锁顺序：显示锁在前
+std::vector<ProcPtr> s_procs;
+Proc* s_tile_owner;  // 占着收听卡片的（显示锁里读写）
 Display* s_display;
+QueueHandle_t s_jobs;
+esp_timer_handle_t s_housekeeping;
 
 Display* display() { return s_display; }
 
-void Post(AppRun* run, int32_t type, int32_t id, int32_t value) {
-    if (!run || run->closed) return;
+// 还在跑（没在退）的那个
+ProcPtr Find(const std::string& id) {
+    std::lock_guard<std::mutex> lock(s_procs_mutex);
+    for (auto& p : s_procs) {
+        if (p->pkg->id == id && !p->exiting) return p;
+    }
+    return nullptr;
+}
+
+void Post(Proc* p, int32_t type, int32_t id, int32_t value) {
+    if (!p || p->exiting) return;
     Event ev = {type, id, value};
-    xQueueSend(run->queue, &ev, 0);
+    xQueueSend(p->queue, &ev, 0);
 }
 
-AppRun* Ctx(wasm_exec_env_t env) {
-    return static_cast<AppRun*>(wasm_runtime_get_custom_data(wasm_runtime_get_module_inst(env)));
+// 让它退：最后收一个 CLOSE（趁这时候存进度），之后的事件都不送了
+void Exit(Proc* p) {
+    if (p->exiting.exchange(true)) return;
+    Event ev = {EV_CLOSE, 0, 0};
+    xQueueSend(p->queue, &ev, 0);
 }
 
-// 改界面：拿显示锁；应用已经关了就什么都不做
+Proc* Ctx(wasm_exec_env_t env) {
+    return static_cast<Proc*>(wasm_runtime_get_custom_data(wasm_runtime_get_module_inst(env)));
+}
+
+// 放的东西归这个应用、而且主人还要它放着（对话时让出来的也算）
+bool OwnsMedia(const Proc* p) {
+    auto& radio = NomiRadio::GetInstance();
+    return radio.Wanted() && radio.Current().owner == p->pkg->id;
+}
+
+bool KeepResident(const Proc* p) { return p->shown || p->pkg->tile || OwnsMedia(p); }
+
+// 改界面：拿显示锁；进程在退就什么都不做
 class UiScope {
 public:
-    explicit UiScope(AppRun* run) : lock_(display()), run_(run) {}
-    bool ok() const { return run_ && !run_->closed && run_->root; }
+    explicit UiScope(Proc* p) : lock_(display()), p_(p) {}
+    bool ok() const { return !p_->exiting; }
+    lv_obj_t* target() const { return ok() ? p_->target : nullptr; }
 
 private:
     DisplayLockGuard lock_;
-    AppRun* run_;
+    Proc* p_;
 };
 
-lv_obj_t* Obj(AppRun* run, int32_t id) {
-    return id >= 1 && id <= static_cast<int32_t>(run->objs.size()) ? run->objs[id - 1] : nullptr;
-}
-
-lv_obj_t* Page(AppRun* run) { return run->pages.empty() ? nullptr : run->pages.back(); }
-
 bool IsInside(lv_obj_t* obj, lv_obj_t* ancestor) {
+    if (!ancestor) return false;
     for (; obj; obj = lv_obj_get_parent(obj)) {
         if (obj == ancestor) return true;
     }
     return false;
 }
 
-// 关掉最上面一页（只剩一页时不关）：上面的控件 id 都作废，露出下面那页
-bool PopPage(AppRun* run) {
-    if (run->pages.size() <= 1) return false;
-    lv_obj_t* top = run->pages.back();
-    run->pages.pop_back();
-    for (auto& o : run->objs) {
-        if (o && IsInside(o, top)) o = nullptr;
+void ForgetInside(Proc* p, lv_obj_t* container) {
+    for (auto& o : p->objs) {
+        if (o && IsInside(o, container)) o = nullptr;
     }
+    if (IsInside(p->target, container)) p->target = nullptr;
+}
+
+// 显示锁里、root 删掉之前：界面拿下，里面的控件 id 作废（root 由应用层删）
+void DetachUi(Proc* p) {
+    if (p->root) ForgetInside(p, p->root);
+    p->pages.clear();
+    p->root = p->loading = nullptr;
+    p->shown = false;
+}
+
+// 显示锁里：卡片让出来（换了别的应用占、或者自己退了）
+void DropTile(Proc* p) {
+    if (!p->tile) return;
+    ForgetInside(p, p->tile);
+    p->tile = nullptr;
+}
+
+void TakeTile(Proc* p) {
+    if (s_tile_owner && s_tile_owner != p) DropTile(s_tile_owner);
+    s_tile_owner = p;
+    p->tile = nomi_ui_listen_slot();
+    lv_obj_clean(p->tile);
+}
+
+lv_obj_t* Obj(Proc* p, int32_t id) {
+    return id >= 1 && id <= static_cast<int32_t>(p->objs.size()) ? p->objs[id - 1] : nullptr;
+}
+
+int32_t AddObj(Proc* p, lv_obj_t* o) {
+    p->objs.push_back(o);
+    return p->objs.size();
+}
+
+// 关掉最上面一页（只剩一页时不关）：上面的控件 id 都作废，露出下面那页
+bool PopPage(Proc* p) {
+    if (p->pages.size() <= 1) return false;
+    lv_obj_t* top = p->pages.back();
+    p->pages.pop_back();
+    bool was_target = IsInside(p->target, top);
+    ForgetInside(p, top);
+    if (was_target) p->target = p->pages.back();
     lv_obj_delete(top);
-    lv_obj_remove_flag(run->pages.back(), LV_OBJ_FLAG_HIDDEN);
+    lv_obj_remove_flag(p->pages.back(), LV_OBJ_FLAG_HIDDEN);
     return true;
 }
 
-void OnClick(lv_event_t* e) { Post(s_current, EV_CLICK, (int32_t)(intptr_t)lv_event_get_user_data(e), 0); }
+// 可点的控件：记着是哪个进程的哪个 id。进程没了点了也不出事（weak_ptr）
+struct ClickTag {
+    std::weak_ptr<Proc> proc;
+    int32_t id;
+};
+void BindClick(lv_obj_t* o, Proc* p, int32_t id) {
+    auto* tag = new ClickTag{p->weak_from_this(), id};
+    lv_obj_add_event_cb(
+        o,
+        [](lv_event_t* e) {
+            auto* t = static_cast<ClickTag*>(lv_event_get_user_data(e));
+            if (ProcPtr proc = t->proc.lock()) Post(proc.get(), EV_CLICK, t->id, 0);
+        },
+        LV_EVENT_CLICKED, tag);
+    lv_obj_add_event_cb(
+        o, [](lv_event_t* e) { delete static_cast<ClickTag*>(lv_event_get_user_data(e)); }, LV_EVENT_DELETE, tag);
+}
 
 lv_obj_t* FirstLabel(lv_obj_t* obj) {
     if (!obj) return nullptr;
@@ -138,83 +244,152 @@ lv_obj_t* FirstLabel(lv_obj_t* obj) {
 
 void SetColor(lv_obj_t* obj, uint32_t c) { lv_obj_set_style_text_color(obj, lv_color_hex(c), 0); }
 
+// 一页：竖着排、只上下滚
+lv_obj_t* MakeColumn(lv_obj_t* parent) {
+    lv_obj_t* col = lv_obj_create(parent);
+    lv_obj_remove_style_all(col);
+    lv_obj_set_size(col, LV_PCT(100), LV_PCT(100));
+    lv_obj_set_style_bg_color(col, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(col, LV_OPA_COVER, 0);
+    lv_obj_set_flex_flow(col, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_hor(col, 36, 0);
+    lv_obj_set_style_pad_ver(col, 20, 0);
+    lv_obj_set_style_pad_row(col, 12, 0);
+    lv_obj_set_scroll_dir(col, LV_DIR_VER);
+    lv_obj_set_scrollbar_mode(col, LV_SCROLLBAR_MODE_AUTO);
+    return col;
+}
+
+// 应用建的容器（页面、卡片、卡片顶上一排）：ui_target 能指它们，不能藏、不能删
+constexpr lv_obj_flag_t kContainer = LV_OBJ_FLAG_USER_1;
+constexpr lv_obj_flag_t kTabBar = LV_OBJ_FLAG_USER_2;  // 「正在放」顶上那排：按钮画成小标签
+
+lv_obj_t* AddLoading(lv_obj_t* root) {
+    lv_obj_t* l = lv_label_create(root);
+    lv_obj_set_style_text_color(l, lv_color_hex(C_MUTED), 0);
+    lv_label_set_text(l, "打开中…");
+    lv_obj_center(l);
+    return l;
+}
+
+void CopyOut(const std::string& s, char* buf, uint32_t size, int32_t* n) {
+    if (size == 0) {
+        *n = E_FAIL;
+        return;
+    }
+    size_t len = std::min<size_t>(s.size(), size - 1);
+    memcpy(buf, s.data(), len);
+    buf[len] = '\0';
+    *n = len;
+}
+
 /* ---------- 界面 ---------- */
 
 int32_t ui_page(wasm_exec_env_t env, const char* title) {
-    AppRun* run = Ctx(env);
-    UiScope ui(run);
-    if (!ui.ok()) return E_FAIL;
-    if (run->loading) {
-        lv_obj_delete(run->loading);
-        run->loading = nullptr;
+    Proc* p = Ctx(env);
+    UiScope ui(p);
+    if (!ui.ok() || !p->root) return E_NO_UI;  // 在后台：没有界面
+    if (p->loading) {
+        lv_obj_delete(p->loading);
+        p->loading = nullptr;
     }
-    lv_obj_t* page = lv_obj_create(run->root);
-    lv_obj_remove_style_all(page);
-    lv_obj_set_size(page, LV_PCT(100), LV_PCT(100));
-    lv_obj_set_style_bg_color(page, lv_color_black(), 0);
-    lv_obj_set_style_bg_opa(page, LV_OPA_COVER, 0);
-    lv_obj_set_flex_flow(page, LV_FLEX_FLOW_COLUMN);
-    lv_obj_set_style_pad_hor(page, 36, 0);
-    lv_obj_set_style_pad_ver(page, 20, 0);
-    lv_obj_set_style_pad_row(page, 12, 0);
-    lv_obj_set_scroll_dir(page, LV_DIR_VER);
-    lv_obj_set_scrollbar_mode(page, LV_SCROLLBAR_MODE_AUTO);
+    lv_obj_t* page = MakeColumn(p->root);
+    lv_obj_add_flag(page, kContainer);
     // 放到左边缘拖动条（应用层加在 root 最后）下面
-    lv_obj_move_to_index(page, static_cast<int32_t>(lv_obj_get_child_count(run->root)) - 2);
-    if (lv_obj_t* prev = Page(run)) lv_obj_add_flag(prev, LV_OBJ_FLAG_HIDDEN);
-    run->pages.push_back(page);
-    if (title && *title) {
-        lv_obj_t* l = lv_label_create(page);
-        lv_label_set_text(l, title);
-    }
-    run->objs.push_back(page);
-    return run->objs.size();
+    lv_obj_move_to_index(page, static_cast<int32_t>(lv_obj_get_child_count(p->root)) - 2);
+    if (!p->pages.empty()) lv_obj_add_flag(p->pages.back(), LV_OBJ_FLAG_HIDDEN);
+    p->pages.push_back(page);
+    p->target = page;
+    if (title && *title) lv_label_set_text(lv_label_create(page), title);
+    return AddObj(p, page);
 }
 
 void ui_page_close(wasm_exec_env_t env) {
-    AppRun* run = Ctx(env);
-    UiScope ui(run);
-    if (ui.ok()) PopPage(run);
+    Proc* p = Ctx(env);
+    UiScope ui(p);
+    if (ui.ok()) PopPage(p);
+}
+
+// 首页卡片（manifest 里 "tile": true）：清空重画，接下来建的控件放进卡片。返回卡片的 id（ui_target 用）
+int32_t ui_tile(wasm_exec_env_t env) {
+    Proc* p = Ctx(env);
+    UiScope ui(p);
+    if (!ui.ok() || !p->tile) return E_DENIED;
+    ForgetInside(p, p->tile);
+    lv_obj_clean(p->tile);
+    lv_obj_t* col = MakeColumn(p->tile);
+    lv_obj_set_style_pad_top(col, 16, 0);
+    lv_obj_add_flag(col, kContainer);
+    p->target = col;
+    return AddObj(p, col);
+}
+
+// 首页卡片里的「正在放」：和系统收听页一个样（封面、标题、上一首 / 放停 / 下一首、进度、右边歌词），系统刷新。
+// 清空卡片重画；返回顶上一排（系统收听页放标签的地方）的 id，接下来建的按钮放进那排，画成小标签
+int32_t ui_now_playing(wasm_exec_env_t env, const char* hint) {
+    Proc* p = Ctx(env);
+    UiScope ui(p);
+    if (!ui.ok() || !p->tile) return E_DENIED;
+    ForgetInside(p, p->tile);
+    lv_obj_clean(p->tile);
+    lv_obj_t* bar = nomi_ui_now_playing(p->tile, hint);
+    if (!bar) return E_FAIL;
+    lv_obj_add_flag(bar, static_cast<lv_obj_flag_t>(kContainer | kTabBar));
+    p->target = bar;
+    return AddObj(p, bar);
+}
+
+// 接下来建的控件放到哪：一页（ui_page 的返回值）或卡片（ui_tile 的返回值）
+int32_t ui_target(wasm_exec_env_t env, int32_t id) {
+    Proc* p = Ctx(env);
+    UiScope ui(p);
+    lv_obj_t* o = ui.ok() ? Obj(p, id) : nullptr;
+    if (!o || !lv_obj_has_flag(o, kContainer)) return E_NOT_FOUND;
+    p->target = o;
+    return 0;
 }
 
 int32_t ui_text(wasm_exec_env_t env, const char* text, int32_t style) {
-    AppRun* run = Ctx(env);
-    UiScope ui(run);
-    if (!ui.ok() || !Page(run)) return E_FAIL;
-    lv_obj_t* l = lv_label_create(Page(run));
+    Proc* p = Ctx(env);
+    UiScope ui(p);
+    lv_obj_t* parent = ui.target();
+    if (!parent) return E_NO_UI;
+    lv_obj_t* l = lv_label_create(parent);
     lv_obj_set_width(l, LV_PCT(100));
     lv_label_set_long_mode(l, LV_LABEL_LONG_MODE_WRAP);
     SetColor(l, style == TEXT_MUTED ? C_MUTED : C_TEXT);
     lv_label_set_text(l, text);
-    run->objs.push_back(l);
-    return run->objs.size();
+    return AddObj(p, l);
 }
 
 int32_t ui_button(wasm_exec_env_t env, const char* text, int32_t primary) {
-    AppRun* run = Ctx(env);
-    UiScope ui(run);
-    if (!ui.ok() || !Page(run)) return E_FAIL;
-    int32_t id = run->objs.size() + 1;
-    lv_obj_t* b = lv_button_create(Page(run));
-    lv_obj_set_style_radius(b, 18, 0);
+    Proc* p = Ctx(env);
+    UiScope ui(p);
+    lv_obj_t* parent = ui.target();
+    if (!parent) return E_NO_UI;
+    lv_obj_t* b = lv_button_create(parent);
+    bool tab = lv_obj_has_flag(parent, kTabBar);  // 「正在放」顶上那排：和系统收听页的标签一个样
+    lv_obj_set_style_radius(b, tab ? 15 : 18, 0);
     lv_obj_set_style_shadow_width(b, 0, 0);
-    lv_obj_set_style_pad_hor(b, 22, 0);
-    lv_obj_set_style_pad_ver(b, 10, 0);
+    lv_obj_set_style_pad_hor(b, tab ? 14 : 22, 0);
+    lv_obj_set_style_pad_ver(b, tab ? 0 : 10, 0);
+    if (tab) lv_obj_set_size(b, LV_SIZE_CONTENT, 30);
     lv_obj_set_style_bg_color(b, lv_color_hex(primary ? C_ACCENT : C_CONTROL), 0);
     lv_obj_t* l = lv_label_create(b);
-    SetColor(l, primary ? 0x0b1220 : C_TEXT);
+    SetColor(l, primary ? 0x0b1220 : tab ? C_MUTED : C_TEXT);
     lv_label_set_text(l, text);
-    lv_obj_add_event_cb(b, OnClick, LV_EVENT_CLICKED, (void*)(intptr_t)id);
-    run->objs.push_back(b);
+    if (tab) lv_obj_center(l);
+    int32_t id = AddObj(p, b);
+    BindClick(b, p, id);
     return id;
 }
 
 int32_t ui_item(wasm_exec_env_t env, const char* title, const char* sub, const char* right) {
-    AppRun* run = Ctx(env);
-    UiScope ui(run);
-    if (!ui.ok() || !Page(run)) return E_FAIL;
-    int32_t id = run->objs.size() + 1;
-    lv_obj_t* row = lv_obj_create(Page(run));
+    Proc* p = Ctx(env);
+    UiScope ui(p);
+    lv_obj_t* parent = ui.target();
+    if (!parent) return E_NO_UI;
+    lv_obj_t* row = lv_obj_create(parent);
     lv_obj_remove_style_all(row);
     lv_obj_set_size(row, LV_PCT(100), LV_SIZE_CONTENT);
     lv_obj_set_style_bg_color(row, lv_color_hex(C_PANEL), 0);
@@ -233,8 +408,7 @@ int32_t ui_item(wasm_exec_env_t env, const char* title, const char* sub, const c
     lv_obj_set_flex_grow(col, 1);
     lv_obj_set_flex_flow(col, LV_FLEX_FLOW_COLUMN);
     lv_obj_remove_flag(col, static_cast<lv_obj_flag_t>(LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE));
-    lv_obj_t* t = lv_label_create(col);
-    lv_label_set_text(t, title);
+    lv_label_set_text(lv_label_create(col), title);
     if (sub && *sub) {
         lv_obj_t* s = lv_label_create(col);
         SetColor(s, C_MUTED);
@@ -245,62 +419,264 @@ int32_t ui_item(wasm_exec_env_t env, const char* title, const char* sub, const c
         SetColor(r, C_MUTED);
         lv_label_set_text(r, right);
     }
-    lv_obj_add_event_cb(row, OnClick, LV_EVENT_CLICKED, (void*)(intptr_t)id);
-    run->objs.push_back(row);
+    int32_t id = AddObj(p, row);
+    BindClick(row, p, id);
     return id;
 }
 
 void ui_set_text(wasm_exec_env_t env, int32_t id, const char* text) {
-    AppRun* run = Ctx(env);
-    UiScope ui(run);
+    Proc* p = Ctx(env);
+    UiScope ui(p);
     if (!ui.ok()) return;
-    if (lv_obj_t* l = FirstLabel(Obj(run, id))) lv_label_set_text(l, text);
+    if (lv_obj_t* l = FirstLabel(Obj(p, id))) {
+        if (strcmp(lv_label_get_text(l), text) != 0) lv_label_set_text(l, text);
+    }
+}
+
+// 页面、卡片本身不能藏、不能删（页面用 ui_page_close，卡片用 ui_tile 重画）
+bool IsContainer(Proc* p, lv_obj_t* o) {
+    (void)p;
+    return lv_obj_has_flag(o, kContainer);
 }
 
 void ui_set_hidden(wasm_exec_env_t env, int32_t id, int32_t hidden) {
-    AppRun* run = Ctx(env);
-    UiScope ui(run);
-    lv_obj_t* o = ui.ok() ? Obj(run, id) : nullptr;
-    if (o && std::find(run->pages.begin(), run->pages.end(), o) == run->pages.end()) {
-        lv_obj_set_flag(o, LV_OBJ_FLAG_HIDDEN, hidden != 0);
-    }
+    Proc* p = Ctx(env);
+    UiScope ui(p);
+    lv_obj_t* o = ui.ok() ? Obj(p, id) : nullptr;
+    if (o && !IsContainer(p, o)) lv_obj_set_flag(o, LV_OBJ_FLAG_HIDDEN, hidden != 0);
 }
 
 void ui_remove(wasm_exec_env_t env, int32_t id) {
-    AppRun* run = Ctx(env);
-    UiScope ui(run);
-    lv_obj_t* o = ui.ok() ? Obj(run, id) : nullptr;
-    if (!o || std::find(run->pages.begin(), run->pages.end(), o) != run->pages.end()) return;  // 页面用 ui_page_close
-    for (auto& x : run->objs) {
-        if (x && IsInside(x, o)) x = nullptr;
-    }
+    Proc* p = Ctx(env);
+    UiScope ui(p);
+    lv_obj_t* o = ui.ok() ? Obj(p, id) : nullptr;
+    if (!o || IsContainer(p, o)) return;
+    ForgetInside(p, o);
     lv_obj_delete(o);
 }
 
 void ui_toast(wasm_exec_env_t env, const char* text) {
-    AppRun* run = Ctx(env);
-    UiScope ui(run);
+    Proc* p = Ctx(env);
+    UiScope ui(p);
     if (ui.ok()) nomi_ui_notify(text, 2500);
+}
+
+// 打开自己的界面（卡片上点了要进应用时用）；界面已经开着什么都不做。之后会来 SHOW
+void ui_open(wasm_exec_env_t env) {
+    Proc* p = Ctx(env);
+    UiScope ui(p);
+    if (ui.ok() && !p->root) nomi_app_open(p->pkg->id.c_str());
+}
+
+/* ---------- ui_player：系统画的「正在放」（封面、歌名、进度、上一首 / 放停 / 下一首） ---------- */
+
+#define ICON_PLAY "\xEF\x81\x8B"
+#define ICON_PAUSE "\xEF\x81\x8C"
+#define ICON_PREV "\xEF\x81\x88"
+#define ICON_NEXT "\xEF\x81\x91"
+constexpr int kCover = NomiMusic::kCoverSize;
+
+struct Player {
+    lv_obj_t *cover, *title, *artist, *time, *slider, *play;
+    lv_image_dsc_t dsc;
+    int cover_version = -1;
+    lv_timer_t* timer;
+    std::weak_ptr<Proc> owner;  // 画这个控件的应用
+    std::string owner_id;
+};
+
+// 上一首 / 下一首：交给放这个的应用（队列是它的）；系统自己放的电台换台、节目快进快退
+void PlayerStep(bool next) {
+    if (NomiWasm::MediaCommand(next ? MEDIA_NEXT : MEDIA_PREV)) return;
+    auto& radio = NomiRadio::GetInstance();
+    if (radio.Current().episode) radio.Seek(next ? 30 : -15);
+    else radio.Step(next ? 1 : -1);
+}
+
+// 放 / 停：在放就停；停着的是这个应用自己的就接着放；别的（或什么都没有）交给应用决定放什么
+void PlayerToggle(Player* p) {
+    auto& radio = NomiRadio::GetInstance();
+    if (radio.Wanted() || radio.Current().owner == p->owner_id) {
+        radio.Toggle();
+    } else if (ProcPtr proc = p->owner.lock()) {
+        Post(proc.get(), EV_MEDIA, 0, MEDIA_PLAY);
+    }
+}
+
+void SetTextIfChanged(lv_obj_t* label, const std::string& text) {
+    if (strcmp(lv_label_get_text(label), text.c_str()) != 0) lv_label_set_text(label, text.c_str());
+}
+
+std::string Clock(int s) {
+    char buf[16];
+    snprintf(buf, sizeof(buf), "%d:%02d", s / 60, s % 60);
+    return buf;
+}
+
+// 0 没在放、1 连接中、2 在放、3 暂停（自己停的、或对话时让出来的）
+int32_t MediaState() {
+    auto& radio = NomiRadio::GetInstance();
+    if (!radio.Wanted()) return radio.Current().episode && radio.Position() > 0 ? 3 : 0;
+    switch (radio.GetState()) {
+    case NomiRadio::kPlaying: return 2;
+    case NomiRadio::kHeld: return 3;
+    case NomiRadio::kOff: return 0;
+    default: return 1;
+    }
+}
+
+void PlayerRefresh(Player* p) {
+    auto& radio = NomiRadio::GetInstance();
+    NomiRadio::Station st = radio.Current();
+    bool any = !st.url.empty();
+    SetTextIfChanged(p->title, any ? st.name : "没在放");
+    SetTextIfChanged(p->artist, any ? st.podcast : "");
+    int pos = st.episode ? radio.Position() : 0, dur = st.episode ? st.duration : 0;
+    SetTextIfChanged(p->time, st.episode ? Clock(pos) + (dur > 0 ? " / " + Clock(dur) : "") : "");
+    lv_obj_set_flag(p->slider, LV_OBJ_FLAG_HIDDEN, !st.episode);  // 电台直播没有进度
+    if (st.episode && !lv_obj_has_state(p->slider, LV_STATE_PRESSED)) {
+        lv_slider_set_range(p->slider, 0, dur > 0 ? dur : 1);
+        lv_slider_set_value(p->slider, dur > 0 ? std::min(pos, dur) : 0, LV_ANIM_OFF);
+    }
+    int state = MediaState();
+    SetTextIfChanged(lv_obj_get_child(p->play, 0), state == 1 || state == 2 ? ICON_PAUSE : ICON_PLAY);
+    int version;
+    const uint16_t* px = NomiMusic::GetInstance().Cover(version);
+    bool show = st.song && px;
+    if (show && (version != p->cover_version || p->dsc.data != reinterpret_cast<const uint8_t*>(px))) {
+        p->cover_version = version;
+        memset(&p->dsc, 0, sizeof(p->dsc));
+        p->dsc.header.magic = LV_IMAGE_HEADER_MAGIC;
+        p->dsc.header.cf = LV_COLOR_FORMAT_RGB565;
+        p->dsc.header.w = kCover;
+        p->dsc.header.h = kCover;
+        p->dsc.header.stride = kCover * 2;
+        p->dsc.data = reinterpret_cast<const uint8_t*>(px);
+        p->dsc.data_size = kCover * kCover * 2;
+        lv_image_set_src(p->cover, &p->dsc);
+        lv_obj_invalidate(p->cover);
+    }
+    lv_obj_set_style_image_opa(p->cover, show ? LV_OPA_COVER : LV_OPA_TRANSP, 0);
+}
+
+lv_obj_t* PlayerButton(lv_obj_t* parent, const char* icon, int size, lv_event_cb_t cb, Player* p) {
+    lv_obj_t* b = lv_button_create(parent);
+    lv_obj_set_size(b, size, size);
+    lv_obj_set_style_radius(b, size / 2, 0);
+    lv_obj_set_style_shadow_width(b, 0, 0);
+    lv_obj_set_style_bg_color(b, lv_color_hex(C_CONTROL), 0);
+    lv_obj_t* l = lv_label_create(b);
+    lv_obj_set_style_text_font(l, &nomi_font_icon_36, 0);
+    lv_label_set_text(l, icon);
+    lv_obj_center(l);
+    lv_obj_add_event_cb(b, cb, LV_EVENT_CLICKED, p);
+    return b;
+}
+
+int32_t ui_player(wasm_exec_env_t env) {
+    Proc* proc = Ctx(env);
+    UiScope ui(proc);
+    lv_obj_t* parent = ui.target();
+    if (!parent) return E_NO_UI;
+    auto* p = new Player();
+    p->owner = proc->weak_from_this();
+    p->owner_id = proc->pkg->id;
+    lv_obj_t* box = lv_obj_create(parent);
+    lv_obj_remove_style_all(box);
+    lv_obj_set_size(box, LV_PCT(100), LV_SIZE_CONTENT);
+    lv_obj_set_flex_flow(box, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_row(box, 10, 0);
+    lv_obj_remove_flag(box, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t* top = lv_obj_create(box);
+    lv_obj_remove_style_all(top);
+    lv_obj_set_size(top, LV_PCT(100), LV_SIZE_CONTENT);
+    lv_obj_set_flex_flow(top, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(top, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(top, 16, 0);
+    lv_obj_remove_flag(top, LV_OBJ_FLAG_SCROLLABLE);
+    p->cover = lv_image_create(top);
+    lv_obj_set_size(p->cover, kCover, kCover);
+    lv_obj_set_style_radius(p->cover, 10, 0);
+    lv_obj_set_style_clip_corner(p->cover, true, 0);
+    lv_obj_set_style_bg_color(p->cover, lv_color_hex(C_PANEL), 0);
+    lv_obj_set_style_bg_opa(p->cover, LV_OPA_COVER, 0);
+    lv_obj_t* info = lv_obj_create(top);
+    lv_obj_remove_style_all(info);
+    lv_obj_set_size(info, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
+    lv_obj_set_flex_grow(info, 1);
+    lv_obj_set_flex_flow(info, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_row(info, 4, 0);
+    lv_obj_remove_flag(info, static_cast<lv_obj_flag_t>(LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE));
+    p->title = lv_label_create(info);
+    lv_obj_set_width(p->title, LV_PCT(100));
+    lv_label_set_long_mode(p->title, LV_LABEL_LONG_MODE_SCROLL_CIRCULAR);
+    p->artist = lv_label_create(info);
+    lv_obj_set_width(p->artist, LV_PCT(100));
+    lv_label_set_long_mode(p->artist, LV_LABEL_LONG_MODE_DOTS);
+    SetColor(p->artist, C_MUTED);
+    p->time = lv_label_create(info);
+    SetColor(p->time, C_MUTED);
+
+    p->slider = lv_slider_create(box);
+    lv_obj_set_size(p->slider, LV_PCT(100), 6);
+    lv_obj_set_style_bg_color(p->slider, lv_color_hex(C_CONTROL), LV_PART_MAIN);
+    lv_obj_set_style_bg_color(p->slider, lv_color_hex(C_ACCENT), LV_PART_INDICATOR);
+    lv_obj_set_style_bg_color(p->slider, lv_color_hex(C_TEXT), LV_PART_KNOB);
+    lv_obj_set_style_pad_all(p->slider, 4, LV_PART_KNOB);
+    lv_obj_add_event_cb(
+        p->slider,
+        [](lv_event_t* e) { NomiRadio::GetInstance().SeekTo(lv_slider_get_value(lv_event_get_target_obj(e))); },
+        LV_EVENT_RELEASED, nullptr);
+
+    lv_obj_t* row = lv_obj_create(box);
+    lv_obj_remove_style_all(row);
+    lv_obj_set_size(row, LV_PCT(100), LV_SIZE_CONTENT);
+    lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(row, LV_FLEX_ALIGN_SPACE_EVENLY, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_remove_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+    // 上一首 / 下一首交给放这个的应用（队列是它的）
+    PlayerButton(row, ICON_PREV, 56, [](lv_event_t*) { PlayerStep(false); }, p);
+    p->play = PlayerButton(row, ICON_PLAY, 68,
+                           [](lv_event_t* e) {
+                               auto* pl = static_cast<Player*>(lv_event_get_user_data(e));
+                               PlayerToggle(pl);
+                               PlayerRefresh(pl);
+                           },
+                           p);
+    lv_obj_set_style_bg_color(p->play, lv_color_hex(C_ACCENT), 0);
+    SetColor(lv_obj_get_child(p->play, 0), 0x0b1220);
+    PlayerButton(row, ICON_NEXT, 56, [](lv_event_t*) { PlayerStep(true); }, p);
+
+    p->timer = lv_timer_create([](lv_timer_t* t) { PlayerRefresh(static_cast<Player*>(lv_timer_get_user_data(t))); },
+                               500, p);
+    lv_obj_add_event_cb(
+        box,
+        [](lv_event_t* e) {
+            auto* pl = static_cast<Player*>(lv_event_get_user_data(e));
+            lv_timer_delete(pl->timer);
+            delete pl;
+        },
+        LV_EVENT_DELETE, p);
+    PlayerRefresh(p);
+    return AddObj(proc, box);
 }
 
 /* ---------- 存储 ---------- */
 
 // 应用给的路径换成设备上的；不许 ..；权限不够、写只读的地方返回空，err 里是原因
-std::string Resolve(AppRun* run, const char* path, bool write, int32_t* err) {
-    std::string p = path ? path : "";
+std::string Resolve(Proc* p, const char* path, bool write, int32_t* err) {
+    std::string s = path ? path : "";
     *err = E_FAIL;
-    if (p.find("..") != std::string::npos) return "";
-    if (p.rfind("data:/", 0) == 0) return run->pkg->dir + "/data/" + p.substr(6);
-    if (p.rfind("pkg:/", 0) == 0) {
-        if (write) return "";
-        return run->pkg->dir + "/assets/" + p.substr(5);
-    }
-    if (p.rfind("sd:/", 0) == 0) {
-        if (write || !run->pkg->Has("sd.read")) {
+    if (s.find("..") != std::string::npos) return "";
+    if (s.rfind("data:/", 0) == 0) return p->pkg->dir + "/data/" + s.substr(6);
+    if (s.rfind("pkg:/", 0) == 0) return write ? "" : p->pkg->dir + "/assets/" + s.substr(5);
+    if (s.rfind("sd:/", 0) == 0) {
+        if (write || !p->pkg->Has("sd.read")) {
             *err = E_DENIED;
             return "";
         }
-        return std::string("/sd/") + p.substr(4);
+        return std::string("/sd/") + s.substr(4);
     }
     return "";
 }
@@ -309,7 +685,7 @@ int32_t fs_list(wasm_exec_env_t env, const char* dir, char* buf, uint32_t size) 
     int32_t err;
     std::string path = Resolve(Ctx(env), dir, false, &err);
     if (path.empty()) return err;
-    if (!path.empty() && path.back() == '/') path.pop_back();
+    if (path.back() == '/') path.pop_back();
     DIR* d = opendir(path.c_str());
     if (!d) return NomiSdCard::GetInstance().GetState() == NomiSdCard::kReady ? E_NOT_FOUND : E_NO_SD;
     uint32_t n = 0;
@@ -324,19 +700,19 @@ int32_t fs_list(wasm_exec_env_t env, const char* dir, char* buf, uint32_t size) 
     return n;
 }
 
-int32_t fs_size(wasm_exec_env_t env, const char* p) {
+int32_t fs_size(wasm_exec_env_t env, const char* path) {
     int32_t err;
-    std::string path = Resolve(Ctx(env), p, false, &err);
-    if (path.empty()) return err;
+    std::string s = Resolve(Ctx(env), path, false, &err);
+    if (s.empty()) return err;
     struct stat st;
-    return stat(path.c_str(), &st) == 0 ? static_cast<int32_t>(st.st_size) : E_NOT_FOUND;
+    return stat(s.c_str(), &st) == 0 ? static_cast<int32_t>(st.st_size) : E_NOT_FOUND;
 }
 
-int32_t fs_read(wasm_exec_env_t env, const char* p, int32_t offset, void* buf, uint32_t size) {
+int32_t fs_read(wasm_exec_env_t env, const char* path, int32_t offset, void* buf, uint32_t size) {
     int32_t err;
-    std::string path = Resolve(Ctx(env), p, false, &err);
-    if (path.empty()) return err;
-    FILE* f = fopen(path.c_str(), "rb");
+    std::string s = Resolve(Ctx(env), path, false, &err);
+    if (s.empty()) return err;
+    FILE* f = fopen(s.c_str(), "rb");
     if (!f) return E_NOT_FOUND;
     if (size > kMaxRead) size = kMaxRead;
     size_t n = fseek(f, offset, SEEK_SET) == 0 ? fread(buf, 1, size, f) : 0;
@@ -345,48 +721,173 @@ int32_t fs_read(wasm_exec_env_t env, const char* p, int32_t offset, void* buf, u
 }
 
 // 小设置和进度：data/kv.json，一个 JSON 对象，改一次写一次（不占设备那 16KB 的 NVS）
-void LoadKv(AppRun* run) {
-    std::string path = run->pkg->dir + "/data/kv.json";
-    FILE* f = fopen(path.c_str(), "rb");
+void LoadKv(Proc* p) {
     std::string text;
-    if (f) {
+    if (FILE* f = fopen((p->pkg->dir + "/data/kv.json").c_str(), "rb")) {
         char tmp[512];
         size_t n;
         while ((n = fread(tmp, 1, sizeof(tmp), f)) > 0 && text.size() < 64 * 1024) text.append(tmp, n);
         fclose(f);
     }
-    run->kv = cJSON_Parse(text.c_str());
-    if (!cJSON_IsObject(run->kv)) {
-        cJSON_Delete(run->kv);
-        run->kv = cJSON_CreateObject();
+    p->kv = cJSON_Parse(text.c_str());
+    if (!cJSON_IsObject(p->kv)) {
+        cJSON_Delete(p->kv);
+        p->kv = cJSON_CreateObject();
     }
 }
 
 int32_t kv_get(wasm_exec_env_t env, const char* key, char* buf, uint32_t size) {
-    AppRun* run = Ctx(env);
-    cJSON* item = cJSON_GetObjectItemCaseSensitive(run->kv, key);
-    if (!cJSON_IsString(item) || size == 0) return E_NOT_FOUND;
-    size_t len = strlen(item->valuestring);
-    size_t n = len < size - 1 ? len : size - 1;
-    memcpy(buf, item->valuestring, n);
-    buf[n] = '\0';
-    return static_cast<int32_t>(n);
+    cJSON* item = cJSON_GetObjectItemCaseSensitive(Ctx(env)->kv, key);
+    if (!cJSON_IsString(item)) return E_NOT_FOUND;
+    int32_t n;
+    CopyOut(item->valuestring, buf, size, &n);
+    return n;
 }
 
 int32_t kv_set(wasm_exec_env_t env, const char* key, const char* value) {
-    AppRun* run = Ctx(env);
+    Proc* p = Ctx(env);
     if (!key || !*key) return E_FAIL;
     cJSON* item = cJSON_CreateString(value ? value : "");
-    if (cJSON_HasObjectItem(run->kv, key)) cJSON_ReplaceItemInObjectCaseSensitive(run->kv, key, item);
-    else cJSON_AddItemToObject(run->kv, key, item);
-    std::string dir = run->pkg->dir + "/data";
+    if (cJSON_HasObjectItem(p->kv, key)) cJSON_ReplaceItemInObjectCaseSensitive(p->kv, key, item);
+    else cJSON_AddItemToObject(p->kv, key, item);
+    std::string dir = p->pkg->dir + "/data";
     mkdir(dir.c_str(), 0775);
-    char* json = cJSON_PrintUnformatted(run->kv);
+    char* json = cJSON_PrintUnformatted(p->kv);
     FILE* f = fopen((dir + "/kv.json").c_str(), "wb");
     bool ok = f && json && fwrite(json, 1, strlen(json), f) == strlen(json);
     if (f) fclose(f);
     cJSON_free(json);
     return ok ? 0 : E_FAIL;
+}
+
+/* ---------- 播放（权限 media）：交给系统播放器，放的东西记在这个应用名下 ---------- */
+
+// flags：1 = 直播（电台：没有进度，断了自动重连）；0 = 一首歌 / 一期节目（能跳转，放完来 MEDIA 事件）。
+// src：sd:/ 的文件（还要 sd.read）或 http(s) 地址
+int32_t media_play(wasm_exec_env_t env, const char* src, const char* title, const char* artist, int32_t flags) {
+    Proc* p = Ctx(env);
+    if (!p->pkg->Has("media")) return E_DENIED;
+    std::string s = src ? src : "", url;
+    if (s.rfind("http://", 0) == 0 || s.rfind("https://", 0) == 0) {
+        url = s;
+    } else {
+        int32_t err;
+        url = Resolve(p, src, false, &err);
+        if (url.empty() || url.rfind("/sd/", 0) != 0) return url.empty() ? err : E_FAIL;
+        struct stat st;
+        if (stat(url.c_str(), &st) != 0) return E_NOT_FOUND;
+    }
+    bool live = (flags & 1) && url[0] != '/';
+    NomiRadio::Station item;
+    item.url = url;
+    item.name = title && *title ? title : url.substr(url.rfind('/') + 1);
+    item.podcast = artist ? artist : "";
+    item.local = url[0] == '/';
+    item.episode = item.song = !live;
+    item.owner = p->pkg->id;
+    NomiRadio::GetInstance().PlayEpisode(item);
+    if (item.local) NomiMusic::GetInstance().ShowLocal(url);
+    else if (!live) NomiMusic::GetInstance().ShowRemote(url, "", "");
+    return 0;
+}
+
+// 正在放的这首（网上的）给封面地址（JPEG）和 LRC 歌词；SD 卡上的歌系统自己读
+void media_meta(wasm_exec_env_t env, const char* cover_url, const char* lrc) {
+    Proc* p = Ctx(env);
+    NomiRadio::Station st = NomiRadio::GetInstance().Current();
+    if (!p->pkg->Has("media") || st.owner != p->pkg->id || st.local || !st.song) return;
+    NomiMusic::GetInstance().ShowRemote(st.url, cover_url ? cover_url : "", lrc ? lrc : "");
+}
+
+// 和 nomi_sdk.h 一致：1 暂停、2 接着放、5 停、6 暂停 / 接着放（上一首下一首是应用自己的队列）
+void media_control(wasm_exec_env_t env, int32_t cmd) {
+    if (!Ctx(env)->pkg->Has("media")) return;
+    auto& radio = NomiRadio::GetInstance();
+    if ((cmd == 1 && radio.Wanted()) || (cmd == 2 && !radio.Wanted()) || cmd == 6) radio.Toggle();
+    else if (cmd == 5) radio.Stop();
+}
+
+void media_seek(wasm_exec_env_t env, int32_t second) {
+    if (Ctx(env)->pkg->Has("media")) NomiRadio::GetInstance().SeekTo(second);
+}
+
+int32_t media_state(wasm_exec_env_t env) {
+    (void)env;
+    return MediaState();
+}
+
+int32_t media_position(wasm_exec_env_t env) {
+    (void)env;
+    return NomiRadio::GetInstance().Position();
+}
+
+int32_t media_duration(wasm_exec_env_t env) {
+    (void)env;
+    return NomiRadio::GetInstance().Current().duration;
+}
+
+// 现在放的是不是自己放的：1 是
+int32_t media_mine(wasm_exec_env_t env) { return NomiRadio::GetInstance().Current().owner == Ctx(env)->pkg->id; }
+
+// "标题\n歌手\n时长秒"：标签读不到时标题是文件名
+int32_t media_info(wasm_exec_env_t env, const char* path, char* buf, uint32_t size) {
+    int32_t err;
+    std::string s = Resolve(Ctx(env), path, false, &err);
+    if (s.empty()) return err;
+    NomiMusic::Track t;
+    int duration = 0;
+    NomiMusic::ReadInfo(s, t, duration);
+    int32_t n;
+    CopyOut(t.title + "\n" + t.artist + "\n" + std::to_string(duration), buf, size, &n);
+    return n;
+}
+
+/* ---------- 联网（权限 net） ---------- */
+
+// GET 一个地址（跟着跳转），正文最多 size 字节、多的截掉；成功（HTTP 200）返回字节数
+int32_t net_get(wasm_exec_env_t env, const char* url, char* buf, uint32_t size) {
+    Proc* p = Ctx(env);
+    if (!p->pkg->Has("net")) return E_DENIED;
+    std::string u = url ? url : "";
+    if (u.rfind("http://", 0) != 0 && u.rfind("https://", 0) != 0) return E_FAIL;
+    if (!nomi::NetworkUp()) return E_NO_NET;
+    // 内部 RAM 只够同时一条 TLS：正在放的若是 https，先让出来，取完接着放
+    auto& radio = NomiRadio::GetInstance();
+    bool held = u.rfind("https://", 0) == 0 && radio.HoldForHttps();
+    std::string body;
+    bool ok = nomi::HttpGet(u, body, std::min<size_t>(size, kMaxNet));
+    if (held) radio.ReleaseHttpsHold();
+    if (!ok) return E_FAIL;
+    size_t n = std::min<size_t>(body.size(), size);
+    memcpy(buf, body.data(), n);
+    return n;
+}
+
+/* ---------- 大模型（权限 assistant） ---------- */
+
+// 每轮对话的系统提示里带上这段（应用开在前台时）：比如"正在看《xx》第 3 章"
+void assistant_context(wasm_exec_env_t env, const char* text) {
+    Proc* p = Ctx(env);
+    if (!p->pkg->Has("assistant")) return;
+    std::lock_guard<std::mutex> lock(p->text_mutex);
+    p->context = text ? std::string(text).substr(0, 600) : "";
+}
+
+// 语音指令（NOMI_EV_VOICE）带的参数
+int32_t voice_arg(wasm_exec_env_t env, char* buf, uint32_t size) {
+    Proc* p = Ctx(env);
+    std::lock_guard<std::mutex> lock(p->text_mutex);
+    int32_t n;
+    CopyOut(p->voice_arg, buf, size, &n);
+    return n;
+}
+
+// 回给大模型的话；end = 1 时这句说完就回待机（开始放歌了：不然对话还开着、声音出不来）
+void voice_reply(wasm_exec_env_t env, const char* text, int32_t end) {
+    Proc* p = Ctx(env);
+    std::lock_guard<std::mutex> lock(p->text_mutex);
+    p->voice_reply = text ? std::string(text).substr(0, 600) : "";
+    p->voice_end = end != 0;
 }
 
 /* ---------- 其他 ---------- */
@@ -398,23 +899,24 @@ int64_t time_now(wasm_exec_env_t env) {
     return tv.tv_sec < 1700000000 ? 0 : static_cast<int64_t>(tv.tv_sec) * 1000 + tv.tv_usec / 1000;
 }
 
-void StopTimer(AppRun* run, int32_t id) {
-    auto it = run->timers.find(id);
-    if (it == run->timers.end()) return;
+void StopTimer(Proc* p, int32_t id) {
+    auto it = p->timers.find(id);
+    if (it == p->timers.end()) return;
     esp_timer_stop(it->second->handle);
     esp_timer_delete(it->second->handle);
     delete it->second;
-    run->timers.erase(it);
+    p->timers.erase(it);
 }
 
 void timer_start(wasm_exec_env_t env, int32_t id, int32_t ms, int32_t repeat) {
-    AppRun* run = Ctx(env);
-    StopTimer(run, id);
-    auto* slot = new TimerSlot{run, id, nullptr};
+    Proc* p = Ctx(env);
+    StopTimer(p, id);
+    if (p->timers.size() >= 8) return;
+    auto* slot = new TimerSlot{p, id, nullptr};
     esp_timer_create_args_t args = {};
     args.callback = [](void* arg) {
         auto* s = static_cast<TimerSlot*>(arg);
-        Post(s->run, EV_TIMER, s->id, 0);
+        Post(s->proc, EV_TIMER, s->id, 0);
     };
     args.arg = slot;
     args.name = "app_timer";
@@ -422,7 +924,7 @@ void timer_start(wasm_exec_env_t env, int32_t id, int32_t ms, int32_t repeat) {
         delete slot;
         return;
     }
-    run->timers[id] = slot;
+    p->timers[id] = slot;
     uint64_t us = static_cast<uint64_t>(ms < 50 ? 50 : ms) * 1000;
     if (repeat) esp_timer_start_periodic(slot->handle, us);
     else esp_timer_start_once(slot->handle, us);
@@ -432,10 +934,13 @@ void timer_stop(wasm_exec_env_t env, int32_t id) { StopTimer(Ctx(env), id); }
 
 void nomi_log(wasm_exec_env_t env, const char* text) { ESP_LOGI("app", "[%s] %s", Ctx(env)->pkg->id.c_str(), text); }
 
-// 签名：i 是 32 位整数，I 是 64 位，$ 是应用里的字符串，*~ 是应用里的缓冲区和它的长度（运行时检查越界）
+// 签名：i 32 位整数，I 64 位，$ 应用里的字符串，*~ 应用里的缓冲区和它的长度（运行时检查越界）
 NativeSymbol kNatives[] = {
     {"ui_page", (void*)ui_page, "($)i", nullptr},
     {"ui_page_close", (void*)ui_page_close, "()", nullptr},
+    {"ui_tile", (void*)ui_tile, "()i", nullptr},
+    {"ui_target", (void*)ui_target, "(i)i", nullptr},
+    {"ui_now_playing", (void*)ui_now_playing, "($)i", nullptr},
     {"ui_text", (void*)ui_text, "($i)i", nullptr},
     {"ui_item", (void*)ui_item, "($$$)i", nullptr},
     {"ui_button", (void*)ui_button, "($i)i", nullptr},
@@ -443,37 +948,52 @@ NativeSymbol kNatives[] = {
     {"ui_set_hidden", (void*)ui_set_hidden, "(ii)", nullptr},
     {"ui_remove", (void*)ui_remove, "(i)", nullptr},
     {"ui_toast", (void*)ui_toast, "($)", nullptr},
+    {"ui_open", (void*)ui_open, "()", nullptr},
+    {"ui_player", (void*)ui_player, "()i", nullptr},
     {"fs_list", (void*)fs_list, "($*~)i", nullptr},
     {"fs_size", (void*)fs_size, "($)i", nullptr},
     {"fs_read", (void*)fs_read, "($i*~)i", nullptr},
     {"kv_get", (void*)kv_get, "($*~)i", nullptr},
     {"kv_set", (void*)kv_set, "($$)i", nullptr},
+    {"media_play", (void*)media_play, "($$$i)i", nullptr},
+    {"media_meta", (void*)media_meta, "($$)", nullptr},
+    {"media_control", (void*)media_control, "(i)", nullptr},
+    {"media_seek", (void*)media_seek, "(i)", nullptr},
+    {"media_state", (void*)media_state, "()i", nullptr},
+    {"media_position", (void*)media_position, "()i", nullptr},
+    {"media_duration", (void*)media_duration, "()i", nullptr},
+    {"media_mine", (void*)media_mine, "()i", nullptr},
+    {"media_info", (void*)media_info, "($*~)i", nullptr},
+    {"net_get", (void*)net_get, "($*~)i", nullptr},
+    {"assistant_context", (void*)assistant_context, "($)", nullptr},
+    {"voice_arg", (void*)voice_arg, "(*~)i", nullptr},
+    {"voice_reply", (void*)voice_reply, "($i)", nullptr},
     {"time_now", (void*)time_now, "()I", nullptr},
     {"timer_start", (void*)timer_start, "(iii)", nullptr},
     {"timer_stop", (void*)timer_stop, "(i)", nullptr},
     {"nomi_log", (void*)nomi_log, "($)", nullptr},
 };
 
-/* ---------- 跑一个应用 ---------- */
+/* ---------- 进程 ---------- */
 
-// 出错：弹提示、关掉应用（还开着的话）
-void Fail(AppRun* run, const std::string& msg) {
-    ESP_LOGW(TAG, "%s: %s", run->pkg->id.c_str(), msg.c_str());
+// 出错：弹提示、界面开着的话关掉，进程结束
+void Fail(Proc* p, const std::string& msg) {
+    ESP_LOGW(TAG, "%s: %s", p->pkg->id.c_str(), msg.c_str());
+    p->exiting = true;
     DisplayLockGuard lock(display());
     nomi_ui_notify(msg.c_str(), 3500);
-    if (!run->closed && nomi_app_current() == &run->pkg->app) nomi_app_close();
+    if (p->root && nomi_app_current() == &p->pkg->app) nomi_app_close();
 }
 
-void RunApp(AppRun* run) {
-    const NomiPackage* pkg = run->pkg;
-    if (run->closed) return;  // 还没轮到它就被关了
+void RunProc(Proc* p) {
+    const NomiPackage* pkg = p->pkg;
     NomiSdCard::Use sd;  // 应用和它的数据在 SD 卡上，跑着的时候一直挂着
-    if (!sd) return Fail(run, "SD 卡没插，打不开「" + pkg->name + "」");
+    if (!sd) return Fail(p, "SD 卡没插，打不开「" + pkg->name + "」");
 
     std::string path = pkg->dir + "/app.wasm";
     struct stat st;
     if (stat(path.c_str(), &st) != 0 || st.st_size <= 0 || static_cast<size_t>(st.st_size) > kMaxWasm) {
-        return Fail(run, "「" + pkg->name + "」的程序文件不见了，重新装一下");
+        return Fail(p, "「" + pkg->name + "」的程序文件不见了，重新装一下");
     }
     // 运行时要一直引用这块（解释器会在里面改写），卸载后才能放
     auto* buf = static_cast<uint8_t*>(heap_caps_malloc(st.st_size, MALLOC_CAP_SPIRAM));
@@ -482,7 +1002,7 @@ void RunApp(AppRun* run) {
     if (f) fclose(f);
     if (!read_ok) {
         heap_caps_free(buf);
-        return Fail(run, "读不了「" + pkg->name + "」的程序文件");
+        return Fail(p, "读不了「" + pkg->name + "」的程序文件");
     }
 
     char err[128] = "";
@@ -492,53 +1012,161 @@ void RunApp(AppRun* run) {
     wasm_function_inst_t fmain = inst ? wasm_runtime_lookup_function(inst, "nomi_main") : nullptr;
     wasm_function_inst_t fevent = inst ? wasm_runtime_lookup_function(inst, "nomi_event") : nullptr;
     std::string problem;
+    auto deliver = [&](const Event& ev) {
+        uint32_t argv[3] = {static_cast<uint32_t>(ev.type), static_cast<uint32_t>(ev.id),
+                            static_cast<uint32_t>(ev.value)};
+        if (!wasm_runtime_call_wasm(env, fevent, 3, argv)) problem = wasm_runtime_get_exception(inst);
+    };
     if (!env || !fmain || !fevent) {
         problem = err[0] ? err : "找不到 nomi_main / nomi_event";
     } else {
-        wasm_runtime_set_custom_data(inst, run);
-        LoadKv(run);
+        wasm_runtime_set_custom_data(inst, p);
+        LoadKv(p);
         int64_t t0 = esp_timer_get_time();
-        if (!wasm_runtime_call_wasm(env, fmain, 0, nullptr)) {
-            problem = wasm_runtime_get_exception(inst);
-        } else {
-            ESP_LOGI(TAG, "%s started in %lld ms", pkg->id.c_str(), (esp_timer_get_time() - t0) / 1000);
-        }
+        if (!wasm_runtime_call_wasm(env, fmain, 0, nullptr)) problem = wasm_runtime_get_exception(inst);
+        ESP_LOGI(TAG, "%s started in %lld ms%s", pkg->id.c_str(), (esp_timer_get_time() - t0) / 1000,
+                 p->show_after_main ? "" : " (background)");
+        if (problem.empty() && p->show_after_main && p->shown) deliver({EV_SHOW, 0, 0});
         while (problem.empty()) {
             Event ev;
-            xQueueReceive(run->queue, &ev, portMAX_DELAY);
-            uint32_t argv[3] = {static_cast<uint32_t>(ev.type), static_cast<uint32_t>(ev.id),
-                                static_cast<uint32_t>(ev.value)};
-            if (!wasm_runtime_call_wasm(env, fevent, 3, argv)) problem = wasm_runtime_get_exception(inst);
+            xQueueReceive(p->queue, &ev, portMAX_DELAY);
+            deliver(ev);
+            if (ev.type == EV_VOICE) xSemaphoreGive(p->voice_done);
             if (ev.type == EV_CLOSE) break;
         }
     }
-    if (!problem.empty() && !run->closed) Fail(run, "「" + pkg->name + "」出错了：" + problem);
+    if (!problem.empty() && !p->exiting) Fail(p, "「" + pkg->name + "」出错了：" + problem);
 
     if (env) wasm_runtime_destroy_exec_env(env);
     if (inst) wasm_runtime_deinstantiate(inst);
     if (module) wasm_runtime_unload(module);
     heap_caps_free(buf);
-    ESP_LOGI(TAG, "%s closed, PSRAM free %u", pkg->id.c_str(),
-             (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
 }
 
-void* Worker(void*) {
+void* ProcThread(void* arg) {
+    ProcPtr self = *static_cast<ProcPtr*>(arg);
+    delete static_cast<ProcPtr*>(arg);
+    Proc* p = self.get();
     wasm_runtime_init_thread_env();
+    RunProc(p);
+    wasm_runtime_destroy_thread_env();
+    // 收尾：先停定时器，界面上留下的拿掉（卡片还给系统的收听页），再从列表里去掉
+    p->exiting = true;
+    xSemaphoreGive(p->voice_done);  // 等着语音回话的别干等
+    while (!p->timers.empty()) StopTimer(p, p->timers.begin()->first);
+    {
+        DisplayLockGuard lock(display());
+        if (p->root && nomi_app_current() == &p->pkg->app) nomi_app_close();
+        DetachUi(p);
+        if (s_tile_owner == p) {
+            DropTile(p);
+            nomi_ui_listen_slot_release();
+            s_tile_owner = nullptr;
+        }
+        p->target = nullptr;
+        std::lock_guard<std::mutex> procs(s_procs_mutex);
+        s_procs.erase(std::remove(s_procs.begin(), s_procs.end(), self), s_procs.end());
+    }
+    ESP_LOGI(TAG, "%s exited, PSRAM free %u", p->pkg->id.c_str(), (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+    return nullptr;
+}
+
+// 起一个进程。root 不为空：界面挂着（显示锁里调）。有卡片的应用占首页收听卡片
+ProcPtr Spawn(const NomiPackage* pkg, lv_obj_t* root) {
+    size_t running;
+    {
+        std::lock_guard<std::mutex> lock(s_procs_mutex);
+        running = s_procs.size();
+    }
+    if (running >= kMaxProcs) {
+        DisplayLockGuard ui(display());
+        nomi_ui_notify(("同时开着的应用太多，打不开「" + pkg->name + "」").c_str(), 3500);
+        if (root && nomi_app_current() == &pkg->app) nomi_app_close();
+        return nullptr;
+    }
+    auto p = std::make_shared<Proc>();
+    p->pkg = pkg;
+    p->queue = xQueueCreate(16, sizeof(Event));
+    p->voice_done = xSemaphoreCreateBinary();
+    {
+        DisplayLockGuard lock(display());
+        if (root) {
+            p->root = root;
+            p->shown = true;
+            p->show_after_main = true;
+            p->loading = AddLoading(root);
+        }
+        if (pkg->tile) TakeTile(p.get());
+        std::lock_guard<std::mutex> procs(s_procs_mutex);
+        s_procs.push_back(p);
+    }
+    // 运行时的 esp-idf 平台层假定自己跑在 pthread 里（加载应用时会调 pthread_self），栈放 PSRAM
+    esp_pthread_cfg_t cfg = esp_pthread_get_default_config();
+    cfg.stack_size = kThreadStack;
+    cfg.prio = 3;
+    cfg.thread_name = "nomi_app";
+    cfg.stack_alloc_caps = MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT;
+    esp_pthread_set_cfg(&cfg);
+    pthread_t tid;
+    auto* arg = new ProcPtr(p);
+    bool ok = pthread_create(&tid, nullptr, ProcThread, arg) == 0;
+    cfg = esp_pthread_get_default_config();  // 别影响这个任务以后建的其他 pthread
+    esp_pthread_set_cfg(&cfg);
+    if (ok) {
+        pthread_detach(tid);
+        return p;
+    }
+    delete arg;
+    ESP_LOGE(TAG, "Failed to start %s", pkg->id.c_str());
+    Fail(p.get(), "内存不够，打不开「" + pkg->name + "」");
+    DisplayLockGuard lock(display());
+    DetachUi(p.get());
+    if (s_tile_owner == p.get()) {
+        DropTile(p.get());
+        nomi_ui_listen_slot_release();
+        s_tile_owner = nullptr;
+    }
+    std::lock_guard<std::mutex> procs(s_procs_mutex);
+    s_procs.erase(std::remove(s_procs.begin(), s_procs.end(), p), s_procs.end());
+    return nullptr;
+}
+
+// 还在跑的那个，没在跑就在后台拉起来
+ProcPtr FindOrSpawn(const std::string& id) {
+    if (ProcPtr p = Find(id)) return p;
+    const NomiPackage* pkg = NomiPkg::GetInstance().Find(id);
+    return pkg ? Spawn(pkg, nullptr) : nullptr;
+}
+
+// 每 5 秒：在后台、没理由留着（没卡片、放的东西不归它或主人停了）的进程，30 秒后结束
+void Housekeeping(void*) {
+    int64_t now = esp_timer_get_time();
+    std::lock_guard<std::mutex> lock(s_procs_mutex);
+    for (auto& p : s_procs) {
+        if (p->exiting || KeepResident(p.get())) {
+            p->idle_since = 0;
+        } else if (p->idle_since == 0) {
+            p->idle_since = now;
+        } else if (now - p->idle_since > kIdleExitUs) {
+            ESP_LOGI(TAG, "%s idle in background, exiting", p->pkg->id.c_str());
+            Exit(p.get());
+        }
+    }
+}
+
+// 系统任务：开机扫描装好的包之类的活
+struct Job {
+    void (*fn)(void*);
+    void* arg;
+};
+
+void* JobThread(void*) {
     for (;;) {
         Job job;
         xQueueReceive(s_jobs, &job, portMAX_DELAY);
-        if (!job.run) {
-            job.fn(job.arg);
-            continue;
-        }
-        AppRun* run = job.run;
-        RunApp(run);
-        // 收尾：先停定时器（它们会往队列里塞事件），再放掉其他东西
-        while (!run->timers.empty()) StopTimer(run, run->timers.begin()->first);
-        cJSON_Delete(run->kv);
-        vQueueDelete(run->queue);
-        delete run;
+        job.fn(job.arg);
     }
+    return nullptr;
 }
 
 void* PsramMalloc(unsigned int size) { return heap_caps_malloc(size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT); }
@@ -566,62 +1194,154 @@ void Init(Display* display) {
         ESP_LOGE(TAG, "wasm_runtime_full_init failed");
         return;
     }
+    // 应用放的歌 / 节目放完了（主循环里）：告诉那个应用，接着放什么由它定
+    NomiRadio::GetInstance().on_finished = [](const NomiRadio::Station& item) {
+        if (item.owner.empty()) return;
+        if (ProcPtr p = FindOrSpawn(item.owner)) Post(p.get(), EV_MEDIA, 0, MEDIA_FINISHED);
+    };
+
+    // 系统任务也是 pthread：扫描时会登记卡片应用、起进程
     s_jobs = xQueueCreate(4, sizeof(Job));
-    // 运行时的 esp-idf 平台层假定自己跑在 pthread 里（加载应用时会调 pthread_self，普通 FreeRTOS 任务里
-    // 会断言失败、整机重启），所以常驻任务用 pthread 建，栈照样放 PSRAM
     esp_pthread_cfg_t cfg = esp_pthread_get_default_config();
-    cfg.stack_size = kTaskStack;
+    cfg.stack_size = 8192;
     cfg.prio = 3;
-    cfg.thread_name = "nomi_app";
+    cfg.thread_name = "nomi_jobs";
     cfg.stack_alloc_caps = MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT;
     esp_pthread_set_cfg(&cfg);
     pthread_t tid;
-    if (pthread_create(&tid, nullptr, Worker, nullptr) == 0) pthread_detach(tid);
-    else ESP_LOGE(TAG, "Failed to create app thread");
-    cfg = esp_pthread_get_default_config();  // 别影响这个任务以后建的其他 pthread
+    if (pthread_create(&tid, nullptr, JobThread, nullptr) == 0) pthread_detach(tid);
+    else ESP_LOGE(TAG, "Failed to create job thread");
+    cfg = esp_pthread_get_default_config();
     esp_pthread_set_cfg(&cfg);
+
+    esp_timer_create_args_t targs = {};
+    targs.callback = Housekeeping;
+    targs.name = "app_house";
+    esp_timer_create(&targs, &s_housekeeping);
+    esp_timer_start_periodic(s_housekeeping, 5 * 1000000ULL);
 }
 
 Display* GetDisplay() { return s_display; }
 
 void RunInWorker(void (*fn)(void*), void* arg) {
     if (!s_jobs) return;
-    Job job = {nullptr, fn, arg};
+    Job job = {fn, arg};
     xQueueSend(s_jobs, &job, portMAX_DELAY);
 }
 
 void Open(const nomi_app_t* app, lv_obj_t* root) {
-    auto* run = new AppRun();
-    run->pkg = static_cast<const NomiPackage*>(app->user);
-    run->root = root;
-    run->queue = xQueueCreate(16, sizeof(Event));
-    run->loading = lv_label_create(root);
-    lv_obj_set_style_text_color(run->loading, lv_color_hex(C_MUTED), 0);
-    lv_label_set_text(run->loading, "打开中…");
-    lv_obj_center(run->loading);
-    s_current = run;
-    Job job = {run, nullptr, nullptr};
-    if (!s_jobs || xQueueSend(s_jobs, &job, 0) != pdTRUE) {
-        run->closed = true;
-        lv_label_set_text(run->loading, "应用运行时没起来，打不开");
+    auto* pkg = static_cast<const NomiPackage*>(app->user);
+    if (ProcPtr p = Find(pkg->id)) {  // 在后台跑着：把界面挂上去，它收到 SHOW 再建页面
+        DetachUi(p.get());
+        p->root = root;
+        p->shown = true;
+        p->loading = AddLoading(root);
+        Post(p.get(), EV_SHOW, 0, 0);
+        return;
     }
+    Spawn(pkg, root);
 }
 
 void Close(const nomi_app_t* app) {
-    AppRun* run = s_current;
-    if (!run || &run->pkg->app != app) return;
-    run->closed = true;  // 之后它改界面的调用都不做了，root 由应用层删
-    run->root = nullptr;
-    s_current = nullptr;
-    Event ev = {EV_CLOSE, 0, 0};
-    xQueueSend(run->queue, &ev, 0);
+    ProcPtr live;
+    {
+        std::lock_guard<std::mutex> lock(s_procs_mutex);
+        for (auto& p : s_procs) {
+            if (p->pkg->id != app->id || !p->root) continue;
+            DetachUi(p.get());  // 在退的也要拿下：root 马上要删了
+            if (!p->exiting) live = p;
+        }
+    }
+    if (!live) return;
+    if (KeepResident(live.get())) Post(live.get(), EV_HIDE, 0, 0);  // 有卡片、或在放它的歌：留在后台
+    else Exit(live.get());
 }
 
 bool Back(const nomi_app_t* app) {
-    AppRun* run = s_current;
-    if (!run || &run->pkg->app != app || !PopPage(run)) return false;
-    Post(run, EV_BACK, 0, static_cast<int32_t>(run->pages.size()));
+    ProcPtr p = Find(app->id);
+    if (!p || !p->root || !PopPage(p.get())) return false;
+    Post(p.get(), EV_BACK, 0, static_cast<int32_t>(p->pages.size()));
     return true;
+}
+
+void TileToggle() {
+    auto& radio = NomiRadio::GetInstance();
+    Proc* owner = s_tile_owner;
+    if (radio.Wanted() || !owner || radio.Current().owner == owner->pkg->id) radio.Toggle();
+    else Post(owner, EV_MEDIA, 0, MEDIA_PLAY);  // 停着的不是它的（或什么都没放过）：让卡片的应用决定放什么
+}
+
+void StartBackground(const NomiPackage* pkg) {
+    if (!Find(pkg->id)) Spawn(pkg, nullptr);
+}
+
+void Kill(const std::string& id) {
+    DisplayLockGuard lock(display());
+    std::vector<ProcPtr> victims;
+    {
+        std::lock_guard<std::mutex> procs(s_procs_mutex);
+        for (auto& p : s_procs) {
+            if (p->pkg->id == id) victims.push_back(p);
+        }
+    }
+    for (auto& p : victims) {
+        if (p->root && nomi_app_current() == &p->pkg->app) nomi_app_close();
+        DetachUi(p.get());
+        if (s_tile_owner == p.get()) {
+            DropTile(p.get());
+            nomi_ui_listen_slot_release();
+            s_tile_owner = nullptr;
+        }
+        Exit(p.get());
+    }
+}
+
+bool MediaCommand(int code) {
+    std::string owner = NomiRadio::GetInstance().Current().owner;
+    if (owner.empty()) return false;
+    ProcPtr p = FindOrSpawn(owner);  // 应用不在跑了（在后台待太久被结束）：拉起来处理
+    if (!p) return false;
+    Post(p.get(), EV_MEDIA, 0, code);
+    return true;
+}
+
+std::string VoiceCommand(const std::string& app, const std::string& command, const std::string& arg,
+                         bool* end_conversation) {
+    const NomiPackage* pkg = NomiPkg::GetInstance().Find(app);
+    if (!pkg) return "!没装这个应用：" + app;
+    int index = -1;
+    for (size_t i = 0; i < pkg->voice.size(); i++) {
+        if (pkg->voice[i].name == command) index = i;
+    }
+    if (index < 0) return "!「" + pkg->name + "」没有这个指令：" + command;
+    ProcPtr p = FindOrSpawn(pkg->id);
+    if (!p) return "!「" + pkg->name + "」起不来";
+    {
+        std::lock_guard<std::mutex> lock(p->text_mutex);
+        p->voice_arg = arg;
+        p->voice_reply.clear();
+        p->voice_end = false;
+    }
+    xSemaphoreTake(p->voice_done, 0);  // 清掉上次没人收的
+    Post(p.get(), EV_VOICE, index + 1, 0);
+    if (xSemaphoreTake(p->voice_done, pdMS_TO_TICKS(kVoiceWaitMs)) != pdTRUE) {
+        return "!「" + pkg->name + "」没回应";
+    }
+    std::lock_guard<std::mutex> lock(p->text_mutex);
+    if (p->exiting && p->voice_reply.empty()) return "!「" + pkg->name + "」出错退出了";
+    if (end_conversation) *end_conversation = p->voice_end;
+    return p->voice_reply.empty() ? "已交给「" + pkg->name + "」" : p->voice_reply;
+}
+
+std::string PromptContext() {
+    std::lock_guard<std::mutex> lock(s_procs_mutex);
+    for (auto& p : s_procs) {
+        if (!p->shown || p->exiting) continue;
+        std::lock_guard<std::mutex> text_lock(p->text_mutex);
+        std::string out = "主人正开着应用「" + p->pkg->name + "」";
+        return p->context.empty() ? out + "。" : out + "：" + p->context;
+    }
+    return "";
 }
 
 }  // namespace NomiWasm

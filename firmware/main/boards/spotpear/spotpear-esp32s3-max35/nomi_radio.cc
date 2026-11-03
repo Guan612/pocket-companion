@@ -4,6 +4,7 @@
 #include "board.h"
 #include "mcp_server.h"
 #include "nomi_mp4.h"
+#include "nomi_sdcard.h"
 #include "nomi_util.h"
 #include "settings.h"
 #if CONFIG_DIRECT_API
@@ -36,8 +37,9 @@ constexpr size_t kMaxStations = 20;
 constexpr size_t kBufferBytes = 64 * 1024;    // 网络数据缓冲：64kbps 约 8 秒
 constexpr size_t kPrebufferBytes = 12 * 1024;  // 攒够这么多再开始放：64kbps 约 1.5 秒
 constexpr size_t kReadChunk = 2048;
+constexpr int kMaxBadChunks = 64;  // 连着这么多块（128KB）一帧都解不出来就放弃
 constexpr int64_t kResumeDelayUs = 800 * 1000;  // 回到待机多久后接着放（连续对话一轮轮之间别忽停忽放）
-enum { kCodecMp3 = 1, kCodecAac = 2 };
+enum { kCodecMp3 = 1, kCodecAac = 2, kCodecFlac = 3, kCodecWav = 4 };
 
 // 默认台单：千听（蜻蜓）的直播 MP3 走 http 不占 TLS 内存；AsiaFM 是 AAC，流里带歌名
 const NomiRadio::Station kDefaults[] = {
@@ -260,10 +262,12 @@ void NomiRadio::Start() {
     stream_ = xStreamBufferCreateStatic(kBufferBytes, 1, storage, &sb);
     // 两个常驻任务，栈放 PSRAM（所以它们不能读写 flash / NVS）：平时阻塞在信号量上，不占内部 RAM。
     // 收流任务要做 TLS 握手（播客节目多是 https），栈给足
+    // 优先级都比界面任务（2）低：放 FLAC 时 CPU 本来就满，翻页时让界面先画；解码跟得上播放就行，
+    // 播放队列和收流缓冲够垫几百毫秒
     xTaskCreatePinnedToCoreWithCaps([](void* arg) { static_cast<NomiRadio*>(arg)->ReaderLoop(); }, "radio_rx",
-                                    12288, this, 2, nullptr, tskNO_AFFINITY, MALLOC_CAP_SPIRAM);
+                                    12288, this, 1, nullptr, tskNO_AFFINITY, MALLOC_CAP_SPIRAM);
     xTaskCreatePinnedToCoreWithCaps([](void* arg) { static_cast<NomiRadio*>(arg)->DecoderLoop(); }, "radio_dec",
-                                    12288, this, 3, nullptr, tskNO_AFFINITY, MALLOC_CAP_SPIRAM);
+                                    12288, this, 1, nullptr, tskNO_AFFINITY, MALLOC_CAP_SPIRAM);
     const esp_timer_create_args_t args = {
         .callback = [](void* arg) { static_cast<NomiRadio*>(arg)->Monitor(); },
         .arg = this,
@@ -286,22 +290,40 @@ void NomiRadio::Monitor() {
     else if (https_hold_since_us_ == 0) https_hold_since_us_ = now;
     bool https_held = https_hold_ > 0 && now - https_hold_since_us_ < 30 * 1000000LL;
     bool held = alarm_hold_ || https_held || !idle || now - idle_since_us_ < kResumeDelayUs;
-    bool should = wanted_ && !held && now >= retry_at_us_ && nomi::NetworkUp();
+    Station cur = Current();
+    bool should = wanted_ && !held && now >= retry_at_us_ && (cur.local || nomi::NetworkUp());
 
     if (running_) {
         if (busy_ == 0) {
             running_ = false;  // 两个任务都回到等待了：这次播放结束
-            if (reached_end_ && wanted_ && IsEpisode()) {  // 节目从头到尾放完了
+            paused_ = false;
+            if (decode_failed_.exchange(false)) {
+                retry_at_us_ = now + 5 * 1000000LL;  // 网上的流过一会儿重试
+                if (cur.local) {  // 本地文件重试也一样：停下，主人换一首
+                    wanted_ = false;
+                    state_ = kError;
+                }
+            }
+            if (reached_end_ && wanted_ && IsEpisode()) {  // 节目 / 歌从头到尾放完了
                 reached_end_ = false;
                 wanted_ = false;
                 state_ = kOff;
                 ReportProgress(true);
                 position_ = 0;
+                if (on_finished) {
+                    Application::GetInstance().Schedule([this, cur]() { on_finished(cur); });
+                }
             }
+        } else if (cur.local && wanted_ && held) {
+            paused_ = true;  // 本地文件：对话、闹钟时停住就行，不用断开（不占网络、TLS 的内存），之后原地接着放
         } else if (!should && !stopping_) {
+            paused_ = false;
             stopping_ = true;
+        } else if (should) {
+            paused_ = false;
         }
     } else if (should && busy_ == 0) {
+        paused_ = false;
         BeginSession();
     }
     if (!wanted_) state_ = kOff;
@@ -309,7 +331,7 @@ void NomiRadio::Monitor() {
 
     // 待机时小智把 Wi-Fi 设成最省电（MAX_MODEM，约 1 秒醒一次收包），直播流收不过来，
     // 缓冲一会儿空一会儿满，屏幕上就在"连接中"和"在放"之间跳。放的时候关掉省电，停了还原
-    if (running_ || (wanted_ && !held)) {  // 断线重连的间隙也别切回省电
+    if (!cur.local && (running_ || (wanted_ && !held))) {  // 断线重连的间隙也别切回省电；本地文件不用网
         wifi_ps_type_t ps;
         if (esp_wifi_get_ps(&ps) == ESP_OK && ps != WIFI_PS_NONE) {
             esp_wifi_set_ps(WIFI_PS_NONE);
@@ -465,6 +487,13 @@ void NomiRadio::ReportProgress(bool finished) {
     Application::GetInstance().Schedule([this, st, pos, finished]() { on_progress(st, pos, finished); });
 }
 
+void NomiRadio::UpdateMeta(const std::string& url, const std::string& name, const std::string& artist) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (current_.url != url) return;
+    if (!name.empty()) current_.name = name;
+    if (!artist.empty()) current_.podcast = artist;
+}
+
 void NomiRadio::SetDuration(const std::string& url, int seconds) {
     std::lock_guard<std::mutex> lock(mutex_);
     if (seconds > 0 && current_.url == url && current_.duration <= 0) current_.duration = seconds;
@@ -477,9 +506,10 @@ void NomiRadio::ReaderLoop() {
         xSemaphoreTake(reader_go_, portMAX_DELAY);
         Station st = Current();
         bool mp4 = st.format == Station::kMp4 || (st.format == Station::kAuto && IsMp4(st.url, ""));
-        bool ok = !st.episode ? ReadStream(PreferHttp(st.url), 0, 0, true)
-                  : mp4       ? ReadMp4(st.url, st.start)
-                              : ReadEpisode(st.url, st.start);
+        bool ok = st.local    ? ReadLocal(st.url, st.start)
+                  : !st.episode ? ReadStream(PreferHttp(st.url), 0, 0, true)
+                  : mp4         ? ReadMp4(st.url, st.start)
+                                : ReadEpisode(st.url, st.start);
         if (!ok && !stopping_) {
             // 断线 / 连不上：1、3、6、12、24、30 秒后再试（服务器偶尔停一下，第一次马上重连）；
             // 连续三次失败显示"连不上"
@@ -781,6 +811,202 @@ bool NomiRadio::ReadMp4(const std::string& source, int start) {
     return ok || stopping_;
 }
 
+/* ---------- SD 卡上的文件 ---------- */
+
+namespace {
+
+// FLAC 帧头的 CRC-8（多项式 0x07）
+uint8_t FlacCrc8(const uint8_t* p, size_t n) {
+    uint8_t crc = 0;
+    for (size_t i = 0; i < n; i++) {
+        crc ^= p[i];
+        for (int k = 0; k < 8; k++) crc = (crc & 0x80) ? static_cast<uint8_t>((crc << 1) ^ 0x07) : crc << 1;
+    }
+    return crc;
+}
+
+// buf[i] 起是不是一个 FLAC 帧头：同步码、保留位、长度可变的几段都对上，再核一下 CRC-8
+bool IsFlacFrame(const uint8_t* b, size_t avail) {
+    if (avail < 16 || b[0] != 0xFF || (b[1] & 0xFE) != 0xF8) return false;
+    int bs = b[2] >> 4, sr = b[2] & 0x0F;
+    if (bs == 0 || sr == 15 || (b[3] & 0x01) || (b[3] >> 4) > 10 || ((b[3] >> 1) & 7) == 3) return false;
+    // 帧号是 UTF-8 式的变长编码：开头有几个 1 就占几个字节（没有 1 是 1 个字节，10 开头不合法）
+    int ones = 0;
+    for (uint8_t c = b[4]; ones < 8 && (c & 0x80); c <<= 1) ones++;
+    if (ones == 1 || ones > 7) return false;
+    size_t p = 4 + (ones == 0 ? 1 : ones);
+    if (bs == 6) p += 1;
+    if (bs == 7) p += 2;
+    if (sr == 12) p += 1;
+    if (sr == 13 || sr == 14) p += 2;
+    return p < avail && FlacCrc8(b, p) == b[p];
+}
+
+// MPEG-1 / 2 Layer III 的码率（kbps），帧头第 3 字节高 4 位
+int Mp3Bitrate(const uint8_t* h) {
+    static const int v1[] = {0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 0};
+    static const int v2[] = {0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160, 0};
+    if (h[0] != 0xFF || (h[1] & 0xE0) != 0xE0) return 0;
+    int idx = h[2] >> 4;
+    return ((h[1] >> 3) & 3) == 3 ? v1[idx] : v2[idx];
+}
+
+}  // namespace
+
+// SD 卡上的文件：看文件头认格式，从 start 秒开始读，送进缓冲（缓冲满了会在这等，正好按播放速度往下读）。
+// 跳到中间：WAV 按字节率精确算；MP3 / AAC 按平均码率估，解码器自己找帧；FLAC 先把文件头（fLaC 和元数据块）
+// 送给解码器，再从估的位置往后找到一个帧头接着送
+bool NomiRadio::ReadLocal(const std::string& path, int start) {
+    NomiSdCard::Use sd;
+    if (!sd) {
+        ESP_LOGW(TAG, "No SD card: %s", path.c_str());
+        return false;
+    }
+    FILE* f = fopen(path.c_str(), "rb");
+    if (!f) {
+        ESP_LOGW(TAG, "Cannot open %s", path.c_str());
+        return false;
+    }
+    fseek(f, 0, SEEK_END);
+    int64_t size = ftell(f);
+    uint8_t head[64] = {};
+    fseek(f, 0, SEEK_SET);
+    size_t hn = fread(head, 1, sizeof(head), f);
+    int64_t audio = 0;  // 第一帧音频在文件里的位置
+    int duration = 0, block = 1, codec = kCodecMp3;
+    // FLAC、WAV 的解码器要先看到文件头才认得出格式。不把原样的头喂给它：FLAC 的头里常有内嵌封面，
+    // 大的几百 KB，喂过去又慢又没用。这里拼一个最小的头（FLAC 只留 STREAMINFO，WAV 只留 fmt），
+    // 从头放、跳到中间放都先送它，再接音频帧
+    std::string min_head;
+    if (hn >= 4 && !memcmp(head, "fLaC", 4)) {
+        codec = kCodecFlac;
+        // 元数据块：4 字节头（最后一块的标志、类型、长度）；STREAMINFO 里有采样率和总采样数
+        int64_t pos = 4;
+        for (bool last = false; !last && pos + 4 <= size;) {
+            uint8_t bh[4], si[34];
+            fseek(f, pos, SEEK_SET);
+            if (fread(bh, 1, 4, f) != 4) break;
+            last = bh[0] & 0x80;
+            uint32_t len = (bh[1] << 16) | (bh[2] << 8) | bh[3];
+            if ((bh[0] & 0x7F) == 0 && len >= 34 && fread(si, 1, 34, f) == 34) {
+                uint32_t rate = (si[10] << 12) | (si[11] << 4) | (si[12] >> 4);
+                uint64_t total = (static_cast<uint64_t>(si[13] & 0x0F) << 32) | (static_cast<uint32_t>(si[14]) << 24) |
+                                 (si[15] << 16) | (si[16] << 8) | si[17];
+                if (rate) duration = total / rate;
+                static const uint8_t kStreamInfoLast[4] = {0x80, 0x00, 0x00, 34};  // 标成最后一块
+                min_head.assign("fLaC", 4);
+                min_head.append(reinterpret_cast<const char*>(kStreamInfoLast), 4);
+                min_head.append(reinterpret_cast<const char*>(si), 34);
+            }
+            pos += 4 + len;
+        }
+        audio = pos;
+    } else if (hn >= 12 && !memcmp(head, "RIFF", 4) && !memcmp(head + 8, "WAVE", 4)) {
+        codec = kCodecWav;
+        uint32_t byte_rate = 0;
+        std::string fmt_chunk;
+        for (int64_t pos = 12; pos + 8 <= size;) {
+            uint8_t ch[8], fmt[40];
+            fseek(f, pos, SEEK_SET);
+            if (fread(ch, 1, 8, f) != 8) break;
+            uint32_t len = ch[4] | (ch[5] << 8) | (ch[6] << 16) | (static_cast<uint32_t>(ch[7]) << 24);
+            if (!memcmp(ch, "fmt ", 4) && len >= 16 && len <= sizeof(fmt) && fread(fmt, 1, len, f) == len) {
+                byte_rate = fmt[8] | (fmt[9] << 8) | (fmt[10] << 16) | (static_cast<uint32_t>(fmt[11]) << 24);
+                block = std::max(1, fmt[12] | (fmt[13] << 8));
+                fmt_chunk.assign(reinterpret_cast<const char*>(ch), 8);
+                fmt_chunk.append(reinterpret_cast<const char*>(fmt), len);
+            } else if (!memcmp(ch, "data", 4)) {
+                if (!fmt_chunk.empty()) {
+                    uint32_t data_len = static_cast<uint32_t>(std::min<int64_t>(len, size - (pos + 8)));
+                    uint32_t riff_len = 4 + fmt_chunk.size() + 8 + data_len;
+                    auto le32 = [](uint32_t v) {
+                        char b[4] = {static_cast<char>(v), static_cast<char>(v >> 8), static_cast<char>(v >> 16),
+                                     static_cast<char>(v >> 24)};
+                        return std::string(b, 4);
+                    };
+                    min_head = "RIFF" + le32(riff_len) + "WAVE" + fmt_chunk + "data" + le32(data_len);
+                }
+                audio = pos + 8;
+                if (byte_rate) duration = std::min<int64_t>(len, size - audio) / byte_rate;
+                break;
+            }
+            pos += 8 + len + (len & 1);
+        }
+        if (audio == 0) {
+            fclose(f);
+            ESP_LOGW(TAG, "WAV without data chunk: %s", path.c_str());
+            return false;
+        }
+    } else {
+        if (hn >= 8 && !memcmp(head + 4, "ftyp", 4)) {  // m4a：要按目录（moov）找帧，本地的还没做
+            fclose(f);
+            ESP_LOGW(TAG, "Local m4a not supported yet: %s", path.c_str());
+            return false;
+        }
+        if (hn >= 10 && !memcmp(head, "ID3", 3)) {  // ID3v2 标签：长度是 4 个 7 位
+            audio = 10 + ((head[6] & 0x7F) << 21 | (head[7] & 0x7F) << 14 | (head[8] & 0x7F) << 7 | (head[9] & 0x7F));
+            if (head[5] & 0x10) audio += 10;
+        }
+        uint8_t fh[4] = {};
+        fseek(f, audio, SEEK_SET);
+        fread(fh, 1, 4, f);
+        if (fh[0] == 0xFF && (fh[1] & 0xF6) == 0xF0) codec = kCodecAac;  // ADTS
+        int kbps = codec == kCodecMp3 ? Mp3Bitrate(fh) : 0;
+        duration = (size - audio) * 8 / ((kbps > 0 ? kbps : 128) * 1000);
+    }
+    SetDuration(path, duration);
+    codec_ = codec;
+
+    if ((codec == kCodecFlac || codec == kCodecWav) && min_head.empty()) {
+        fclose(f);
+        ESP_LOGW(TAG, "Bad %s header: %s", codec == kCodecFlac ? "FLAC" : "WAV", path.c_str());
+        return false;
+    }
+    int64_t offset = audio;
+    if (start > 0 && duration > 0) {
+        offset = audio + (size - audio) * std::min(start, duration) / duration;
+        if (codec == kCodecWav) offset = audio + (offset - audio) / block * block;
+    }
+    if (!min_head.empty()) WriteAudio(min_head.data(), min_head.size());
+    auto* buf = static_cast<uint8_t*>(heap_caps_malloc(4096, MALLOC_CAP_SPIRAM));
+    if (!buf) {
+        fclose(f);
+        return false;
+    }
+    if (offset > audio && codec == kCodecFlac) {  // 往后找一个真的帧头（最多看 256KB）
+        int64_t found = -1;
+        for (int64_t pos = offset; found < 0 && pos < offset + 256 * 1024 && pos < size; pos += 4096 - 32) {
+            fseek(f, pos, SEEK_SET);
+            size_t n = fread(buf, 1, 4096, f);
+            for (size_t i = 0; i + 16 <= n; i++) {
+                if (IsFlacFrame(buf + i, n - i)) {
+                    found = pos + i;
+                    break;
+                }
+            }
+            if (n < 4096) break;
+        }
+        offset = found >= 0 ? found : audio;
+        if (found < 0) position_ = 0;  // 没找到就从头放
+    }
+    ESP_LOGI(TAG, "Local %s: codec %d, %d s, from byte %lld", path.c_str(), codec, duration,
+             static_cast<long long>(offset));
+    fseek(f, offset, SEEK_SET);
+    bool ok = true;
+    while (!stopping_) {
+        size_t n = fread(buf, 1, 4096, f);
+        if (n == 0) {
+            if (ferror(f)) ok = false;  // 卡被拔了之类
+            else reached_end_ = true;
+            break;
+        }
+        if (!WriteAudio(buf, n)) break;
+    }
+    heap_caps_free(buf);
+    fclose(f);
+    return ok;
+}
+
 /* ---------- 解码、送播放 ---------- */
 
 void NomiRadio::DecoderLoop() {
@@ -796,11 +1022,12 @@ void NomiRadio::DecoderLoop() {
         auto& audio = Application::GetInstance().GetAudioService();
         esp_audio_simple_dec_handle_t dec = nullptr;
         std::vector<int16_t> pending;
-        int rate = 0, channels = 1;
+        int rate = 0, channels = 1, bytes_per_sample = 2;
         bool buffering = true;
         bool episode = IsEpisode();
         int base = position_, reported = position_;
         uint64_t played = 0;  // 这次播放送出去的采样数
+        int bad_chunks = 0;   // 连着多少块一帧都没解出来
         while (!stopping_) {
             // 先攒一点再放；放着放着缓冲空了（网络卡了）也重新攒
             if (buffering) {
@@ -817,7 +1044,10 @@ void NomiRadio::DecoderLoop() {
                     continue;
                 }
                 esp_audio_simple_dec_cfg_t cfg = {};
-                cfg.dec_type = codec_ == kCodecAac ? ESP_AUDIO_SIMPLE_DEC_TYPE_AAC : ESP_AUDIO_SIMPLE_DEC_TYPE_MP3;
+                cfg.dec_type = codec_ == kCodecAac    ? ESP_AUDIO_SIMPLE_DEC_TYPE_AAC
+                               : codec_ == kCodecFlac ? ESP_AUDIO_SIMPLE_DEC_TYPE_FLAC
+                               : codec_ == kCodecWav  ? ESP_AUDIO_SIMPLE_DEC_TYPE_WAV
+                                                      : ESP_AUDIO_SIMPLE_DEC_TYPE_MP3;
                 if (esp_audio_simple_dec_open(&cfg, &dec) != ESP_AUDIO_ERR_OK || dec == nullptr) {
                     ESP_LOGE(TAG, "Failed to open decoder");
                     dec = nullptr;
@@ -837,6 +1067,7 @@ void NomiRadio::DecoderLoop() {
             esp_audio_simple_dec_raw_t raw = {};
             raw.buffer = in;
             raw.len = n;
+            bool decoded = false, failed = false;
             while (raw.len > 0 && !stopping_) {
                 esp_audio_simple_dec_out_t frame = {};
                 frame.buffer = out.data();
@@ -849,25 +1080,38 @@ void NomiRadio::DecoderLoop() {
                 if (ret != ESP_AUDIO_ERR_OK) {
                     // 流中间坏一帧常见（刚连上从半帧开始），跳过这块接着解
                     ESP_LOGD(TAG, "Decode error %d", ret);
+                    failed = true;
                     break;
                 }
                 if (frame.decoded_size > 0) {
+                    decoded = true;
                     if (rate == 0) {
                         esp_audio_simple_dec_info_t info = {};
                         esp_audio_simple_dec_get_info(dec, &info);
                         rate = info.sample_rate;
                         channels = info.channel ? info.channel : 1;
-                        ESP_LOGI(TAG, "Playing: %d Hz, %d ch", rate, channels);
+                        bytes_per_sample = info.bits_per_sample >= 8 ? info.bits_per_sample / 8 : 2;
+                        ESP_LOGI(TAG, "Playing: %d Hz, %d ch, %d bit (first frame %u bytes)", rate, channels,
+                                 bytes_per_sample * 8, (unsigned)frame.decoded_size);
                     }
-                    const auto* s = reinterpret_cast<const int16_t*>(frame.buffer);
-                    size_t samples = frame.decoded_size / sizeof(int16_t) / channels;
-                    for (size_t i = 0; i < samples; i++) {  // 混成单声道（喇叭只有一个）
-                        int sum = 0;
-                        for (int c = 0; c < channels; c++) sum += s[i * channels + c];
+                    // 混成单声道（喇叭只有一个）；无损的 24 / 32 位、WAV 的 8 位都换成 16 位
+                    const uint8_t* b = frame.buffer;
+                    size_t samples = frame.decoded_size / bytes_per_sample / channels;
+                    for (size_t i = 0; i < samples; i++) {
+                        int32_t sum = 0;
+                        for (int c = 0; c < channels; c++, b += bytes_per_sample) {
+                            switch (bytes_per_sample) {
+                            case 1: sum += (static_cast<int32_t>(b[0]) - 128) << 8; break;
+                            case 3: sum += static_cast<int32_t>((b[0] << 8) | (b[1] << 16) | (b[2] << 24)) >> 16; break;
+                            case 4: sum += static_cast<int32_t>(b[0] | (b[1] << 8) | (b[2] << 16) | (b[3] << 24)) >> 16; break;
+                            default: sum += static_cast<int16_t>(b[0] | (b[1] << 8)); break;
+                            }
+                        }
                         pending.push_back(static_cast<int16_t>(sum / channels));
                     }
                     // 攒够 60ms 送一块；播放队列满了就在这里等，正好按播放速度往下解
                     size_t chunk = static_cast<size_t>(rate) * 60 / 1000;
+                    while (paused_ && !stopping_) vTaskDelay(pdMS_TO_TICKS(50));  // 本地文件对话时停在这
                     while (!stopping_ && rate > 0 && pending.size() >= chunk) {
                         std::vector<int16_t> part(pending.begin(), pending.begin() + chunk);
                         pending.erase(pending.begin(), pending.begin() + chunk);
@@ -890,6 +1134,14 @@ void NomiRadio::DecoderLoop() {
                 raw.buffer += raw.consumed;
                 raw.len -= raw.consumed;
                 if (raw.consumed == 0 && frame.decoded_size == 0) break;  // 不够一帧，等下一块
+            }
+            // 一直解不出来（格式认错、文件坏了）：别一块块报错下去（解码库每次都打一行日志，串口刷满会把
+            // 界面拖卡），这次就不放了
+            if (decoded) bad_chunks = 0;
+            else if (failed && ++bad_chunks >= kMaxBadChunks) {
+                ESP_LOGW(TAG, "Cannot decode %s, giving up", Current().name.c_str());
+                decode_failed_ = true;
+                stopping_ = true;
             }
         }
         if (dec != nullptr) esp_audio_simple_dec_close(dec);

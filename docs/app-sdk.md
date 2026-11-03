@@ -1,8 +1,8 @@
-# 应用开发规范（草案 v0.1）
+# 应用开发规范（草案 v0.2）
 
 Pocket Companion 的应用像手机 APK 一样能装、能删、能更新，不用重刷固件。这份文档说明应用包长什么样、应用怎么写、能调哪些系统接口、装在哪、怎么管理。
 
-> 状态：v0.1 部分实现（2026-11-03 上机跑通计数器示例）。已实现的接口见第 13 节，其余是计划；标「待验证」的地方上机测过才定。
+> 状态：v0.2 部分实现（2026-11-03 上机跑通计数器示例和音乐应用）。已实现的接口见第 13 节，其余是计划；标「待验证」的地方上机测过才定。
 
 ## 1. 分工
 
@@ -13,6 +13,11 @@ Pocket Companion 的应用像手机 APK 一样能装、能删、能更新，不�
 | 自己装的应用 | 机器内部的应用分区，或 SD 卡（装的时候选） | 随便装、随便删 |
 
 **应用只管界面和逻辑**：显示什么、点了怎么办、语音指令怎么响应。**重活都调系统接口**：读 SD 卡、解码图片和音乐、播放、联网、大模型。这些在固件里用原生代码跑，应用这边只是一行调用。
+
+**系统给能力，业务归应用**。拿音乐举例：
+- 系统的：解码、放"这一首"、封面和歌词、进度条控件。
+- 音乐应用的：放哪首、播放队列、列表循环 / 随机、电台台单，以及本地 / 在线 / 播客几个页面。
+- 首页的收听卡片也由音乐应用来画（像 Wear OS 的 tile）。
 
 应用编译成 WebAssembly（`.wasm`），在设备上由乐鑫的 [wasm-micro-runtime](https://components.espressif.com/components/espressif/wasm-micro-runtime/) 解释执行。应用在沙箱里：读写越界、死循环只会让这个应用被关掉，不会把整机弄崩。
 
@@ -41,7 +46,10 @@ assets/         应用自带的只读文件（可选），程序里用 pkg:/ 开
     "circles": []
   },
   "permissions": ["sd.read", "assistant"],
-  "memory_kb": 512
+  "memory_kb": 512,
+  "voice": [
+    {"name": "next_chapter", "description": "翻到下一章"}
+  ]
 }
 ```
 
@@ -54,15 +62,30 @@ assets/         应用自带的只读文件（可选），程序里用 pkg:/ 开
 | `icon` | **线条图标**：在 36×36 的格子里写折线（`lines`，每条是一串点）和描边圆（`circles`，每个是 `[x, y, 直径]`）。系统统一画成白色 2 像素细线、放进深色圆角方块，桌面风格一致，也不用解码图片 |
 | `permissions` | 要用的权限，见第 6 节。装的时候列给用户看 |
 | `memory_kb` | 运行时最多用多少内存（放 PSRAM），默认 256，最大 1024 |
+| `tile` | `true`：这个应用占首页的收听卡片（现在只有这一个卡片位，给音乐应用用）。开机、装好后系统在后台把它跑起来，它在 `nomi_main` 里用 `ui_tile` 画卡片 |
+| `voice` | 大模型能调的指令，最多 8 个。每个指令有 `name`（小写字母、数字、下划线）和 `description`（写给大模型看：什么时候用、`arg` 怎么填）。要 `assistant` 权限，见第 5 节 |
 
 ## 3. 生命周期
 
-同一时间只运行一个应用。应用导出两个函数，系统只通过它们调应用：
+每个跑着的应用是一个"进程"：有自己的线程、内存和事件队列。所以音乐应用能在后台放歌、画首页卡片，同时前台开着别的应用。应用导出两个函数，系统只通过它们调应用：
 
 ```c
-void    nomi_main(void);                                        // 打开时调一次：建第一页
+void    nomi_main(void);                                        // 进程起来时调一次：读设置、画卡片
 int32_t nomi_event(int32_t type, int32_t id, int32_t value);   // 其他所有事情；处理了返回 1
 ```
+
+**界面能挂上、拿下**：
+
+- **从桌面打开**：
+  - 没在跑：先起进程，`nomi_main` 跑完后收到 `NOMI_EV_SHOW`，在这时建第一页。
+  - 已经在后台跑着：直接收到 `SHOW`。
+  - 只在前台用的简单应用（比如计数器）可以在 `nomi_main` 里直接建页面，不理 `SHOW` 就行。
+- **右划退出**：界面拿下，收到 `NOMI_EV_HIDE`。
+  - 有理由的进程留在后台：manifest 里写了 `"tile": true`，或者它放的歌还在放（暂停着、对话时让出来的也算）。
+  - 没理由的马上收到 `NOMI_EV_CLOSE`，然后结束。
+  - 留在后台、后来理由没了的，30 秒后结束。
+- **在后台时**：`ui_page` 这类界面调用返回 `NOMI_E_NO_UI`；卡片上的控件照常能改。
+- **没在跑时有事找它**：比如它放的歌放完了、卡片上点了下一首、大模型调了它的指令。系统先在后台把它拉起来（跑 `nomi_main`），再送事件。所以之后还要用的状态（队列、放到第几首）要存进 `kv`。
 
 | 事件 `type` | 什么时候 | `id` / `value` |
 |---|---|---|
@@ -70,17 +93,19 @@ int32_t nomi_event(int32_t type, int32_t id, int32_t value);   // 其他所有�
 | `NOMI_EV_CHANGE` | 开关、滑杆变了 | 控件 id / 新值 |
 | `NOMI_EV_BACK` | 左边缘右划退了一页 | 0 / 剩几页。系统先关掉当前页再通知应用；已经是第一页时右划直接关掉应用（收到 `NOMI_EV_CLOSE`）。应用拦不住返回：那样界面得等应用回话，应用卡住时界面也跟着卡 |
 | `NOMI_EV_PAUSE` / `NOMI_EV_RESUME` | 对话浮层升起 / 收起、睡着 / 醒来 | — |
-| `NOMI_EV_CLOSE` | 要关了（用户退出、装新版本、内存不够） | — 。趁这时候把进度存好 |
+| `NOMI_EV_CLOSE` | 进程要结束了：退出后没理由留着、在后台闲太久、装了新版本、被删 | — 。趁这时候把进度存好，界面已经没了 |
 | `NOMI_EV_TIMER` | 定时器到点 | 定时器 id |
-| `NOMI_EV_VOICE` | 用户说了这个应用注册的语音指令 | 指令 id / 0 |
+| `NOMI_EV_VOICE` | 大模型调了 manifest 里的语音指令 | 第几个指令（从 1 起）/ 0。用 `voice_arg` 取参数，用 `voice_reply` 回话 |
 | `NOMI_EV_READER` | 阅读器翻页 | 阅读器 id / 当前读到的字节位置 |
-| `NOMI_EV_MEDIA` | 播放状态变了 | 0 / 新状态 |
+| `NOMI_EV_MEDIA` | 你放的歌放完了，或主人在系统的播放控件上点了上一首 / 下一首 / 放 | 0 / `NOMI_MEDIA_FINISHED`、`NEXT`、`PREV`、`PLAY`，见第 5 节 |
+| `NOMI_EV_SHOW` / `NOMI_EV_HIDE` | 界面挂上 / 拿下 | — |
 
 规矩：
 
 - **一次事件处理不能超过 2 秒**，超过就算「应用无响应」，系统关掉它。耗时的事交给系统接口做。
 - 应用跑在自己的任务里，不占界面任务，应用卡住时界面照常能滑、能返回。
-- **退出就是关掉**：回到桌面时应用被关掉、内存收回，进度要自己用 `kv_set` 存，下次 `nomi_main` 读回来接着显示。只有音乐这种交给系统播放器的，退出后还能接着放。
+- **大多数应用退出就是关掉**：回到桌面时进程结束、内存收回。进度要自己用 `kv_set` 存，下次在 `nomi_main` 里读回来接着显示。会留在后台的只有上面说的两种。
+- 同时跑着的应用最多 4 个。
 
 ## 4. 界面
 
@@ -105,7 +130,16 @@ void ui_set_value(int32_t id, int32_t value);
 void ui_set_hidden(int32_t id, int32_t hidden);
 void ui_remove(int32_t id);
 void ui_toast(const char *text);                           // 屏幕上方弹一句提示
+int32_t ui_player(void);   // 系统画的「正在放」：封面、歌名、进度（能拖）、上一首 / 放停 / 下一首，自己刷新
+
+int32_t ui_tile(void);           // 首页卡片（要 "tile": true）：清空重画，接下来建的控件放进卡片
+int32_t ui_target(int32_t id);   // 接下来建的控件放到哪：一页（ui_page 的返回值）或卡片（ui_tile 的返回值）
+void    ui_open(void);           // 打开自己的界面（卡片上点了"打开"时用），之后收到 SHOW
 ```
+
+- **首页卡片**：首页往右划的收听卡片交给 `"tile": true` 的应用画（现在是音乐应用）。
+  - 应用在 `nomi_main` 里调 `ui_tile()`，再放 `ui_player()` 和几个 `ui_item`。卡片上的控件点了，照常收到 `NOMI_EV_CLICK`。
+  - 没装这样的应用、或者它的进程结束了，卡片位置显示系统自己的收听页。
 
 - 控件按建的先后从上往下排，超出一屏自动可以上下滚。
 - **阅读器**（`ui_reader`）是给小说准备的：一大段文字的排版、分页、翻页都由系统做（原生代码，快）。应用只给文件和起始位置，翻页时收到 `NOMI_EV_READER` 和当前位置，存下来就是书签。
@@ -151,27 +185,52 @@ SD 卡由系统按需挂载（见 `nomi_sdcard.h`）：没插卡时 `sd:/` 的�
 
 ### 播放（权限 `media`）
 
-交给系统播放器放，收听卡片、表情页小条、下拉设置里都能看到、能控制，退出应用也接着放。
+**系统只管放"这一首"**：解码、缓冲、对话时暂停让出来、封面歌词、进度。**放哪首、下一首放什么（队列、循环、随机）是应用的事**。
+
+放的东西记在应用名下。收听卡片、表情页小条、下拉设置里都能看到、能控制，退出应用也接着放。
 
 ```c
-int32_t media_play(const char *path, const char *title, const char *artist);  // sd:/ 文件或 http(s) 地址
-int32_t media_queue(const char *path, const char *title, const char *artist);  // 加到播放队列末尾
-void    media_control(int32_t cmd);   // NOMI_MEDIA_PAUSE / RESUME / NEXT / PREV / STOP
+// src：sd:/ 的文件（还要 sd.read）或 http(s) 地址；flags 为 NOMI_PLAY_LIVE 是直播（电台：没有进度，断了自动重连）
+int32_t media_play(const char *src, const char *title, const char *artist, int32_t flags);
+void    media_meta(const char *cover_url, const char *lrc);  // 网上的歌：配封面（JPEG 地址）和 LRC 歌词
+void    media_control(int32_t cmd);   // NOMI_MEDIA_PAUSE / RESUME / STOP / TOGGLE
 void    media_seek(int32_t second);
 int32_t media_state(void);            // 0 没在放、1 连接中、2 在放、3 暂停
+int32_t media_position(void);         // 放到第几秒
+int32_t media_duration(void);         // 总长（秒），不知道为 0
+int32_t media_mine(void);             // 现在放的（或停着的）是不是自己放的
+int32_t media_info(const char *path, char *buf, int32_t size);  // 读文件里的标签："标题\n歌手\n时长秒"
 ```
 
-格式：现在能放 MP3、AAC、m4a；FLAC、WAV 要给系统加解码器（待做，音乐应用会用到）。
+`NOMI_EV_MEDIA` 只发给放这一首的应用：
+
+| `value` | 什么时候 | 应用该做什么 |
+|---|---|---|
+| `NOMI_MEDIA_FINISHED` | 这一首放完了 | 按自己的队列和模式接着放（不放就停着） |
+| `NOMI_MEDIA_NEXT` / `PREV` | 主人在 `ui_player` 或收听卡片上点了下一首 / 上一首 | 在自己的队列里换 |
+| `NOMI_MEDIA_PLAY` | 主人点了你的 `ui_player` 上的"放"，但现在放的不是你的 | 决定放什么，比如接着放上次的 |
+
+SD 卡上的歌，系统自己读文件里的标签（FLAC 的 Vorbis 注释、MP3 的 ID3），用读到的歌名歌手替换显示的，还会读内嵌封面和同名的 `.lrc` 歌词。
+
+格式：MP3、AAC、m4a、FLAC（最高 24 位 / 96kHz）、WAV。
 
 ### 大模型和语音（权限 `assistant`）
 
+**语音指令写在 manifest 的 `voice` 里**。每轮对话的系统提示会列出装好的应用各有哪些指令，大模型统一用 `self.app.command(app, command, arg)` 这一个工具去调。所以装、删应用都不用改工具列表。
+
 ```c
-void    assistant_context(const char *text);  // 每轮对话带给大模型：比如小说当前这一页、正在看的照片说明
-int32_t voice_command(const char *name, const char *description);  // 注册语音指令，触发时收到 NOMI_EV_VOICE
-void    assistant_say(const char *text);      // 用语音读出来（走语音合成）
+void    assistant_context(const char *text);        // 界面开在前台时，每轮对话带给大模型（最多 600 字节）
+int32_t voice_arg(char *buf, int32_t size);         // 收到 NOMI_EV_VOICE 时：取参数
+void    voice_reply(const char *text, int32_t end); // 回话；end = 1 时这句说完就回待机
 ```
 
-比如小说应用注册「下一章」「从头读」，把当前页文字设成上下文。用户在看书时问「这段讲的什么」，大模型就知道在说哪一段。
+- **回话时机**：要在处理这个 `NOMI_EV_VOICE` 的那次 `nomi_event` 里回，系统最多等 5 秒。不回话的话，大模型收到的是"已交给「应用名」"。
+- **开始放歌这类事**：回话时带 `end = 1`。不然对话还开着，声音出不来。
+- **没找到、做不了**：如实回话（比如"SD 卡里没找到"），大模型会换别的办法。
+
+例子：
+- 音乐应用的 `play` 指令：`arg` 是歌名、歌手或文件夹名。在 SD 卡里搜到就放，回"好的，放「…」"。
+- 小说应用可以注册「下一章」，并把当前页的文字设成上下文。用户看书时问「这段讲的什么」，大模型就知道说的是哪一段。
 
 ### 其他
 
@@ -183,7 +242,15 @@ void    keep_awake(int32_t on);                             // 要权限 keep_aw
 void    nomi_log(const char *text);                         // 打到串口日志，调试用
 ```
 
-联网（`net.get`，权限 `net`）放到下一版：先看几个应用实际需要什么再定。
+### 联网（权限 `net`）
+
+```c
+// GET 一个 http(s) 地址（跟着跳转），正文最多 size 字节（多的截掉，一次最多 256KB）；返回字节数，没联网 NOMI_E_NO_NET
+int32_t net_get(const char *url, char *buf, int32_t size);
+```
+
+- 会卡住几秒，但跑在应用自己的线程里，不影响界面。
+- 设备内部 RAM 只够同时开一条 https 连接：如果正在放的是 https 的流，系统先暂停它，取完再接着放。
 
 ## 6. 权限
 
@@ -193,7 +260,7 @@ void    nomi_log(const char *text);                         // 打到串口日�
 | `media` | 让系统播放器放歌、控制播放 |
 | `assistant` | 给大模型加上下文、注册语音指令、让它念出来 |
 | `keep_awake` | 打开时不息屏 |
-| `net` | 联网（下一版） |
+| `net` | 联网（`net_get`） |
 
 没写在 `permissions` 里的接口，调了返回 `NOMI_E_DENIED`。
 
@@ -235,7 +302,8 @@ void    nomi_log(const char *text);                         // 打到串口日�
 | `app.wasm` 大小 | 1MB |
 | 运行内存 | `memory_kb`，最大 1MB（PSRAM） |
 | 一次事件处理 | 2 秒 |
-| 同时运行 | 1 个应用 |
+| 同时运行 | 4 个应用（前台一个，其余在后台） |
+| 语音指令回话 | 5 秒 |
 | 一次读文件 | 32KB |
 
 ## 10. 开发工具
@@ -296,9 +364,19 @@ int32_t nomi_event(int32_t type, int32_t id, int32_t value)
 - 系统接口：用 `wasm_runtime_register_natives("env", …)` 注册。字符串参数签名写 `$`，缓冲区写 `*~`，运行时会自动把应用里的地址换成设备地址并检查越界。
 - 调应用：用 `wasm_runtime_lookup_function` 找到 `nomi_main` / `nomi_event`，用 `wasm_runtime_call_wasm` 调。不让应用传函数指针当回调，全部走 `nomi_event`。
 - 线程：
-  - 应用跑在自己的任务里，事件经队列送进去。
-  - `ui_*` 调用拿显示锁去改界面，不在界面任务里跑应用代码。
-  - 2 秒超时靠这个任务的看门狗来实现。
+  - 每个进程一个 pthread（栈 32KB，放 PSRAM），有自己的模块实例和事件队列。系统另有一个任务，做开机扫描之类的活。
+  - `ui_*` 调用拿显示锁去改界面。拿到锁先看界面还在不在，不在就什么都不做，所以关界面不用等应用。
+  - 进程对象用 `shared_ptr` 管理；界面回调持有的是 `weak_ptr`，进程没了再点也不会出事。
+  - 每 5 秒检查一遍：在后台、又没理由留着的进程，30 秒后结束。
+  - 2 秒超时（待做）靠这个任务的看门狗来实现。
+- 播放：
+  - `NomiRadio::Station.owner` 记着是哪个应用放的。
+  - 放完时，`on_finished` 把 `NOMI_MEDIA_FINISHED` 送给这个应用。
+  - 收听卡片和 `ui_player` 上的上一首 / 下一首，经 `NomiWasm::MediaCommand` 送给它。
+  - 系统自己放的电台、播客（`owner` 为空），这两个按钮还是换台、快进快退。
+- 大模型：
+  - `self.app.command` 在主循环里调 `NomiWasm::VoiceCommand`，送出 `NOMI_EV_VOICE` 后等应用处理完。
+  - 指令列表由 `NomiPkg::PromptContext` 每轮放进系统提示。
 - 内存：运行时的堆和应用的线性内存都放 PSRAM。内部 RAM 很紧，空闲只有 55～60KB。
 - 界面：`ui_*` 建的控件放进应用层（`nomi_app.c`）给的全屏容器里。页面栈、右划返回由框架管。
 
@@ -312,19 +390,39 @@ int32_t nomi_event(int32_t type, int32_t id, int32_t value)
 - 网页设置页的「应用」页：列表、上传安装、卸载。（v0.1 已有：设备 → 应用，还能「打开」）
 - 没插 SD 卡时，装在卡上的应用现在不出现在桌面上；规范要的是图标变灰，要在机器内部存一份已装应用的索引。
 
-## 13. 实现进度（v0.1）
+## 13. 实现进度（v0.2）
 
 | 部分 | 状态 |
 |---|---|
 | 运行时 | ✓ wasm-micro-runtime 2.4 解释执行（fast-interp），关了 AOT、WASI、pthread 库、它自带的应用框架；固件增加约 90KB |
-| 界面 | ✓ `ui_page` `ui_page_close` `ui_text` `ui_item` `ui_button` `ui_set_text` `ui_set_hidden` `ui_remove` `ui_toast`；✗ 开关、滑杆、进度条、图片、阅读器、画布 |
+| 进程 | ✓ 每个应用一个进程、界面挂上 / 拿下、后台常驻（有卡片、在放歌）、闲置后结束、有事时在后台拉起；✗ 2 秒无响应自动关 |
+| 界面 | ✓ `ui_page` `ui_page_close` `ui_text` `ui_item` `ui_button` `ui_set_text` `ui_set_hidden` `ui_remove` `ui_toast` `ui_player` `ui_tile` `ui_target` `ui_open`；✗ 开关、滑杆、进度条、图片、阅读器、画布 |
 | 存储 | ✓ `fs_list` `fs_size` `fs_read` `kv_get` `kv_set`（`data/kv.json`）；✗ `fs_write` `fs_remove` |
-| 其他 | ✓ `time_now` `timer_start` `timer_stop` `nomi_log`；✗ 播放、大模型和语音、`keep_awake` |
-| 事件 | ✓ 点击、返回、关闭、定时器；✗ 暂停 / 恢复（浮层、睡眠）、2 秒无响应自动关 |
+| 播放 | ✓ `media_play`（本地 / 网上 / 直播）`media_meta` `media_control` `media_seek` `media_state` `media_position` `media_duration` `media_mine` `media_info`；放完、上一首、下一首、放都会通知应用 |
+| 联网 | ✓ `net_get` |
+| 大模型 | ✓ manifest 的 `voice` + `self.app.command`、`voice_arg` `voice_reply` `assistant_context`；✗ `assistant_say` |
+| 其他 | ✓ `time_now` `timer_start` `timer_stop` `nomi_log`；✗ `keep_awake` |
+| 事件 | ✓ 点击、返回、关闭、定时器、语音、播放、SHOW / HIDE；✗ 暂停 / 恢复（浮层、睡眠） |
 | 安装 | ✓ 网页上传 `.npk`、开机扫描、更新保留数据、应用管理和网页删除；✗ 装到机器内部、从 SD 卡上的安装包装、权限确认界面 |
 | 工具 | ✓ `tools/app-sdk/`：`nomi_sdk.h`、`build.py`（编译 + 打包）、`wasm_info.py`（看导入导出）、`examples/counter` |
 
-实测（计数器示例，`app.wasm` 6.6KB）：上传安装约 1～1.6 秒；第一次打开 75ms，之后 8ms；关掉后内存全部收回。
+| 自带应用 | ✓ `apps/music` v0.2：SD 卡按文件夹浏览、队列和三种播放模式、电台台单、首页卡片、`play` / `skip` / `mode` 三个指令 |
+
+源码和安装包放在哪：
+
+- 自带应用的源码在 `apps/<名字>/`；SDK 示例在 `tools/app-sdk/examples/`。
+- `build.py` 把 `.npk` 打到各自目录的 `build/` 下。`build/` 不进仓库，要用时现打。
+
+实测（计数器示例，`app.wasm` 6.6KB）：
+- 上传安装约 1～1.6 秒。
+- 第一次打开 75ms，之后 8ms。
+- 关掉后内存全部收回。
+
+实测（音乐应用，`app.wasm` 47KB）：
+- 开机后在后台起来，约 40～300ms。
+- 按名字在 SD 卡里搜歌，搜到后开始放约 1.8 秒。
+- 一首放完自动接下一首。
+- 重装同一版本：旧进程先结束，新进程接着用原来的数据。
 
 实现上踩过的坑：
 

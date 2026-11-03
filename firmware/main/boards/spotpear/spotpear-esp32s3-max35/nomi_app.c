@@ -90,12 +90,6 @@ static void icon_set_color(lv_obj_t *icon, uint32_t color)
     }
 }
 
-static const lv_point_precise_t kMusicStem[] = {{23, 5}, {23, 26}};
-static const lv_point_precise_t kMusicFlag[] = {{23, 5}, {31, 9}, {31, 14}};
-static const nomi_icon_line_t kMusicLines[] = {{kMusicStem, 2}, {kMusicFlag, 3}};
-static const nomi_icon_circle_t kMusicCircles[] = {{11, 21, 13}};
-static const nomi_icon_t kMusicIcon = {kMusicLines, 2, kMusicCircles, 1};
-
 static const lv_point_precise_t kBookLeft[] = {{17, 10}, {4, 7}, {4, 28}, {17, 31}, {17, 10}};
 static const lv_point_precise_t kBookRight[] = {{19, 10}, {32, 7}, {32, 28}, {19, 31}, {19, 10}};
 static const nomi_icon_line_t kBookLines[] = {{kBookLeft, 5}, {kBookRight, 5}};
@@ -151,7 +145,6 @@ static void placeholder_open(const nomi_app_t *app, lv_obj_t *root)
     }
 }
 
-static const nomi_app_t kMusic = {"music", "音乐", &kMusicIcon, placeholder_open, NULL, NULL, NULL, "放 SD 卡里的歌"};
 static const nomi_app_t kNovel = {"novel", "小说", &kBookIcon, placeholder_open, NULL, NULL, NULL, "看 SD 卡里的小说"};
 static const nomi_app_t kPhoto = {"photo", "图片", &kPhotoIcon, placeholder_open, NULL, NULL, NULL, "看 SD 卡里的照片"};
 static const nomi_app_t kMap = {"map", "地图", &kMapIcon, placeholder_open, NULL, NULL, NULL, "地图"};
@@ -528,8 +521,7 @@ static void build_launcher(lv_obj_t *tile)
     lv_obj_set_style_pad_row(s_grid, 14, 0);
     lv_obj_set_scroll_dir(s_grid, LV_DIR_VER);  // 应用多了往下滚
     lv_obj_set_scrollbar_mode(s_grid, LV_SCROLLBAR_MODE_OFF);
-    nomi_apps_add(&kMusic);
-    nomi_apps_add(&kNovel);
+    nomi_apps_add(&kNovel);  // 音乐已经是应用包（apps/music），装上后自己登记
     nomi_apps_add(&kPhoto);
     nomi_apps_add(&kMap);
     add_edge(tile, on_launcher_edge);

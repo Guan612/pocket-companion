@@ -1,0 +1,9 @@
+# 电台：一行一个，台名|地址（http 的 MP3 / AAC 直播流）
+华语经典|http://lhttp.qingting.fm/live/5022308/64k.mp3
+AsiaFM 高清|http://asiafm.hk:8000/asiahd
+怀集音乐|http://lhttp.qingting.fm/live/4804/64k.mp3
+两广音乐|http://lhttp.qingting.fm/live/20500149/64k.mp3
+中国之声|http://lhttp.qingting.fm/live/15318317/64k.mp3
+第一财经|http://lhttp.qingting.fm/live/276/64k.mp3
+故事广播|http://lhttp.qingting.fm/live/20500182/64k.mp3
+评书|http://lhttp.qingting.fm/live/1951/64k.mp3

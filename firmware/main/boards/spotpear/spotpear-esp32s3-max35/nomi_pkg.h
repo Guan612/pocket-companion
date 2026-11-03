@@ -18,6 +18,12 @@ struct NomiPackage {
     std::string dir;  // 设备上的目录
     std::vector<std::string> permissions;
     int memory_kb = 256;
+    bool tile = false;  // 占首页的收听卡片（开机后在后台跑起来画）
+    // 大模型能调的指令（self.app.command）：NOMI_EV_VOICE 的 id 是第几个（从 1 起）
+    struct Voice {
+        std::string name, description;
+    };
+    std::vector<Voice> voice;
     // 线条图标（manifest 里的 icon），nomi_app_t 指着这里
     std::vector<std::vector<lv_point_precise_t>> icon_points;
     std::vector<nomi_icon_line_t> icon_lines;
@@ -45,6 +51,10 @@ public:
 
     bool Remove(const std::string& id);  // 删程序和数据、从桌面去掉
     int Count();
+    // 装好的包（指针一直有效：换下来的旧包也留着）；没装返回 nullptr
+    const NomiPackage* Find(const std::string& id);
+    // 每轮对话的系统提示里加的：装好的应用有哪些语音指令（没有为空）
+    std::string PromptContext();
 
 private:
     std::mutex mutex_;
@@ -54,5 +64,5 @@ private:
 
     NomiPkg() = default;
     void Scan();
-    void Register(std::unique_ptr<NomiPackage> pkg);
+    const NomiPackage* Register(std::unique_ptr<NomiPackage> pkg);
 };

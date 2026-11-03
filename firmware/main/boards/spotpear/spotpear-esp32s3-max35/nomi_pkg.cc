@@ -154,6 +154,22 @@ std::string ParseManifest(const std::string& text, NomiPackage& pkg) {
         }
     }
     if (problem.empty()) {
+        pkg.tile = cJSON_IsTrue(cJSON_GetObjectItem(root, "tile"));
+        cJSON* cmd = nullptr;
+        cJSON_ArrayForEach(cmd, cJSON_GetObjectItem(root, "voice")) {
+            std::string name = cJSON_IsString(cJSON_GetObjectItem(cmd, "name")) ? cJSON_GetObjectItem(cmd, "name")->valuestring : "";
+            cJSON* desc = cJSON_GetObjectItem(cmd, "description");
+            bool name_ok = !name.empty() && name.size() <= 24 &&
+                           std::all_of(name.begin(), name.end(), [](char c) { return (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_'; });
+            if (!pkg.Has("assistant")) problem = "有 voice 指令要申请 assistant 权限";
+            else if (!name_ok) problem = "voice 指令的 name 只能用小写字母、数字、下划线（最多 24 个）";
+            else if (!cJSON_IsString(desc) || !*desc->valuestring || strlen(desc->valuestring) > 300) problem = "voice 指令「" + name + "」要写 description（最多一百来字）";
+            else if (pkg.voice.size() >= 8) problem = "voice 指令最多 8 个";
+            if (!problem.empty()) break;
+            pkg.voice.push_back({name, desc->valuestring});
+        }
+    }
+    if (problem.empty()) {
         cJSON* icon = cJSON_GetObjectItem(root, "icon");
         cJSON* line = nullptr;
         cJSON_ArrayForEach(line, cJSON_GetObjectItem(icon, "lines")) {
@@ -241,20 +257,45 @@ int NomiPkg::Count() {
     return packages_.size();
 }
 
-void NomiPkg::Register(std::unique_ptr<NomiPackage> pkg) {
+const NomiPackage* NomiPkg::Register(std::unique_ptr<NomiPackage> pkg) {
     FinishApp(*pkg);
-    DisplayLockGuard ui(display());
+    const NomiPackage* added = pkg.get();
+    {
+        DisplayLockGuard ui(display());
+        std::lock_guard<std::mutex> lock(mutex_);
+        for (auto it = packages_.begin(); it != packages_.end(); ++it) {
+            if ((*it)->id == pkg->id) {  // 同一个应用的新版本：先把旧的从桌面去掉（开着的话会关掉）
+                nomi_apps_remove(&(*it)->app);
+                retired_.push_back(std::move(*it));
+                packages_.erase(it);
+                break;
+            }
+        }
+        nomi_apps_add(&pkg->app);
+        packages_.push_back(std::move(pkg));
+    }
+    if (added->tile) NomiWasm::StartBackground(added);  // 首页卡片：开机、装好就画出来
+    return added;
+}
+
+const NomiPackage* NomiPkg::Find(const std::string& id) {
     std::lock_guard<std::mutex> lock(mutex_);
-    for (auto it = packages_.begin(); it != packages_.end(); ++it) {
-        if ((*it)->id == pkg->id) {  // 同一个应用的新版本：先把旧的从桌面去掉（开着的话会关掉）
-            nomi_apps_remove(&(*it)->app);
-            retired_.push_back(std::move(*it));
-            packages_.erase(it);
-            break;
+    for (const auto& p : packages_) {
+        if (p->id == id) return p.get();
+    }
+    return nullptr;
+}
+
+std::string NomiPkg::PromptContext() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    std::string out;
+    for (const auto& p : packages_) {
+        for (const auto& v : p->voice) {
+            out += "- app=\"" + p->id + "\" command=\"" + v.name + "\"（" + p->name + "）：" + v.description + "\n";
         }
     }
-    nomi_apps_add(&pkg->app);
-    packages_.push_back(std::move(pkg));
+    if (out.empty()) return "";
+    return "装好的应用能做的事（用 self.app.command 调，主人的话合适时优先用这些）：\n" + out;
 }
 
 void NomiPkg::Scan() {
@@ -377,6 +418,7 @@ std::string NomiPkg::InstallJson(size_t length, const std::function<int(char*, s
             problem = ParseManifest(text, *pkg);
             if (!problem.empty()) break;
             have_manifest = true;
+            NomiWasm::Kill(pkg->id);  // 旧版本在跑的话先结束（后面还要传一会儿，够它收尾）
             if (FILE* f = fopen((tmp_dir + "/manifest.json").c_str(), "wb")) {
                 fwrite(text.data(), 1, text.size(), f);
                 fclose(f);
@@ -491,6 +533,7 @@ bool NomiPkg::Remove(const std::string& id) {
         }
     }
     if (!victim) return false;
+    NomiWasm::Kill(id);
     {
         NomiSdCard::Use sd;
         if (sd) RemoveTree(victim->dir);
