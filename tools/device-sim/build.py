@@ -77,7 +77,7 @@ def main():
     write_device_widgets()
     lvgl = lvgl_dir()
     sources = sorted(str(p) for p in (lvgl / "src").rglob("*.c"))
-    sources += [str(HERE / "sim_main.c"), *(str(BOARD / f) for f in ("nomi_ui.c", "face.c", "face_script.c", "raster.c",
+    sources += [str(HERE / "sim_main.c"), *(str(BOARD / f) for f in ("nomi_ui.c", "nomi_app.c", "face.c", "face_script.c", "raster.c",
                                                                     "nomi_font_clock_120.c", "nomi_font_icon_36.c"))]
     sources.append(str(CJSON / "cJSON.c"))
     sources.append(str(FONTS / "src" / "cbin_font.c"))

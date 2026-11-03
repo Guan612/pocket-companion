@@ -6,6 +6,8 @@
 
 #include "face.h"
 #include "face_script.h"
+#include "nomi_app.h"
+#include "nomi_style.h"
 
 #define FRAME_MS 33
 #define STEP_S (1.0f / 60)
@@ -14,14 +16,6 @@
 #define SUBTITLE_LINGER_MS 600  // 说完后字幕再留多久就收起
 #define MIN_BRIGHTNESS 10     // 亮度滑条下限，免得调成全黑找不回来
 
-#define C_TEXT 0xe8eaf0
-#define C_MUTED 0x8b90a0
-#define C_PANEL 0x1b1e26
-#define C_CONTROL 0x2c3040
-#define C_ACCENT 0x6aa6ff
-#define C_DANGER 0xff6b6b
-#define C_PAGE 0x111318
-#define C_WARM 0xffc857  // 太阳、闪电、闹钟铃铛
 
 #define CLOCK_REFRESH_MS 1000  // 时钟页多久对一次时间、天气、闹钟（文字没变就不重画）
 #define RADIO_REFRESH_MS 400   // 电台页、左上角电台小条多久对一次状态
@@ -42,7 +36,7 @@ static uint16_t *s_buf;
 // 页面结构：外层上下翻（设置 / 主界面），主界面里左右翻（历史对话 / 表情 / 电台 / 时钟），
 // 状态栏、字幕、页码小圆点和电台小条浮在主界面上
 enum { PAGE_HIST, PAGE_FACE, PAGE_MUSIC, PAGE_CLOCK, PAGE_COUNT };
-static lv_obj_t *s_outer, *s_settings_tile, *s_main_tile;
+static lv_obj_t *s_outer, *s_settings_tile, *s_main_tile, *s_launcher_tile;  // 外层：设置 / 主界面 / 桌面
 static lv_obj_t *s_modes, *s_chat_tile, *s_hist_tile, *s_music_tile, *s_clock_tile;
 // 收听页（电台 / 播客 / 音乐）
 static lv_obj_t *s_tab_btns[3], *s_now_cover, *s_now_title, *s_now_sub;
@@ -57,6 +51,14 @@ static int s_cover_version = -1;
 static uint32_t s_radio_refresh_at;  // 下次对收听页的时刻
 static lv_obj_t *s_canvas, *s_hist_list;
 static lv_obj_t *s_status, *s_battery, *s_subtitle, *s_toast, *s_dots;
+// 对话浮层：不在表盘（表情页）时叫它说话，从屏幕底下升起来，不翻页、不关应用，说完收回去
+#define SHEET_H 120
+#define SHEET_LINGER_MS 1500  // 说完后浮层再留多久（看完最后一句）
+#define WAVE_N 41             // 浮层顶上那条细线的点数
+static lv_obj_t *s_sheet, *s_sheet_text, *s_sheet_wave;
+static lv_point_precise_t s_wave_pts[WAVE_N];
+static bool s_sheet_up;
+static uint32_t s_sheet_hide_at;  // 对话结束后到这个时刻收起浮层，0 表示不在倒计时
 static lv_timer_t *s_toast_timer;
 static uint32_t s_last_ms, s_emotion_until;
 static float s_acc;
@@ -166,6 +168,7 @@ static bool hist_page_active(void)
 static bool face_visible(void)
 {
     if (lv_tileview_get_tile_active(s_outer) == s_settings_tile) return false;
+    if (lv_tileview_get_tile_active(s_outer) == s_launcher_tile || nomi_app_current()) return false;
     lv_obj_t *tile = lv_tileview_get_tile_active(s_modes);
     if (tile == s_hist_tile || tile == s_music_tile || tile == s_clock_tile) return false;
     if (s_alarm_layer && !lv_obj_has_flag(s_alarm_layer, LV_OBJ_FLAG_HIDDEN)) return false;
@@ -176,6 +179,129 @@ static bool in_conversation(nomi_state_t state)
 {
     return state == NOMI_STATE_LISTENING || state == NOMI_STATE_THINKING || state == NOMI_STATE_SPEAKING ||
            state == NOMI_STATE_CONNECTING;
+}
+
+/* ---------- 对话浮层 ---------- */
+
+// 表盘（表情页）露在最前面：对话就在脸上，不用浮层
+static bool face_in_front(void)
+{
+    lv_obj_t *outer = lv_tileview_get_tile_active(s_outer);
+    return !nomi_app_current() && outer != s_settings_tile && outer != s_launcher_tile && current_page() == PAGE_FACE;
+}
+
+static void set_sheet_y(void *obj, int32_t y) { lv_obj_set_y((lv_obj_t *)obj, y); }
+
+static void on_sheet_down(lv_anim_t *a)
+{
+    (void)a;
+    if (!s_sheet_up) lv_obj_add_flag(s_sheet, LV_OBJ_FLAG_HIDDEN);
+}
+
+static void sheet_slide(bool up)
+{
+    if (up == s_sheet_up) return;
+    s_sheet_up = up;
+    if (up) lv_obj_remove_flag(s_sheet, LV_OBJ_FLAG_HIDDEN);
+    lv_anim_delete(s_sheet, set_sheet_y);
+    lv_anim_t a;
+    lv_anim_init(&a);
+    lv_anim_set_var(&a, s_sheet);
+    lv_anim_set_exec_cb(&a, set_sheet_y);
+    lv_anim_set_values(&a, lv_obj_get_y(s_sheet), up ? FACE_H - SHEET_H : FACE_H);
+    lv_anim_set_duration(&a, 220);
+    lv_anim_set_path_cb(&a, up ? lv_anim_path_ease_out : lv_anim_path_ease_in);
+    if (!up) lv_anim_set_completed_cb(&a, on_sheet_down);
+    lv_anim_start(&a);
+}
+
+static float sin_deg(float deg)
+{
+    int32_t d = (int32_t)deg % 360;
+    if (d < 0) d += 360;
+    return lv_trigo_sin((int16_t)d) / 32767.0f;
+}
+
+// 浮层顶上的细线：听的时候缓缓起伏，想的时候一个小鼓包从左往右跑，说的时候跟着节奏跳，其余时候是平的。
+// 两头固定（乘一个半周正弦当窗），线宽 2，和 Nomi 的细线条一个路子
+static void wave_tick(nomi_state_t state, uint32_t now)
+{
+    const int x0 = 40, x1 = FACE_W - 40, base = 18;
+    float t = now / 1000.0f;
+    for (int i = 0; i < WAVE_N; i++) {
+        float u = (float)i / (WAVE_N - 1);
+        float win = sin_deg(u * 180);
+        float y = 0;
+        if (state == NOMI_STATE_LISTENING || state == NOMI_STATE_CONNECTING) {
+            y = 5 * sin_deg(u * 720 + t * 160);
+        } else if (state == NOMI_STATE_THINKING) {
+            float pos = t * 0.6f - (int)(t * 0.6f);  // 0..1 循环
+            float d = (u - pos) * 8;
+            y = -9 / (1 + d * d * d * d);
+        } else if (state == NOMI_STATE_SPEAKING) {
+            float env = 3 + 7 * sin_deg(t * 420) * sin_deg(t * 250);
+            y = env * sin_deg(u * 1080 + t * 700);
+        }
+        s_wave_pts[i].x = (lv_value_precise_t)(x0 + u * (x1 - x0));
+        s_wave_pts[i].y = (lv_value_precise_t)(base + y * win);
+    }
+    lv_line_set_points_mutable(s_sheet_wave, s_wave_pts, WAVE_N);
+}
+
+static void sheet_tick(nomi_state_t state, uint32_t now)
+{
+    bool talking = in_conversation(state);
+    const char *shown = lv_label_get_text(s_sheet_text);
+    bool placeholder = !shown[0] || strcmp(shown, "在听…") == 0 || strcmp(shown, "想一想…") == 0;
+    // 说完了：有字幕就多留一会儿看完最后一句；只有"在听…"这种占位字（没听到话）就直接收
+    if (talking) s_sheet_hide_at = 0;
+    else if (in_conversation(s_last_state) && !placeholder) s_sheet_hide_at = now + SHEET_LINGER_MS;
+    if (s_sheet_hide_at && (int32_t)(now - s_sheet_hide_at) >= 0) s_sheet_hide_at = 0;
+    // 在表盘上就交给脸；翻到别处、开着应用就用浮层
+    bool want = (talking || s_sheet_hide_at) && !s_sleeping && !face_in_front();
+    if (!want && !talking && !s_sheet_hide_at) lv_label_set_text(s_sheet_text, "");  // 下次从空的开始
+    sheet_slide(want);
+    if (!s_sheet_up) return;
+    // 刚开口还没有字：写一句在干什么
+    if (talking && placeholder) {
+        lv_obj_set_style_text_color(s_sheet_text, lv_color_hex(C_MUTED), 0);
+        set_text_if_changed(s_sheet_text, state == NOMI_STATE_THINKING ? "想一想…" : "在听…");
+    }
+    wave_tick(talking ? state : NOMI_STATE_IDLE, now);
+    // 状态字、字幕在浮层里了，主界面上的那两个别再露出来
+    lv_obj_add_flag(s_status, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(s_subtitle, LV_OBJ_FLAG_HIDDEN);
+}
+
+static void create_sheet(lv_obj_t *screen)
+{
+    s_sheet = lv_obj_create(screen);
+    lv_obj_remove_style_all(s_sheet);
+    lv_obj_set_size(s_sheet, FACE_W, SHEET_H + 20);  // 多出来的 20 藏在屏幕下面，底下两个圆角看不见
+    lv_obj_set_pos(s_sheet, 0, FACE_H);
+    lv_obj_set_style_bg_color(s_sheet, lv_color_hex(C_SHEET), 0);
+    lv_obj_set_style_bg_opa(s_sheet, LV_OPA_COVER, 0);
+    lv_obj_set_style_radius(s_sheet, 18, 0);
+    lv_obj_set_style_border_width(s_sheet, 1, 0);
+    lv_obj_set_style_border_side(s_sheet, LV_BORDER_SIDE_TOP, 0);
+    lv_obj_set_style_border_color(s_sheet, lv_color_hex(C_CONTROL), 0);
+    lv_obj_add_flag(s_sheet, LV_OBJ_FLAG_CLICKABLE);  // 挡住下面
+    lv_obj_remove_flag(s_sheet, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(s_sheet, LV_OBJ_FLAG_HIDDEN);
+
+    s_sheet_wave = lv_line_create(s_sheet);
+    lv_obj_set_style_line_width(s_sheet_wave, 2, 0);
+    lv_obj_set_style_line_rounded(s_sheet_wave, true, 0);
+    lv_obj_set_style_line_color(s_sheet_wave, lv_color_hex(C_TEXT), 0);
+    lv_obj_set_pos(s_sheet_wave, 0, 0);
+    wave_tick(NOMI_STATE_IDLE, 0);
+
+    s_sheet_text = lv_label_create(s_sheet);
+    lv_obj_set_width(s_sheet_text, FACE_W - 64);
+    lv_label_set_long_mode(s_sheet_text, LV_LABEL_LONG_MODE_DOTS);
+    lv_obj_set_style_text_align(s_sheet_text, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_pos(s_sheet_text, 32, 40);
+    lv_label_set_text(s_sheet_text, "");
 }
 
 static void face_tick(lv_timer_t *timer)
@@ -207,11 +333,8 @@ static void face_tick(lv_timer_t *timer)
         lv_obj_add_flag(s_subtitle, LV_OBJ_FLAG_HIDDEN);
         s_subtitle_hide_at = 0;
     }
-    // 停在时钟 / 电台页时叫它说话：翻回表情页（听、想、说的样子都在脸上）
-    int page = current_page();
-    if (in_conversation(state) && !in_conversation(s_last_state) && (page == PAGE_CLOCK || page == PAGE_MUSIC)) {
-        show_page(PAGE_FACE, !s_sleeping);
-    }
+    // 不在表盘时叫它说话：不翻页、不关应用，底下升起对话浮层（看小说、拖地图到哪，说完还在哪）
+    sheet_tick(state, now);
     s_last_state = state;
 
     // 时钟页：每秒对一次时间、天气、闹钟（看不见时也对，文字没变就不重画，翻过去时已经是对的）
@@ -279,6 +402,11 @@ void nomi_ui_set_font(const lv_font_t *font)
         if (roots[i]) lv_obj_set_style_text_font(roots[i], font, 0);
     }
     lv_obj_set_height(s_subtitle, lv_font_get_line_height(font) * 2);  // 最多两行
+    if (s_sheet) {
+        lv_obj_set_style_text_font(s_sheet, font, 0);
+        lv_obj_set_height(s_sheet_text, lv_font_get_line_height(font) * 2);
+    }
+    nomi_apps_set_font(font);
 }
 
 void nomi_ui_set_status(const char *status)
@@ -318,6 +446,12 @@ void nomi_ui_set_subtitle(const char *role, const char *text)
 {
     s_subtitle_hide_at = 0;  // 有新字幕就别收了
     s_hist_dirty = true;     // 历史页记下这条消息，可见时重建（字幕关了也要记）
+    // 浮层里的字不受"显示字幕"开关管：浮层就靠这行字说明在干什么
+    if (s_sheet_text && text && *text) {
+        bool user = role && strcmp(role, "user") == 0;
+        lv_obj_set_style_text_color(s_sheet_text, lv_color_hex(user ? C_MUTED : C_TEXT), 0);
+        lv_label_set_text(s_sheet_text, trim_subtitle(text));
+    }
     if (!s_subtitles_on || !text || !*text) {
         lv_obj_add_flag(s_subtitle, LV_OBJ_FLAG_HIDDEN);
         return;
@@ -356,6 +490,7 @@ void nomi_ui_set_sleep(bool sleeping)
 {
     s_sleeping = sleeping;
     face_set_sleep(sleeping);
+    nomi_apps_set_hidden(sleeping);
     if (sleeping) {
         lv_obj_add_flag(s_subtitle, LV_OBJ_FLAG_HIDDEN);
         show_main(false);
@@ -862,6 +997,7 @@ static void on_outer_scroll_end(lv_event_t *e)
     (void)e;
     lock_outer_if_settings();
     if (lv_tileview_get_tile_active(s_outer) == s_main_tile) disarm_action_button();
+    if (lv_tileview_get_tile_active(s_outer) == s_launcher_tile) nomi_launcher_shown();
 }
 
 #define TAB_BAR_W 92  // 设置页左边标签栏的宽度
@@ -1017,7 +1153,7 @@ static void create_dots(void)
         lv_obj_set_style_radius(dot, 3, 0);
         lv_obj_set_style_bg_color(dot, lv_color_hex(C_TEXT), 0);
     }
-    lv_obj_align(s_dots, LV_ALIGN_BOTTOM_MID, 0, -6);
+    lv_obj_align(s_dots, LV_ALIGN_BOTTOM_MID, 0, -16);  // 让开最底下提示往上推的小横条
 }
 
 /* ---------- 第三页：收听（电台 / 播客 / 音乐） ---------- */
@@ -1874,11 +2010,9 @@ void nomi_ui_alarm_hide(void)
 }
 
 // 外层开始上下翻：从主界面往下拉时，设置页上的值有变化才重建；没变只刷新一下信号强度
-static void on_outer_scroll(lv_event_t *e)
+// 设置页上的值变了才重建（见 settings_signature）；Wi-Fi 信号每次都刷新
+static void refresh_settings(void)
 {
-    (void)e;
-    user_activity();
-    if (lv_tileview_get_tile_active(s_outer) != s_main_tile) return;
     char sig[sizeof(s_settings_sig)];
     settings_signature(sig, sizeof(sig));
     if (strcmp(sig, s_settings_sig) != 0) {
@@ -1887,6 +2021,13 @@ static void on_outer_scroll(lv_event_t *e)
         const char *wifi = get_text("wifi");
         lv_label_set_text(s_wifi_label, wifi[0] ? wifi : "没连上");
     }
+}
+
+static void on_outer_scroll(lv_event_t *e)
+{
+    (void)e;
+    user_activity();
+    if (lv_tileview_get_tile_active(s_outer) == s_main_tile) refresh_settings();
 }
 
 // 触摸只用来叫醒它；说话交给 BOOT 键和唤醒词
@@ -1915,6 +2056,9 @@ static lv_obj_t *add_tileview(lv_obj_t *parent)
     return tv;
 }
 
+// 桌面上左边缘右划：回表盘
+static void go_home(void) { show_main(true); }
+
 void nomi_ui_create(lv_obj_t *screen, uint16_t *face_buf, const lv_font_t *font,
                     const nomi_ui_callbacks_t *callbacks)
 {
@@ -1926,10 +2070,11 @@ void nomi_ui_create(lv_obj_t *screen, uint16_t *face_buf, const lv_font_t *font,
     lv_obj_set_style_bg_color(screen, lv_color_black(), 0);
     lv_obj_remove_flag(screen, LV_OBJ_FLAG_SCROLLABLE);
 
-    // 外层：设置在上，主界面在下
+    // 外层上下翻：设置在上（往下拉），主界面在中间，应用列表在下（往上推）
     s_outer = add_tileview(screen);
     s_settings_tile = add_tile(s_outer, 0, 0, LV_DIR_BOTTOM, C_PAGE);
-    s_main_tile = add_tile(s_outer, 0, 1, LV_DIR_TOP, 0x000000);
+    s_main_tile = add_tile(s_outer, 0, 1, LV_DIR_VER, 0x000000);
+    s_launcher_tile = add_tile(s_outer, 0, 2, LV_DIR_TOP, 0x000000);
     lv_obj_add_event_cb(s_outer, on_outer_scroll, LV_EVENT_SCROLL_BEGIN, NULL);
     lv_obj_add_event_cb(s_outer, on_outer_scroll_end, LV_EVENT_SCROLL_END, NULL);
 
@@ -1996,6 +2141,19 @@ void nomi_ui_create(lv_obj_t *screen, uint16_t *face_buf, const lv_font_t *font,
     lv_obj_add_flag(s_subtitle, LV_OBJ_FLAG_HIDDEN);
 
     create_dots();
+
+    // 底部小横条：提示往上推是应用列表（和顶上提示下拉设置的那条对称）
+    lv_obj_t *grip_bottom = lv_obj_create(s_main_tile);
+    lv_obj_remove_style_all(grip_bottom);
+    lv_obj_set_size(grip_bottom, 44, 4);
+    lv_obj_set_style_radius(grip_bottom, 2, 0);
+    lv_obj_set_style_bg_color(grip_bottom, lv_color_hex(C_MUTED), 0);
+    lv_obj_set_style_bg_opa(grip_bottom, LV_OPA_50, 0);
+    lv_obj_align(grip_bottom, LV_ALIGN_BOTTOM_MID, 0, -6);
+
+    // 应用层盖在卡片上，对话浮层再盖在应用上（闹钟层响铃时才建，在最上面）
+    nomi_apps_init(screen, s_launcher_tile, font, user_activity, go_home);
+    create_sheet(screen);
 
     build_settings();
     show_main(false);
