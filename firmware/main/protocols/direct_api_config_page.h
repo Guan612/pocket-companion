@@ -16,7 +16,7 @@ inline constexpr char kDirectApiConfigPage[] = R"HTML(<!doctype html>
 <style>
 :root{--bg:#111318;--card:#1b1e26;--line:#2c3040;--fg:#e8eaf0;--muted:#8b90a0;--accent:#6aa6ff;--ok:#5ad19a;--err:#ff7a7a}
 *{box-sizing:border-box}
-body{margin:0;padding:16px 16px 88px;background:var(--bg);color:var(--fg);font:15px/1.5 system-ui,sans-serif}
+body{margin:0;padding:16px;background:var(--bg);color:var(--fg);font:15px/1.5 system-ui,sans-serif}
 main{max-width:560px;margin:auto}
 h1{font-size:20px;margin:0 0 4px}
 h2{font-size:15px;color:var(--accent);margin:22px 0 8px;font-weight:600}
@@ -48,15 +48,35 @@ button.mini{padding:7px 10px}
 .presets{display:grid;grid-template-columns:1fr 1fr;gap:8px}
 .presets button{text-align:left;padding:10px}
 .presets small{display:block;color:var(--muted);font-size:12px}
+body.has-save{padding-bottom:88px}
 .save{position:fixed;left:0;right:0;bottom:0;padding:12px 16px;background:rgba(17,19,24,.95);border-top:1px solid var(--line)}
 .save div{max-width:560px;margin:auto;display:flex;gap:10px;align-items:center}
 .save button{flex:none;padding:10px 22px}
 #msg{flex:1;font-size:14px}
 .ok{color:var(--ok)}.err{color:var(--err)}
+.menu{display:block;background:var(--card);border:1px solid var(--line);border-radius:12px;overflow:hidden;margin-top:14px}
+.menu a{display:flex;align-items:center;gap:10px;padding:15px 12px;color:var(--fg);text-decoration:none;border-top:1px solid var(--line)}
+.menu a:first-child{border-top:0}
+.menu b{font-weight:600;flex:none}
+.menu small{flex:1;min-width:0;text-align:right;color:var(--muted);font-size:13px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.menu small.err{color:var(--err)}
+.menu i{font-style:normal;color:var(--muted);font-size:18px}
+.back{display:inline-block;color:var(--accent);text-decoration:none;padding:2px 0 6px}
 [hidden]{display:none!important}
 </style>
 <main>
+<div id="home">
 <h1>Pocket Companion 设置</h1>
+<nav class="menu">
+  <a href="#ai"><b>大模型</b><small id="sum_ai">供应商 · 用途 · 人设 · 记忆</small><i>›</i></a>
+  <a href="#listen" id="menu_listen" hidden><b>收听</b><small id="sum_listen">电台 · 播客 · 在线音乐</small><i>›</i></a>
+  <a href="#device"><b>设备</b><small id="sum_device">Wi-Fi · 天气 · SD 卡</small><i>›</i></a>
+</nav>
+</div>
+
+<section id="pg-ai" hidden>
+<a class="back" href="#">‹ 设置</a>
+<h1>大模型</h1>
 <p>先添加供应商（填地址和 Key），再给下面四个用途各选一个模型。接口都是 OpenAI 兼容格式；语音合成要能返回 opus。</p>
 
 <h2>供应商</h2>
@@ -82,21 +102,17 @@ button.mini{padding:7px 10px}
   <p class="err" id="missing" hidden></p>
 </div>
 
-<h2>Wi-Fi 网络</h2>
-<div class="card">
-  <p class="hint">可以存多个（最多 10 个）：设备在哪个网络附近就自动连哪个，都在时连信号强的。不在身边的也能先存上，比如在家把公司的加好，到了公司就能直接连。这一栏点了就生效，不用点底部的保存。</p>
-  <div id="wifiList"><p class="hint">读取中…</p></div>
-  <label>Wi-Fi 名称<input id="wifiSsid" autocomplete="off" placeholder="区分大小写，要和路由器上的一模一样"></label>
-  <label>密码<input id="wifiPass" type="password" autocomplete="off" placeholder="开放网络留空"></label>
-  <div class="row"><button id="wifiAdd">添加 / 更新密码</button><span id="wifiMsg" class="hint"></span></div>
-</div>
+<h2>人设提示词</h2>
+<textarea id="prompt" rows="4" placeholder="留空用默认提示词"></textarea>
 
-<h2>天气</h2>
-<div class="card">
-  <label>城市<input id="wx_city" maxlength="20" autocomplete="off" placeholder="留空按网络位置自动判断，比如：深圳"></label>
-  <p class="hint">时钟页显示这个城市的天气，问它天气也按这里。也可以直接跟它说「我在深圳」。</p>
-</div>
+<h2>长期记忆</h2>
+<p class="hint">对话里它会自己往里记（一行一条）；这里能看到全部并手改，删掉就不记得了。<span id="memSize"></span></p>
+<textarea id="memory" rows="5"></textarea>
+</section>
 
+<section id="pg-listen" hidden>
+<a class="back" href="#">‹ 设置</a>
+<h1>收听</h1>
 <div id="radioCard" hidden>
 <h2>电台</h2>
 <div class="card">
@@ -132,6 +148,25 @@ button.mini{padding:7px 10px}
   <div id="musicResults"></div>
 </div>
 </div>
+</section>
+
+<section id="pg-device" hidden>
+<a class="back" href="#">‹ 设置</a>
+<h1>设备</h1>
+<h2>Wi-Fi 网络</h2>
+<div class="card">
+  <p class="hint">可以存多个（最多 10 个）：设备在哪个网络附近就自动连哪个，都在时连信号强的。不在身边的也能先存上，比如在家把公司的加好，到了公司就能直接连。这一栏点了就生效，不用点底部的保存。</p>
+  <div id="wifiList"><p class="hint">读取中…</p></div>
+  <label>Wi-Fi 名称<input id="wifiSsid" autocomplete="off" placeholder="区分大小写，要和路由器上的一模一样"></label>
+  <label>密码<input id="wifiPass" type="password" autocomplete="off" placeholder="开放网络留空"></label>
+  <div class="row"><button id="wifiAdd">添加 / 更新密码</button><span id="wifiMsg" class="hint"></span></div>
+</div>
+
+<h2>天气</h2>
+<div class="card">
+  <label>城市<input id="wx_city" maxlength="20" autocomplete="off" placeholder="留空按网络位置自动判断，比如：深圳"></label>
+  <p class="hint">时钟页显示这个城市的天气，问它天气也按这里。也可以直接跟它说「我在深圳」。</p>
+</div>
 
 <div id="sdCard" hidden>
 <h2>SD 卡</h2>
@@ -140,13 +175,7 @@ button.mini{padding:7px 10px}
   <p class="hint">要 FAT32 格式。64GB 以上的卡出厂多是 exFAT，先在电脑上格式化成 FAT32 再插。没有插卡检测，插拔后点「重新检测」。</p>
 </div>
 </div>
-
-<h2>人设提示词</h2>
-<textarea id="prompt" rows="4" placeholder="留空用默认提示词"></textarea>
-
-<h2>长期记忆</h2>
-<p class="hint">对话里它会自己往里记（一行一条）；这里能看到全部并手改，删掉就不记得了。<span id="memSize"></span></p>
-<textarea id="memory" rows="5"></textarea>
+</section>
 </main>
 <div class="save"><div><span id="msg"></span><button class="primary" id="save" disabled>保存</button></div></div>
 <script>
@@ -180,6 +209,27 @@ const PRESETS = [
 
 const $ = s => document.querySelector(s);
 const esc = s => String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const gb = b => (b / 1073741824).toFixed(1) + ' GB';
+
+// 一级菜单右边那行字：各块读到数据后填进 sum 再重画；没读到的项不显示
+const sum = {};
+function drawMenu() {
+  if (sum.missing) {
+    const el = $('#sum_ai');
+    el.textContent = sum.missing.length ? '还没选：' + sum.missing.join('、') : '对话 · 识别 · 合成都选好了';
+    el.className = sum.missing.length ? 'err' : '';
+  }
+  const listen = [];
+  if (sum.radio !== undefined) listen.push(`电台 ${sum.radio}`);
+  if (sum.pod !== undefined) listen.push(`播客 ${sum.pod}`);
+  if (sum.music !== undefined) listen.push(sum.music ? '在线音乐' : '在线音乐没设');
+  if (listen.length) $('#sum_listen').textContent = listen.join(' · ');
+  const dev = [];
+  if (sum.wifi !== undefined) dev.push(sum.wifi ? '已连 ' + sum.wifi : 'Wi-Fi 没连');
+  if (sum.city) dev.push(sum.city);
+  if (sum.sd) dev.push(sum.sd.state === 'ready' ? 'SD ' + gb(sum.sd.total) : sum.sd.state === 'unsupported' ? 'SD 格式不支持' : '没插 SD 卡');
+  if (dev.length) $('#sum_device').textContent = dev.join(' · ');
+}
 let cfg = {providers: [], roles: {}, limits: {providers: 8, models: 30, memory: 2000}};
 let open = null, picker = null;  // 正在编辑的供应商、拉回来的模型列表
 
@@ -336,6 +386,7 @@ function renderRoles() {
   const missing = ['chat', 'asr', 'tts'].filter(r => !(cfg.roles[r] || {}).p).map(r => ({chat: '对话', asr: '语音识别', tts: '语音合成'})[r]);
   $('#missing').hidden = !missing.length;
   $('#missing').textContent = `还没选：${missing.join('、')}。选全之前设备不能对话。`;
+  sum.missing = missing; drawMenu();
 }
 
 // 合成换了一家：音色不在这家的列表里就换成它的第一个
@@ -411,6 +462,7 @@ async function loadWifi() {
       box.appendChild(row);
     }
     $('#wifiAdd').title = `已存 ${w.saved.length} / ${w.max} 个`;
+    sum.wifi = w.current || ''; drawMenu();
   } catch (e) { wifiMsg('读取 Wi-Fi 列表失败，刷新再试', 'err'); }
 }
 async function wifiPost(path, body) {
@@ -465,6 +517,7 @@ async function loadRadio() {
     box.appendChild(row);
   });
   $('#radioAdd').title = `已存 ${r.stations.length} / ${r.max} 个`;
+  $('#menu_listen').hidden = false; sum.radio = r.stations.length; drawMenu();
 }
 async function radioPost(path, body) {
   try {
@@ -492,7 +545,7 @@ async function loadSd() {
     r = await res.json();
   } catch (e) { return; }
   $('#sdCard').hidden = false;
-  const gb = b => (b / 1073741824).toFixed(1) + ' GB';
+  sum.sd = r; drawMenu();
   const el = $('#sdState');
   if (r.state === 'ready') { el.textContent = `已插卡：共 ${gb(r.total)}，剩余 ${gb(r.free)}`; el.className = 'ok'; }
   else if (r.state === 'unsupported') { el.textContent = '卡的格式不支持，要格式化成 FAT32'; el.className = 'err'; }
@@ -528,6 +581,7 @@ async function loadPod() {
     box.appendChild(row);
   });
   $('#podSearch').title = `已订阅 ${r.podcasts.length} / ${r.max} 个`;
+  $('#menu_listen').hidden = false; sum.pod = r.podcasts.length; drawMenu();
 }
 async function podPost(path, body, done) {
   try {
@@ -580,10 +634,11 @@ async function musicPost(path, body, done) {
     $('#musicSite').value = (await res.json()).site || '';
   } catch (e) { return; }
   $('#musicCard').hidden = false;
+  $('#menu_listen').hidden = false; sum.music = !!$('#musicSite').value; drawMenu();
 })();
 $('#musicSave').onclick = async () => {
   $('#musicSave').disabled = true;
-  await musicPost('/music/site', {site: $('#musicSite').value.trim()}, '已保存');
+  if ((await musicPost('/music/site', {site: $('#musicSite').value.trim()}, '已保存')).ok) { sum.music = !!$('#musicSite').value.trim(); drawMenu(); }
   $('#musicSave').disabled = false;
 };
 $('#musicSearch').onclick = async () => {
@@ -605,6 +660,28 @@ $('#musicSearch').onclick = async () => {
   });
 };
 
+// 一级菜单 / 二级页面：用地址里的 #ai / #listen / #device 切换，手机的返回键也能回菜单。
+// 底部「保存」只在有要它保存的东西的页面出现（大模型；设备页的天气城市），收听页的东西都是点了就生效
+const PAGES = ['ai', 'listen', 'device'], SAVE_PAGES = ['ai', 'device'];
+let fromHome = false;
+function route() {
+  const cur = PAGES.includes(location.hash.slice(1)) ? location.hash.slice(1) : '';
+  $('#home').hidden = !!cur;
+  for (const pg of PAGES) $('#pg-' + pg).hidden = pg !== cur;
+  const save = SAVE_PAGES.includes(cur);
+  $('.save').hidden = !save;
+  document.body.classList.toggle('has-save', save);
+  if (!cur) fromHome = false;
+  window.scrollTo(0, 0);
+}
+document.querySelectorAll('.menu a').forEach(a => a.addEventListener('click', () => { fromHome = true; }));
+// 从菜单点进来的，返回就退一步历史（不然手机返回键又会回到这一页）；直接打开的子页面就回菜单
+document.querySelectorAll('.back').forEach(a => a.addEventListener('click', e => {
+  if (fromHome) { e.preventDefault(); history.back(); }
+}));
+window.addEventListener('hashchange', route);
+route();
+
 // 读到当前设置之前不让保存，免得空页面把已有设置冲掉
 async function load() {
   const c = await (await fetch('/config.json', {cache: 'no-store'})).json();
@@ -615,6 +692,7 @@ async function load() {
   $('#tts_speak').checked = c.roles.tts.speak !== false;
   $('#prompt').value = c.prompt || '';
   $('#wx_city').value = c.city || '';
+  sum.city = c.city || '';
   $('#memory').value = c.memory_md || '';
   memSize();
   renderPresets();
