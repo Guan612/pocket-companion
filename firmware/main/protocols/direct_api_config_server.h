@@ -30,6 +30,13 @@ void AddJsonHandler(const char* uri, bool post, JsonHandler handler);
 using UploadHandler = std::function<std::string(size_t length, const std::function<int(char*, size_t)>& read)>;
 void AddUploadHandler(const char* uri, UploadHandler handler);
 
+// 一个前缀下的所有地址（比如 "/app/"：应用自带的网页文件、网页发给应用的请求）。handler 收地址（不带 ?）、
+// 是不是 POST、请求体，填好内容类型和内容返回 true；返回 false 回 404。类型是 application/json、内容以
+// "!" 开头时回 {"ok":false,"error":原因}。要在 Start() 之前加
+using PrefixHandler = std::function<bool(const std::string& uri, bool post, const std::string& body,
+                                         std::string& type, std::string& out)>;
+void AddPrefixHandler(const char* prefix, PrefixHandler handler);
+
 }  // namespace DirectApiConfigServer
 
 #endif  // DIRECT_API_CONFIG_SERVER_H

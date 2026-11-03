@@ -190,9 +190,12 @@ SD 卡由系统按需挂载（见 `nomi_sdcard.h`）：没插卡时 `sd:/` 的�
 放的东西记在应用名下。收听卡片、表情页小条、下拉设置里都能看到、能控制，退出应用也接着放。
 
 ```c
-// src：sd:/ 的文件（还要 sd.read）或 http(s) 地址；flags 为 NOMI_PLAY_LIVE 是直播（电台：没有进度，断了自动重连）
-int32_t media_play(const char *src, const char *title, const char *artist, int32_t flags);
-void    media_meta(const char *cover_url, const char *lrc);  // 网上的歌：配封面（JPEG 地址）和 LRC 歌词
+// src：sd:/ 的文件（还要 sd.read）或 http(s) 地址。flags：NOMI_PLAY_LIVE 直播（电台：没有进度，断了自动重连）、
+// NOMI_PLAY_EPISODE 节目（播客：左右键是倒回 15 秒 / 快进 30 秒），都不写是一首歌。
+// start 从第几秒放；duration、bytes 是总长（秒）和文件大小（字节，网上的 MP3 按时间跳转要用），不知道填 0
+int32_t media_play(const char *src, const char *title, const char *artist, int32_t flags,
+                   int32_t start, int32_t duration, int32_t bytes);
+void    media_meta(const char *cover_url, const char *lrc);  // 网上的歌、节目：配封面（JPEG 地址）和 LRC 歌词
 void    media_control(int32_t cmd);   // NOMI_MEDIA_PAUSE / RESUME / STOP / TOGGLE
 void    media_seek(int32_t second);
 int32_t media_state(void);            // 0 没在放、1 连接中、2 在放、3 暂停
@@ -212,7 +215,13 @@ int32_t media_info(const char *path, char *buf, int32_t size);  // 读文件里�
 
 SD 卡上的歌，系统自己读文件里的标签（FLAC 的 Vorbis 注释、MP3 的 ID3），用读到的歌名歌手替换显示的，还会读内嵌封面和同名的 `.lrc` 歌词。
 
-格式：MP3、AAC、m4a、FLAC（最高 24 位 / 96kHz）、WAV。
+网上的歌、节目，系统放之前先探一下：
+- https 的地址先试 http，能用就走 http（不占 TLS 要的内部 RAM）。
+- 按文件头认格式（扩展名、响应头常对不上，m4a 写成 .aac 之类）。
+- 歌如果不是音频（下架后跳到网页之类），`media_play` 返回 `NOMI_E_NOT_FOUND`，应用好换下一首。节目探不出来也照样试着放。
+- 应用放的节目，进度由应用自己记（`media_position`），系统不记。
+
+格式：MP3、AAC、m4a、FLAC（最高 24 位 / 96kHz，只限 SD 卡）、WAV（只限 SD 卡）。
 
 ### 大模型和语音（权限 `assistant`）
 
@@ -224,7 +233,7 @@ int32_t voice_arg(char *buf, int32_t size);         // 收到 NOMI_EV_VOICE 时�
 void    voice_reply(const char *text, int32_t end); // 回话；end = 1 时这句说完就回待机
 ```
 
-- **回话时机**：要在处理这个 `NOMI_EV_VOICE` 的那次 `nomi_event` 里回，系统最多等 5 秒。不回话的话，大模型收到的是"已交给「应用名」"。
+- **回话时机**：要在处理这个 `NOMI_EV_VOICE` 的那次 `nomi_event` 里回，系统最多等 25 秒（在线点歌要搜、取歌曲页）。不回话的话，大模型收到的是"已交给「应用名」"。
 - **开始放歌这类事**：回话时带 `end = 1`。不然对话还开着，声音出不来。
 - **没找到、做不了**：如实回话（比如"SD 卡里没找到"），大模型会换别的办法。
 
@@ -245,12 +254,31 @@ void    nomi_log(const char *text);                         // 打到串口日�
 ### 联网（权限 `net`）
 
 ```c
-// GET 一个 http(s) 地址（跟着跳转），正文最多 size 字节（多的截掉，一次最多 256KB）；返回字节数，没联网 NOMI_E_NO_NET
+// GET 一个 http(s) 地址（跟着跳转），正文最多 size 字节（够了就断开，一次最多 512KB）；返回字节数，
+// 没联网 NOMI_E_NO_NET，别的失败（连不上、不是 200）NOMI_E_FAIL。最多等 20 秒，收到多少算多少
 int32_t net_get(const char *url, char *buf, int32_t size);
+// 同上，收到 until 出现 count 次就不往下收：RSS 动辄几 MB，只要最新 10 期就 until = "</item>"、count = 10
+int32_t net_get_until(const char *url, char *buf, int32_t size, const char *until, int32_t count);
 ```
 
 - 会卡住几秒，但跑在应用自己的线程里，不影响界面。
 - 设备内部 RAM 只够同时开一条 https 连接：如果正在放的是 https 的流，系统先暂停它，取完再接着放。
+- 拿回来的 JSON、XML、网页用 `tools/app-sdk/nomi_text.h` 里的小工具拆，见第 10 节。
+
+### 网页（应用自带的设置页）
+
+有些设置在设备上不好弄：要打字（搜播客、填网址），或者要列一长串。应用可以自带一个网页：
+
+- 包里放 `assets/web/index.html`（还可以有 js、css、图片）。设备网页设置页的「设备 → 应用」里，这个应用旁边就会出现「设置」，打开的是 `http://<设备>/app/<id>/`。
+- 网页里 POST 到相对地址 `call`，请求体交给应用（`NOMI_EV_WEB`）。应用回的内容（一般是 JSON，最多 32KB）原样回给网页。
+- 回话要在这次 `nomi_event` 里给，系统最多等 60 秒，可以先联网搜一下再回。应用没在跑时，系统先在后台把它拉起来。
+
+```c
+int32_t web_body(char *buf, int32_t size);  // 收到 NOMI_EV_WEB 时：取请求体
+void    web_reply(const char *text);         // 回给网页
+```
+
+例子：音乐应用的网页管播客订阅（搜索、订阅、取消、放最新一期）和在线音乐的网站地址。
 
 ## 6. 权限
 
@@ -260,7 +288,7 @@ int32_t net_get(const char *url, char *buf, int32_t size);
 | `media` | 让系统播放器放歌、控制播放 |
 | `assistant` | 给大模型加上下文、注册语音指令、让它念出来 |
 | `keep_awake` | 打开时不息屏 |
-| `net` | 联网（`net_get`） |
+| `net` | 联网（`net_get` `net_get_until`） |
 
 没写在 `permissions` 里的接口，调了返回 `NOMI_E_DENIED`。
 
@@ -300,10 +328,11 @@ int32_t net_get(const char *url, char *buf, int32_t size);
 | 项 | 限制 |
 |---|---|
 | `app.wasm` 大小 | 1MB |
-| 运行内存 | `memory_kb`，最大 1MB（PSRAM） |
+| 运行内存 | `memory_kb`，最大 1MB（PSRAM）。常驻的应用要省着用：PSRAM 总共就剩 2MB 左右，播放器放长 m4a 节目时还要 1MB 上下 |
 | 一次事件处理 | 2 秒 |
 | 同时运行 | 4 个应用（前台一个，其余在后台） |
-| 语音指令回话 | 5 秒 |
+| 语音指令回话 | 25 秒 |
+| 网页请求回话 | 60 秒 |
 | 一次读文件 | 32KB |
 
 ## 10. 开发工具
@@ -313,16 +342,18 @@ int32_t net_get(const char *url, char *buf, int32_t size);
 ```
 tools/app-sdk/
   nomi_sdk.h      接口声明、常量、几个小工具函数（字符串、格式化，不带完整的 C 库）
-  build.py        编译 + 打成 .npk：python build.py 应用目录
+  nomi_text.h     处理文字的小工具（纯 C）：查找、拷贝、XML / HTML 字段、JSON 字段、URL 编码、base64、哈希
+  build.py        编译 + 打成 .npk：python build.py 应用目录（目录里所有 .c 一起编）
   examples/       示例应用
 ```
 
-编译大致是这样（`build.py` 替你调）：
+编译大致是这样（`build.py` 替你调；不带调试信息，不然 app.wasm 要大两三倍）：
 
 ```
-zig cc -target wasm32-freestanding -O2 -nostdlib \
-  -Wl,--no-entry -Wl,--export=nomi_main -Wl,--export=nomi_event -Wl,--allow-undefined \
-  -o app.wasm app.c
+zig cc -target wasm32-freestanding -O2 -g0 -nostdlib \
+  -Wl,--no-entry -Wl,--strip-all -Wl,-z,stack-size=16384 \
+  -Wl,--initial-memory=<memory_kb> -Wl,--max-memory=<memory_kb> \
+  -o app.wasm *.c
 ```
 
 **调试**：浏览器模拟器也能装 `.npk`。它用浏览器自带的 WebAssembly 跑应用，接口和设备上是同一套，改完不用刷机就能看效果。
@@ -398,15 +429,16 @@ int32_t nomi_event(int32_t type, int32_t id, int32_t value)
 | 进程 | ✓ 每个应用一个进程、界面挂上 / 拿下、后台常驻（有卡片、在放歌）、闲置后结束、有事时在后台拉起；✗ 2 秒无响应自动关 |
 | 界面 | ✓ `ui_page` `ui_page_close` `ui_text` `ui_item` `ui_button` `ui_set_text` `ui_set_hidden` `ui_remove` `ui_toast` `ui_player` `ui_tile` `ui_target` `ui_open`；✗ 开关、滑杆、进度条、图片、阅读器、画布 |
 | 存储 | ✓ `fs_list` `fs_size` `fs_read` `kv_get` `kv_set`（`data/kv.json`）；✗ `fs_write` `fs_remove` |
-| 播放 | ✓ `media_play`（本地 / 网上 / 直播）`media_meta` `media_control` `media_seek` `media_state` `media_position` `media_duration` `media_mine` `media_info`；放完、上一首、下一首、放都会通知应用 |
-| 联网 | ✓ `net_get` |
+| 播放 | ✓ `media_play`（本地 / 网上的歌 / 节目 / 直播，能指定从第几秒放；网上的先探格式）`media_meta` `media_control` `media_seek` `media_state` `media_position` `media_duration` `media_mine` `media_info`；放完、上一首、下一首、放都会通知应用 |
+| 联网 | ✓ `net_get` `net_get_until` |
+| 网页 | ✓ 应用自带设置页（`assets/web/`、`/app/<id>/`、`call` → `NOMI_EV_WEB`、`web_body` `web_reply`） |
 | 大模型 | ✓ manifest 的 `voice` + `self.app.command`、`voice_arg` `voice_reply` `assistant_context`；✗ `assistant_say` |
 | 其他 | ✓ `time_now` `timer_start` `timer_stop` `nomi_log`；✗ `keep_awake` |
-| 事件 | ✓ 点击、返回、关闭、定时器、语音、播放、SHOW / HIDE；✗ 暂停 / 恢复（浮层、睡眠） |
+| 事件 | ✓ 点击、返回、关闭、定时器、语音、网页、播放、SHOW / HIDE；✗ 暂停 / 恢复（浮层、睡眠） |
 | 安装 | ✓ 网页上传 `.npk`、开机扫描、更新保留数据、应用管理和网页删除；✗ 装到机器内部、从 SD 卡上的安装包装、权限确认界面 |
-| 工具 | ✓ `tools/app-sdk/`：`nomi_sdk.h`、`build.py`（编译 + 打包）、`wasm_info.py`（看导入导出）、`examples/counter` |
+| 工具 | ✓ `tools/app-sdk/`：`nomi_sdk.h`、`nomi_text.h`、`build.py`（编译 + 打包，去掉调试信息）、`wasm_info.py`（看导入导出）、`examples/counter` |
 
-| 自带应用 | ✓ `apps/music` v0.2：SD 卡按文件夹浏览、队列和三种播放模式、电台台单、首页卡片、`play` / `skip` / `mode` 三个指令 |
+| 自带应用 | ✓ `apps/music` v0.3：本地（按文件夹排队列、三种播放模式）、电台、播客（订阅、最新 10 期、每个播客记听到哪）、在线点歌（搜、歌词、封面）、首页卡片、自带网页（订阅、音乐网站）、`play` `skip` `mode` `podcast` `subscribe` `online` 六个指令 |
 
 源码和安装包放在哪：
 

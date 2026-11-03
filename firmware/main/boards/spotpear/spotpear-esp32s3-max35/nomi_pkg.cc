@@ -506,6 +506,8 @@ std::string NomiPkg::ListJson() {
             uint64_t total = sd ? TreeSize(p->dir) : 0, data = sd ? TreeSize(p->dir + "/data") : 0;
             cJSON_AddNumberToObject(item, "size", static_cast<double>(total - data));
             cJSON_AddNumberToObject(item, "data", static_cast<double>(data));
+            struct stat st;  // 应用自带网页设置页
+            cJSON_AddBoolToObject(item, "web", sd && stat((p->dir + "/assets/web/index.html").c_str(), &st) == 0);
             cJSON* perms = cJSON_AddArrayToObject(item, "permissions");
             for (const auto& perm : p->permissions) cJSON_AddItemToArray(perms, cJSON_CreateString(perm.c_str()));
             cJSON_AddItemToArray(arr, item);
@@ -552,6 +554,41 @@ std::string NomiPkg::OpenJson(const std::string& body) {
     DisplayLockGuard ui(display());
     if (!nomi_app_open(s.c_str())) return Error("打不开：没装这个应用，或者它现在不能用");
     return "{\"ok\":true}";
+}
+
+bool NomiPkg::WebRequest(const std::string& uri, bool post, const std::string& body, std::string& type,
+                         std::string& out) {
+    // /app/<id>/<rest>
+    const std::string prefix = "/app/";
+    if (uri.rfind(prefix, 0) != 0) return false;
+    size_t slash = uri.find('/', prefix.size());
+    std::string id = uri.substr(prefix.size(), slash == std::string::npos ? std::string::npos : slash - prefix.size());
+    std::string rest = slash == std::string::npos ? "" : uri.substr(slash + 1);
+    const NomiPackage* pkg = Find(id);
+    if (!pkg) return false;
+    if (post) {
+        if (rest != "call") return false;
+        type = "application/json";
+        out = NomiWasm::WebCall(id, body);
+        return true;
+    }
+    if (rest.empty()) rest = "index.html";
+    if (rest.find("..") != std::string::npos || rest.find('\\') != std::string::npos) return false;
+    NomiSdCard::Use sd;
+    if (!sd) return false;
+    out = ReadSmallFile(pkg->dir + "/assets/web/" + rest, 512 * 1024);
+    if (out.empty()) return false;
+    static const struct {
+        const char *ext, *type;
+    } kTypes[] = {{".html", "text/html; charset=utf-8"}, {".js", "application/javascript"}, {".css", "text/css"},
+                  {".json", "application/json"},        {".png", "image/png"},             {".jpg", "image/jpeg"},
+                  {".svg", "image/svg+xml"}};
+    type = "application/octet-stream";
+    for (const auto& t : kTypes) {
+        size_t n = strlen(t.ext);
+        if (rest.size() > n && rest.compare(rest.size() - n, n, t.ext) == 0) type = t.type;
+    }
+    return true;
 }
 
 std::string NomiPkg::RemoveJson(const std::string& body) {

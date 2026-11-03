@@ -48,6 +48,10 @@ public:
     std::string ListJson();
     std::string RemoveJson(const std::string& body);
     std::string OpenJson(const std::string& body);  // POST /apps/open {"id":…}：在设备上打开
+    // 应用自带的网页：GET /app/<id>/<文件> 读包里 assets/web/ 下的文件（不写文件名是 index.html），
+    // POST /app/<id>/call 把请求体交给应用（NOMI_EV_WEB）、回它给的内容。不认识的返回 false（404）
+    bool WebRequest(const std::string& uri, bool post, const std::string& body, std::string& type,
+                    std::string& out);
 
     bool Remove(const std::string& id);  // 删程序和数据、从桌面去掉
     int Count();

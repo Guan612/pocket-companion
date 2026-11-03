@@ -42,16 +42,17 @@ namespace {
 constexpr uint32_t kWasmStack = 16 * 1024;      // 解释器给应用开的栈（运行时从 PSRAM 分）
 constexpr uint32_t kThreadStack = 32 * 1024;    // 每个进程的 pthread 栈（PSRAM）
 constexpr int kMaxRead = 32 * 1024;             // 一次读文件最多多少
-constexpr size_t kMaxNet = 256 * 1024;          // 一次 net_get 最多多少
+constexpr size_t kMaxNet = 512 * 1024;          // 一次 net_get 最多多少
 constexpr size_t kMaxWasm = 1024 * 1024;
 constexpr size_t kMaxProcs = 4;                 // 同时跑着的应用最多几个
 constexpr int64_t kIdleExitUs = 30 * 1000000LL;  // 在后台、没理由留着多久后结束
-constexpr int kVoiceWaitMs = 5000;               // 语音指令等应用回话最多多久（工具在主循环里跑，别等太久）
+constexpr int kVoiceWaitMs = 25000;              // 语音指令等应用回话最多多久（在线点歌要搜、取歌曲页，慢的网站十几秒）
+constexpr int kWebWaitMs = 60000;                // 网页请求等应用回话最多多久（应用可能要联网搜一下）
 
 // 和 tools/app-sdk/nomi_sdk.h 一致
 enum {
     EV_CLICK = 1, EV_CHANGE, EV_BACK, EV_PAUSE, EV_RESUME, EV_CLOSE, EV_TIMER, EV_VOICE, EV_READER, EV_MEDIA,
-    EV_SHOW, EV_HIDE
+    EV_SHOW, EV_HIDE, EV_WEB
 };
 enum { TEXT_TITLE = 0, TEXT_BODY, TEXT_MUTED };
 enum { MEDIA_FINISHED = 1, MEDIA_NEXT = 2, MEDIA_PREV = 3, MEDIA_PLAY = 4 };
@@ -86,12 +87,12 @@ struct Proc : std::enable_shared_from_this<Proc> {
     int64_t idle_since = 0;  // s_procs_mutex 里读写
     cJSON* kv = nullptr;
     std::map<int32_t, TimerSlot*> timers;  // 只在进程自己的线程里动
-    // 大模型相关（text_mutex）
-    std::mutex text_mutex;
+    // 大模型、网页发来的请求（text_mutex）：一次一个（request_mutex），应用处理完 voice_done
+    std::mutex text_mutex, request_mutex;
     std::string context;
     SemaphoreHandle_t voice_done = nullptr;
-    std::string voice_arg, voice_reply;
-    bool voice_end = false;
+    std::string req_arg, req_reply;
+    bool req_end = false;
 
     ~Proc() {
         if (queue) vQueueDelete(queue);
@@ -762,14 +763,42 @@ int32_t kv_set(wasm_exec_env_t env, const char* key, const char* value) {
 
 /* ---------- 播放（权限 media）：交给系统播放器，放的东西记在这个应用名下 ---------- */
 
-// flags：1 = 直播（电台：没有进度，断了自动重连）；0 = 一首歌 / 一期节目（能跳转，放完来 MEDIA 事件）。
-// src：sd:/ 的文件（还要 sd.read）或 http(s) 地址
-int32_t media_play(wasm_exec_env_t env, const char* src, const char* title, const char* artist, int32_t flags) {
+// 网上的一首 / 一期先探一下：https 的先试 http（不占 TLS 的内部 RAM）；按文件头认格式（扩展名、响应头
+// 常对不上，m4a 写成 .aac 之类）。探到了返回能用的地址；都不是音频（下架了跳到网页之类）返回空
+std::string ProbeRemote(const std::string& url, NomiRadio::Station::Format* format) {
+    std::vector<std::string> tries;
+    if (url.rfind("https://", 0) == 0) tries.push_back("http://" + url.substr(8));
+    tries.push_back(url);
+    for (const auto& u : tries) {
+        auto& radio = NomiRadio::GetInstance();
+        bool held = u.rfind("https://", 0) == 0 && radio.HoldForHttps();
+        std::string head;
+        bool ok = nomi::HttpGet(u, head, 16);
+        if (held) radio.ReleaseHttpsHold();
+        if (ok && (*format = NomiRadio::SniffFormat(head)) != NomiRadio::Station::kAuto) return u;
+    }
+    return "";
+}
+
+// flags：1 直播（电台：没有进度，断了自动重连）；2 节目（播客：按节目显示，左右键是倒回 15 秒 / 快进 30 秒）；
+// 都没有是一首歌。src：sd:/ 的文件（还要 sd.read）或 http(s) 地址。start 从第几秒放；duration、bytes 是
+// 总长（秒）和文件大小（字节，网上的 MP3 按时间跳转要用），不知道填 0
+int32_t media_play(wasm_exec_env_t env, const char* src, const char* title, const char* artist, int32_t flags,
+                   int32_t start, int32_t duration, int32_t bytes) {
     Proc* p = Ctx(env);
     if (!p->pkg->Has("media")) return E_DENIED;
     std::string s = src ? src : "", url;
-    if (s.rfind("http://", 0) == 0 || s.rfind("https://", 0) == 0) {
+    bool remote = s.rfind("http://", 0) == 0 || s.rfind("https://", 0) == 0;
+    bool live = (flags & 1) && remote, show = (flags & 2) && !live;
+    auto format = NomiRadio::Station::kAuto;
+    if (remote) {
         url = s;
+        if (!live) {
+            if (!nomi::NetworkUp()) return E_NO_NET;
+            std::string ok = ProbeRemote(s, &format);
+            if (!ok.empty()) url = ok;
+            else if (!show) return E_NOT_FOUND;  // 歌：不是音频就算放不了（应用好换下一首）；节目探不到也试着放
+        }
     } else {
         int32_t err;
         url = Resolve(p, src, false, &err);
@@ -777,13 +806,17 @@ int32_t media_play(wasm_exec_env_t env, const char* src, const char* title, cons
         struct stat st;
         if (stat(url.c_str(), &st) != 0) return E_NOT_FOUND;
     }
-    bool live = (flags & 1) && url[0] != '/';
     NomiRadio::Station item;
     item.url = url;
     item.name = title && *title ? title : url.substr(url.rfind('/') + 1);
     item.podcast = artist ? artist : "";
-    item.local = url[0] == '/';
-    item.episode = item.song = !live;
+    item.local = !remote;
+    item.episode = !live;
+    item.song = !live && !show;
+    item.start = std::max(0, static_cast<int>(start));
+    item.duration = std::max(0, static_cast<int>(duration));
+    item.bytes_per_sec = bytes > 0 && duration > 0 ? bytes / duration : 0;
+    item.format = format;
     item.owner = p->pkg->id;
     NomiRadio::GetInstance().PlayEpisode(item);
     if (item.local) NomiMusic::GetInstance().ShowLocal(url);
@@ -795,7 +828,7 @@ int32_t media_play(wasm_exec_env_t env, const char* src, const char* title, cons
 void media_meta(wasm_exec_env_t env, const char* cover_url, const char* lrc) {
     Proc* p = Ctx(env);
     NomiRadio::Station st = NomiRadio::GetInstance().Current();
-    if (!p->pkg->Has("media") || st.owner != p->pkg->id || st.local || !st.song) return;
+    if (!p->pkg->Has("media") || st.owner != p->pkg->id || st.local || !st.episode) return;
     NomiMusic::GetInstance().ShowRemote(st.url, cover_url ? cover_url : "", lrc ? lrc : "");
 }
 
@@ -844,23 +877,46 @@ int32_t media_info(wasm_exec_env_t env, const char* path, char* buf, uint32_t si
 
 /* ---------- 联网（权限 net） ---------- */
 
-// GET 一个地址（跟着跳转），正文最多 size 字节、多的截掉；成功（HTTP 200）返回字节数
-int32_t net_get(wasm_exec_env_t env, const char* url, char* buf, uint32_t size) {
-    Proc* p = Ctx(env);
+// GET 一个地址（跟着跳转），正文最多 size 字节（够了就断开）。until 不空时数到它出现 count 次就不往下收了
+// （RSS 只要最新几期：until = "</item>"）；最多等 20 秒，收到多少算多少。成功（HTTP 200）返回字节数
+int32_t NetGet(Proc* p, const char* url, char* buf, uint32_t size, const char* until, int32_t count) {
     if (!p->pkg->Has("net")) return E_DENIED;
     std::string u = url ? url : "";
     if (u.rfind("http://", 0) != 0 && u.rfind("https://", 0) != 0) return E_FAIL;
     if (!nomi::NetworkUp()) return E_NO_NET;
+    std::string mark = until ? until : "";
+    int found = 0;
+    size_t scanned = 0;
+    int64_t deadline = esp_timer_get_time() + 20 * 1000000LL;
+    auto enough = [&](const std::string& b) {
+        if (esp_timer_get_time() > deadline) return true;
+        if (mark.empty() || count <= 0) return false;
+        for (size_t at; (at = b.find(mark, scanned)) != std::string::npos;) {
+            found++;
+            scanned = at + mark.size();
+        }
+        if (b.size() > scanned + mark.size()) scanned = b.size() - mark.size();
+        return found >= count;
+    };
     // 内部 RAM 只够同时一条 TLS：正在放的若是 https，先让出来，取完接着放
     auto& radio = NomiRadio::GetInstance();
     bool held = u.rfind("https://", 0) == 0 && radio.HoldForHttps();
     std::string body;
-    bool ok = nomi::HttpGet(u, body, std::min<size_t>(size, kMaxNet));
+    bool ok = nomi::HttpGet(u, body, std::min<size_t>(size, kMaxNet), nullptr, enough);
     if (held) radio.ReleaseHttpsHold();
     if (!ok) return E_FAIL;
     size_t n = std::min<size_t>(body.size(), size);
     memcpy(buf, body.data(), n);
     return n;
+}
+
+int32_t net_get(wasm_exec_env_t env, const char* url, char* buf, uint32_t size) {
+    return NetGet(Ctx(env), url, buf, size, nullptr, 0);
+}
+
+int32_t net_get_until(wasm_exec_env_t env, const char* url, char* buf, uint32_t size, const char* until,
+                      int32_t count) {
+    return NetGet(Ctx(env), url, buf, size, until, count);
 }
 
 /* ---------- 大模型（权限 assistant） ---------- */
@@ -873,12 +929,12 @@ void assistant_context(wasm_exec_env_t env, const char* text) {
     p->context = text ? std::string(text).substr(0, 600) : "";
 }
 
-// 语音指令（NOMI_EV_VOICE）带的参数
+// 语音指令（NOMI_EV_VOICE）、网页请求（NOMI_EV_WEB）带的参数
 int32_t voice_arg(wasm_exec_env_t env, char* buf, uint32_t size) {
     Proc* p = Ctx(env);
     std::lock_guard<std::mutex> lock(p->text_mutex);
     int32_t n;
-    CopyOut(p->voice_arg, buf, size, &n);
+    CopyOut(p->req_arg, buf, size, &n);
     return n;
 }
 
@@ -886,8 +942,15 @@ int32_t voice_arg(wasm_exec_env_t env, char* buf, uint32_t size) {
 void voice_reply(wasm_exec_env_t env, const char* text, int32_t end) {
     Proc* p = Ctx(env);
     std::lock_guard<std::mutex> lock(p->text_mutex);
-    p->voice_reply = text ? std::string(text).substr(0, 600) : "";
-    p->voice_end = end != 0;
+    p->req_reply = text ? std::string(text).substr(0, 600) : "";
+    p->req_end = end != 0;
+}
+
+// 回给网页的（一般是 JSON），最多 32KB
+void web_reply(wasm_exec_env_t env, const char* text) {
+    Proc* p = Ctx(env);
+    std::lock_guard<std::mutex> lock(p->text_mutex);
+    p->req_reply = text ? std::string(text).substr(0, 32 * 1024) : "";
 }
 
 /* ---------- 其他 ---------- */
@@ -955,7 +1018,7 @@ NativeSymbol kNatives[] = {
     {"fs_read", (void*)fs_read, "($i*~)i", nullptr},
     {"kv_get", (void*)kv_get, "($*~)i", nullptr},
     {"kv_set", (void*)kv_set, "($$)i", nullptr},
-    {"media_play", (void*)media_play, "($$$i)i", nullptr},
+    {"media_play", (void*)media_play, "($$$iiii)i", nullptr},
     {"media_meta", (void*)media_meta, "($$)", nullptr},
     {"media_control", (void*)media_control, "(i)", nullptr},
     {"media_seek", (void*)media_seek, "(i)", nullptr},
@@ -965,9 +1028,12 @@ NativeSymbol kNatives[] = {
     {"media_mine", (void*)media_mine, "()i", nullptr},
     {"media_info", (void*)media_info, "($*~)i", nullptr},
     {"net_get", (void*)net_get, "($*~)i", nullptr},
+    {"net_get_until", (void*)net_get_until, "($*~$i)i", nullptr},
     {"assistant_context", (void*)assistant_context, "($)", nullptr},
     {"voice_arg", (void*)voice_arg, "(*~)i", nullptr},
     {"voice_reply", (void*)voice_reply, "($i)", nullptr},
+    {"web_body", (void*)voice_arg, "(*~)i", nullptr},
+    {"web_reply", (void*)web_reply, "($)", nullptr},
     {"time_now", (void*)time_now, "()I", nullptr},
     {"timer_start", (void*)timer_start, "(iii)", nullptr},
     {"timer_stop", (void*)timer_stop, "(i)", nullptr},
@@ -1024,14 +1090,16 @@ void RunProc(Proc* p) {
         LoadKv(p);
         int64_t t0 = esp_timer_get_time();
         if (!wasm_runtime_call_wasm(env, fmain, 0, nullptr)) problem = wasm_runtime_get_exception(inst);
-        ESP_LOGI(TAG, "%s started in %lld ms%s", pkg->id.c_str(), (esp_timer_get_time() - t0) / 1000,
-                 p->show_after_main ? "" : " (background)");
+        ESP_LOGI(TAG, "%s started in %lld ms%s, PSRAM free %u (largest %u)", pkg->id.c_str(),
+                 (esp_timer_get_time() - t0) / 1000, p->show_after_main ? "" : " (background)",
+                 static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_SPIRAM)),
+                 static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM)));
         if (problem.empty() && p->show_after_main && p->shown) deliver({EV_SHOW, 0, 0});
         while (problem.empty()) {
             Event ev;
             xQueueReceive(p->queue, &ev, portMAX_DELAY);
             deliver(ev);
-            if (ev.type == EV_VOICE) xSemaphoreGive(p->voice_done);
+            if (ev.type == EV_VOICE || ev.type == EV_WEB) xSemaphoreGive(p->voice_done);
             if (ev.type == EV_CLOSE) break;
         }
     }
@@ -1305,6 +1373,36 @@ bool MediaCommand(int code) {
     return true;
 }
 
+}  // namespace NomiWasm
+
+namespace {
+
+// 把一个请求（语音指令、网页）交给应用（没在跑就在后台拉起来），等它处理完。出错返回 "!原因"；
+// 应用没回话返回空
+std::string Request(const NomiPackage* pkg, int32_t type, int32_t id, const std::string& arg, int wait_ms,
+                    bool* end) {
+    ProcPtr p = FindOrSpawn(pkg->id);
+    if (!p) return "!「" + pkg->name + "」起不来";
+    std::lock_guard<std::mutex> one(p->request_mutex);  // 一次一个：回话放在同一个地方
+    {
+        std::lock_guard<std::mutex> lock(p->text_mutex);
+        p->req_arg = arg;
+        p->req_reply.clear();
+        p->req_end = false;
+    }
+    xSemaphoreTake(p->voice_done, 0);  // 清掉上次没人收的
+    Post(p.get(), type, id, 0);
+    if (xSemaphoreTake(p->voice_done, pdMS_TO_TICKS(wait_ms)) != pdTRUE) return "!「" + pkg->name + "」没回应";
+    std::lock_guard<std::mutex> lock(p->text_mutex);
+    if (p->exiting && p->req_reply.empty()) return "!「" + pkg->name + "」出错退出了";
+    if (end) *end = p->req_end;
+    return p->req_reply;
+}
+
+}  // namespace
+
+namespace NomiWasm {
+
 std::string VoiceCommand(const std::string& app, const std::string& command, const std::string& arg,
                          bool* end_conversation) {
     const NomiPackage* pkg = NomiPkg::GetInstance().Find(app);
@@ -1314,23 +1412,15 @@ std::string VoiceCommand(const std::string& app, const std::string& command, con
         if (pkg->voice[i].name == command) index = i;
     }
     if (index < 0) return "!「" + pkg->name + "」没有这个指令：" + command;
-    ProcPtr p = FindOrSpawn(pkg->id);
-    if (!p) return "!「" + pkg->name + "」起不来";
-    {
-        std::lock_guard<std::mutex> lock(p->text_mutex);
-        p->voice_arg = arg;
-        p->voice_reply.clear();
-        p->voice_end = false;
-    }
-    xSemaphoreTake(p->voice_done, 0);  // 清掉上次没人收的
-    Post(p.get(), EV_VOICE, index + 1, 0);
-    if (xSemaphoreTake(p->voice_done, pdMS_TO_TICKS(kVoiceWaitMs)) != pdTRUE) {
-        return "!「" + pkg->name + "」没回应";
-    }
-    std::lock_guard<std::mutex> lock(p->text_mutex);
-    if (p->exiting && p->voice_reply.empty()) return "!「" + pkg->name + "」出错退出了";
-    if (end_conversation) *end_conversation = p->voice_end;
-    return p->voice_reply.empty() ? "已交给「" + pkg->name + "」" : p->voice_reply;
+    std::string reply = Request(pkg, EV_VOICE, index + 1, arg, kVoiceWaitMs, end_conversation);
+    return reply.empty() ? "已交给「" + pkg->name + "」" : reply;
+}
+
+std::string WebCall(const std::string& app, const std::string& body) {
+    const NomiPackage* pkg = NomiPkg::GetInstance().Find(app);
+    if (!pkg) return "!没装这个应用：" + app;
+    std::string reply = Request(pkg, EV_WEB, 0, body, kWebWaitMs, nullptr);
+    return reply.empty() ? "{}" : reply;
 }
 
 std::string PromptContext() {

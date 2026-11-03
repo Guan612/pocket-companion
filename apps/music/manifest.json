@@ -1,28 +1,40 @@
 {
   "id": "nomi.music",
   "name": "音乐",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "api": 1,
-  "description": "放 SD 卡里的歌（按文件夹排队列，列表循环 / 单曲循环 / 随机）、听电台；首页收听卡片也是它",
+  "description": "SD 卡里的歌（按文件夹排队列，列表循环 / 单曲循环 / 随机）、电台、播客、在线点歌；首页收听卡片也是它",
   "icon": {
     "lines": [[[23, 5], [23, 26]], [[23, 5], [31, 9], [31, 14]]],
     "circles": [[11, 21, 13]]
   },
-  "permissions": ["sd.read", "media", "assistant"],
-  "memory_kb": 256,
+  "permissions": ["sd.read", "media", "assistant", "net"],
+  "memory_kb": 512,
   "tile": true,
   "voice": [
     {
       "name": "play",
-      "description": "放 SD 卡里的歌：arg 是歌名、歌手或文件夹名（按文件名搜），空字符串 = 接着放上次的。主人说\"放周杰伦\"\"放本地的歌\"\"接着放音乐\"时先试这个；回话说没找到再用 self.music.play 在线点"
+      "description": "放 SD 卡里的歌：arg 是歌名、歌手或文件夹名（按文件名搜），空字符串 = 接着放上次放的（本地、电台、播客、在线都算）"
     },
     {
       "name": "skip",
-      "description": "正在放音乐应用里的歌（或它的电台）时换一首：arg 填 next（下一首）或 prev（上一首）"
+      "description": "正在放音乐应用里的东西时换一首：arg 填 next 或 prev（播客是快进 30 秒 / 倒回 15 秒）"
     },
     {
       "name": "mode",
-      "description": "改播放模式：arg 填 列表循环、单曲循环 或 随机"
+      "description": "改本地歌的播放模式：arg 填 列表循环、单曲循环 或 随机"
+    },
+    {
+      "name": "podcast",
+      "description": "放播客：arg 是播客名（先找订阅，没有就去目录搜），放它最新一期，没听完的接着放；空字符串 = 接着听上次那期"
+    },
+    {
+      "name": "subscribe",
+      "description": "订阅播客：arg 是播客名，去播客目录搜，订第一个"
+    },
+    {
+      "name": "online",
+      "description": "在网上点歌：arg 是歌名，可以带歌手（\"晴天 周杰伦\"）。SD 卡里没有、或主人说在线听时用"
     }
   ]
 }

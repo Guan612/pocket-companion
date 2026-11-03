@@ -1,28 +1,25 @@
-// 音乐：放 SD 卡里的歌、听电台。
+// 音乐：SD 卡里的歌、电台、播客、在线点歌。
 //
-// 系统只管"放这一首"（解码、封面、歌词、进度条），放哪首、下一首放什么都在这里：
-// - 队列是一个文件夹里的歌（按文件名排），播放模式有列表循环 / 单曲循环 / 随机；放到哪首记在 kv 里，重启后接着用。
-// - 电台是 assets/stations.txt 里的台（一行"台名|地址"），上一个 / 下一个在台单里换。
-// - 首页的收听卡片是这个应用画的（manifest 里 "tile": true）：正在放 + 一个"打开音乐"的入口。
-// - 大模型能调的指令见 manifest 的 voice：放歌（按名字在 SD 卡里搜）、上一首下一首、播放模式。
-#include "nomi_sdk.h"
+// 系统只管"放这一首"（解码、封面、歌词、进度条），放哪首、下一首放什么都在应用里：
+// - 本地（这个文件）：队列是一个文件夹里的歌（按文件名排），列表循环 / 单曲循环 / 随机；放到哪首记在 kv 里。
+// - 电台（这个文件）：assets/stations.txt 里的台（一行"台名|地址"），上一个 / 下一个在台单里换。
+// - 播客（podcast.c）：订阅、最新几期、每个播客听到哪。
+// - 在线（online.c）：在主人填的音乐网站上搜歌、放、配歌词封面。
+// 首页的收听卡片是这个应用画的（manifest 里 "tile": true）。订阅、网站地址在应用自带的网页里管（assets/web）。
+#include "music.h"
 
 #define MAX_TRACKS 300
-#define NAME_LEN 128
-#define PATH_LEN 256
 #define MAX_STATIONS 40
-#define MAX_ROWS 320
+#define MAX_ROWS 200
 #define MAX_PAGES 8
 #define MAX_SCAN_DIRS 48
 
+char g_net[NET_BUF];
+int g_src = SRC_NONE;
+
 /* ---------- 小工具 ---------- */
 
-static void copy(char *dst, const char *src, int size)
-{
-    int i = 0;
-    for (; src[i] && i < size - 1; i++) dst[i] = src[i];
-    dst[i] = '\0';
-}
+static void copy(char *dst, const char *src, int size) { nomi_copy_n(dst, size, src, 0); }
 
 static int compare(const char *a, const char *b)
 {
@@ -100,6 +97,27 @@ static uint32_t rand_next(void)
     return g_seed >> 8;
 }
 
+int32_t json_str(char *out, int32_t size, const char *s)
+{
+    int32_t n = nomi_len(out);
+    if (n < size - 1) out[n++] = '"';
+    for (; *s && n < size - 2; s++) {
+        unsigned char c = (unsigned char)*s;
+        if (c == '"' || c == '\\') {
+            if (n >= size - 3) break;
+            out[n++] = '\\';
+            out[n++] = (char)c;
+        } else if (c < 0x20) {
+            out[n++] = ' ';
+        } else {
+            out[n++] = (char)c;
+        }
+    }
+    if (n < size - 1) out[n++] = '"';
+    out[n < size ? n : size - 1] = 0;
+    return n;
+}
+
 static char g_list[16384];  // fs_list 的结果
 
 // 一个文件夹里的东西拆成一行一个，放进 names（指向 g_list 里），文件夹在前、各自按名字排。返回个数（出错是负数）
@@ -128,7 +146,7 @@ static int list_dir(const char *dir, char **names, int max, int want_dirs)
     return count;
 }
 
-/* ---------- 队列和播放 ---------- */
+/* ---------- 本地：队列 ---------- */
 
 enum { MODE_LOOP, MODE_ONE, MODE_SHUFFLE };
 static const char *const kModeNames[] = {"列表循环", "单曲循环", "随机播放"};
@@ -142,7 +160,15 @@ static int g_index = -1;  // 队列里第几首（-1 还没挑）
 static char g_station_names[MAX_STATIONS][48];
 static char g_station_urls[MAX_STATIONS][200];
 static int g_station_count;
-static int g_station = -1;  // 放的是第几个台（-1 放的是队列里的歌）
+static int g_station = -1;  // 上次放的是第几个台
+
+static const char *const kSources[] = {"", "local", "radio", "podcast", "online"};
+
+void set_source(int src)
+{
+    g_src = src;
+    kv_set("last", kSources[src]);
+}
 
 // 文件夹里的歌排成队列
 static int load_queue(const char *dir)
@@ -165,17 +191,21 @@ static int find_track(const char *name)
     return -1;
 }
 
-static void update_context(void)
+void update_context(void)
 {
-    char text[400];
-    if (g_station >= 0) {
+    char text[600];
+    if (g_src == SRC_RADIO && g_station >= 0) {
         nomi_fmt(text, sizeof(text), "在听电台「%s」。", g_station_names[g_station]);
-    } else if (g_index >= 0) {
+    } else if (g_src == SRC_LOCAL && g_index >= 0) {
         char folder[NAME_LEN], title[NAME_LEN];
         last_part(folder, sizeof(folder), g_qdir);
         display_name(title, sizeof(title), g_tracks[g_index]);
         nomi_fmt(text, sizeof(text), "在放 SD 卡文件夹「%s」里的「%s」（第 %d 首，共 %d 首），播放模式%s。", folder, title,
                  g_index + 1, g_track_count, kModeNames[g_mode]);
+    } else if (g_src == SRC_PODCAST) {
+        pod_context(text, sizeof(text));
+    } else if (g_src == SRC_ONLINE) {
+        online_context(text, sizeof(text));
     } else {
         nomi_fmt(text, sizeof(text), "在音乐应用里，还没挑歌。");
     }
@@ -188,13 +218,12 @@ static int play_track(int i)
     char path[PATH_LEN + NAME_LEN], title[NAME_LEN];
     nomi_fmt(path, sizeof(path), "%s%s", g_qdir, g_tracks[i]);
     display_name(title, sizeof(title), g_tracks[i]);
-    int r = media_play(path, title, "", 0);
+    int r = media_play(path, title, "", 0, 0, 0, 0);
     if (r < 0) return r;
     g_index = i;
-    g_station = -1;
     kv_set("qdir", g_qdir);
     kv_set("qfile", g_tracks[i]);
-    kv_set("last", "local");
+    set_source(SRC_LOCAL);
     update_context();
     return 0;
 }
@@ -202,22 +231,18 @@ static int play_track(int i)
 static int play_station(int i)
 {
     if (i < 0 || i >= g_station_count) return NOMI_E_NOT_FOUND;
-    int r = media_play(g_station_urls[i], g_station_names[i], "电台", NOMI_PLAY_LIVE);
+    int r = media_play(g_station_urls[i], g_station_names[i], "电台", NOMI_PLAY_LIVE, 0, 0, 0);
     if (r < 0) return r;
     g_station = i;
     kv_set_int("station", i);
-    kv_set("last", "radio");
+    set_source(SRC_RADIO);
     update_context();
     return 0;
 }
 
-// 换一首：user 为 1 是主人点的上一首 / 下一首（单曲循环时也换），0 是放完了自动接
-static void step(int delta, int user)
+// 本地队列换一首：user 为 1 是主人点的上一首 / 下一首（单曲循环时也换），0 是放完了自动接
+static void local_step(int delta, int user)
 {
-    if (g_station >= 0) {
-        if (g_station_count) play_station((g_station + delta + g_station_count) % g_station_count);
-        return;
-    }
     if (g_track_count == 0 || g_index < 0) return;
     int next;
     if (!user && g_mode == MODE_ONE) {
@@ -236,16 +261,16 @@ static void step(int delta, int user)
     ui_toast("这个文件夹里的歌都放不了");
 }
 
-// 接着放上次的（没有就返回负数）
+// 接着放上次的那一路（没有就返回负数）
 static int resume_last(void)
 {
-    char last[16];
-    if (kv_get("last", last, sizeof(last)) > 0 && compare(last, "radio") == 0 && g_station >= 0) {
-        return play_station(g_station);
+    switch (g_src) {
+    case SRC_RADIO: return play_station(g_station);
+    case SRC_PODCAST: return pod_resume();
+    case SRC_ONLINE: return online_resume();
+    case SRC_LOCAL: return play_track(g_index);
+    default: return g_index >= 0 ? play_track(g_index) : NOMI_E_NOT_FOUND;
     }
-    if (g_index >= 0) return play_track(g_index);
-    if (g_station >= 0) return play_station(g_station);
-    return NOMI_E_NOT_FOUND;
 }
 
 static void load_stations(void)
@@ -275,7 +300,7 @@ static void load_stations(void)
 
 /* ---------- 界面 ---------- */
 
-enum { ROW_OPEN = 1, ROW_SD, ROW_RADIO, ROW_QDIR, ROW_DIR, ROW_SONG, ROW_STATION, ROW_MODE };
+enum { ROW_SD = 1, ROW_RADIO, ROW_QDIR, ROW_DIR, ROW_SONG, ROW_STATION, ROW_PODCASTS, ROW_ONLINE };
 
 // 可点的控件 → 干什么。page 是它在第几页（1 是首页），退页时把上面那页的扔掉
 static struct {
@@ -285,24 +310,25 @@ static struct {
 } g_rows[MAX_ROWS];
 static char g_row_names[MAX_ROWS][NAME_LEN];
 static int g_row_count;
-static int g_pages;                  // 现在压了几页（0 = 界面没挂着）
+int g_pages;                                  // 现在压了几页（0 = 界面没挂着）
 static char g_dirs[MAX_PAGES + 1][PATH_LEN];  // 浏览页对应的文件夹
 static int32_t g_mode_button;
-static int32_t g_tile_local, g_tile_radio;  // 首页卡片顶上的入口
-static int g_open_page;                     // 从卡片点进来要直接进哪页：1 SD 卡、2 电台
+static int32_t g_tile_buttons[4];  // 首页卡片顶上的入口：本地、电台、播客、在线
+static int g_open_page;            // 从卡片点进来要直接进哪页（ROW_SD 之类）
 
-static void add_row(int32_t id, int kind, int index, const char *name)
+int32_t add_row(int32_t id, int kind, int index, const char *name)
 {
-    if (id < 0 || g_row_count >= MAX_ROWS) return;
+    if (id < 0 || g_row_count >= MAX_ROWS) return id;
     g_rows[g_row_count].id = id;
     g_rows[g_row_count].page = (int8_t)g_pages;
     g_rows[g_row_count].kind = (int8_t)kind;
     g_rows[g_row_count].index = (int16_t)index;
     copy(g_row_names[g_row_count], name ? name : "", NAME_LEN);
     g_row_count++;
+    return id;
 }
 
-static void push_page(const char *title)
+void push_page(const char *title)
 {
     ui_page(title);
     g_pages++;
@@ -319,6 +345,9 @@ static void show_home(void)
     char sub[64];
     nomi_fmt(sub, sizeof(sub), "%d 个台", g_station_count);
     add_row(ui_item("电台", sub, ">"), ROW_RADIO, 0, "");
+    nomi_fmt(sub, sizeof(sub), "%d 个订阅", pod_count());
+    add_row(ui_item("播客", sub, ">"), ROW_PODCASTS, 0, "");
+    add_row(ui_item("在线音乐", online_ready() ? "上次搜到的歌" : "还没填音乐网站", ">"), ROW_ONLINE, 0, "");
     if (g_qdir[0]) {
         char name[NAME_LEN];
         last_part(name, sizeof(name), g_qdir);
@@ -354,7 +383,7 @@ static void show_dir(const char *dir, const char *title)
         char title_buf[NAME_LEN];
         display_name(title_buf, sizeof(title_buf), kept[i]);
         int folder = is_dir(kept[i]);
-        int playing = !folder && g_station < 0 && g_index >= 0 && compare(dir, g_qdir) == 0 &&
+        int playing = !folder && g_src == SRC_LOCAL && g_index >= 0 && compare(dir, g_qdir) == 0 &&
                       compare(kept[i], g_tracks[g_index]) == 0;
         add_row(ui_item(title_buf, folder ? "文件夹" : (playing ? "正在放" : ""), folder ? ">" : ""),
                 folder ? ROW_DIR : ROW_SONG, 0, kept[i]);
@@ -366,12 +395,13 @@ static void show_radio(void)
     push_page("电台");
     if (g_station_count == 0) ui_text("台单是空的。", NOMI_TEXT_MUTED);
     for (int i = 0; i < g_station_count; i++) {
-        add_row(ui_item(g_station_names[i], i == g_station ? "正在放" : "", ""), ROW_STATION, i, "");
+        add_row(ui_item(g_station_names[i], g_src == SRC_RADIO && i == g_station ? "正在放" : "", ""), ROW_STATION, i,
+                "");
     }
 }
 
 // 回到首页（挑了一首之后看「正在放」）
-static void back_home(void)
+void back_home(void)
 {
     while (g_pages > 1) {
         ui_page_close();
@@ -380,17 +410,27 @@ static void back_home(void)
     }
 }
 
-// 首页卡片：系统的「正在放」（带歌词），顶上原来标签的位置放两个入口
+static void open_page(int kind)
+{
+    if (kind == ROW_SD) show_dir("sd:/", "SD 卡");
+    else if (kind == ROW_RADIO) show_radio();
+    else if (kind == ROW_PODCASTS) pod_show_subs();
+    else if (kind == ROW_ONLINE) online_show();
+}
+
+// 首页卡片：系统的「正在放」（带歌词），顶上原来标签的位置放几个入口
 static void draw_tile(void)
 {
-    if (ui_now_playing("跟它说「放周杰伦」，或者点上面的「本地」挑歌") < 0) return;
-    g_tile_local = ui_button("本地", 0);
-    g_tile_radio = ui_button("电台", 0);
+    if (ui_now_playing("跟它说「放周杰伦」「放忽左忽右」，或者点上面的入口挑") < 0) return;
+    g_tile_buttons[0] = ui_button("本地", 0);
+    g_tile_buttons[1] = ui_button("电台", 0);
+    g_tile_buttons[2] = ui_button("播客", 0);
+    g_tile_buttons[3] = ui_button("在线", 0);
 }
 
 /* ---------- 大模型的指令（顺序和 manifest 的 voice 一致） ---------- */
 
-enum { VOICE_PLAY = 1, VOICE_SKIP, VOICE_MODE };
+enum { VOICE_PLAY = 1, VOICE_SKIP, VOICE_MODE, VOICE_PODCAST, VOICE_SUBSCRIBE, VOICE_ONLINE };
 
 // 在 SD 卡里按名字找：先广度优先一层层找文件名、文件夹名里带这个词的
 static int search(const char *word, char *found_dir, char *found_file)
@@ -435,12 +475,12 @@ static void voice(int command)
     if (command == VOICE_PLAY) {
         if (!arg[0]) {
             if (media_mine() && media_state() == 3) media_control(NOMI_MEDIA_RESUME);
-            else if (resume_last() < 0) REPLY("还没放过 SD 卡里的歌，问问主人想听哪首", 0);
+            else if (resume_last() < 0) REPLY("还没放过什么，问问主人想听哪首", 0);
             REPLY("好的，接着放", 1);
         }
         char dir[PATH_LEN], file[NAME_LEN];
         if (!search(arg, dir, file)) {
-            nomi_fmt(reply, sizeof(reply), "SD 卡里没找到「%s」；想在网上找可以用 self.music.play", arg);
+            nomi_fmt(reply, sizeof(reply), "SD 卡里没找到「%s」；在网上找用 command=online", arg);
             REPLY(reply, 0);
         }
         if (load_queue(dir) <= 0) REPLY("找到了文件夹，但里面没有能放的歌", 0);
@@ -453,8 +493,8 @@ static void voice(int command)
         REPLY(reply, 1);
     }
     if (command == VOICE_SKIP) {
-        if (!media_mine()) REPLY("现在放的不是音乐应用里的歌", 0);
-        step(compare(arg, "prev") == 0 ? -1 : 1, 1);
+        if (!media_mine()) REPLY("现在放的不是音乐应用里的", 0);
+        nomi_event(NOMI_EV_MEDIA, 0, nomi_equal(arg, "prev") ? NOMI_MEDIA_PREV : NOMI_MEDIA_NEXT);
         REPLY("好的", 1);
     }
     if (command == VOICE_MODE) {
@@ -466,6 +506,52 @@ static void voice(int command)
         nomi_fmt(reply, sizeof(reply), "已经换成%s", kModeNames[mode]);
         REPLY(reply, 0);
     }
+    if (command == VOICE_PODCAST) {
+        int r = pod_play_latest(arg);
+        if (r == NOMI_E_NOT_FOUND) {
+            nomi_fmt(reply, sizeof(reply), arg[0] ? "订阅里没有、播客目录也没搜到「%s」" : "还没听过播客，问问主人想听哪个", arg);
+            REPLY(reply, 0);
+        }
+        if (r < 0) REPLY("节目单拉不下来（网络不好？），过会儿再试", 0);
+        pod_context(reply, sizeof(reply));
+        REPLY(reply, 1);
+    }
+    if (command == VOICE_SUBSCRIBE) {
+        char name[128];
+        int r = pod_subscribe(arg, name, sizeof(name));
+        if (r < 0) {
+            nomi_fmt(reply, sizeof(reply), "播客目录里没搜到「%s」", arg);
+            REPLY(reply, 0);
+        }
+        nomi_fmt(reply, sizeof(reply), r == 0 ? "已订阅《%s》" : "《%s》已经订阅过了", name);
+        REPLY(reply, 0);
+    }
+    if (command == VOICE_ONLINE) {
+        char title[200];
+        int r = online_search_play(arg, title, sizeof(title));
+        if (r == NOMI_E_DENIED) REPLY("还没设置音乐网站：请主人在网页设置页的「应用 → 音乐 → 设置」里填", 0);
+        if (r < 0) {
+            nomi_fmt(reply, sizeof(reply), "音乐网站上没找到能放的「%s」", arg);
+            REPLY(reply, 0);
+        }
+        nomi_fmt(reply, sizeof(reply), "好的，放《%s》", title);
+        REPLY(reply, 1);
+    }
+}
+
+/* ---------- 网页（assets/web） ---------- */
+
+static void web(void)
+{
+    static char body[2048], out[24 * 1024];
+    web_body(body, sizeof(body));
+    out[0] = 0;
+    char cmd[32];
+    nomi_json_field(body, body + nomi_len(body), "cmd", cmd, sizeof(cmd));
+    if (nomi_starts(cmd, "pod_")) pod_web(body, out, sizeof(out));
+    else if (nomi_starts(cmd, "online_")) online_web(body, out, sizeof(out));
+    else nomi_fmt(out, sizeof(out), "{\"ok\":false,\"error\":\"不认识的请求\"}");
+    web_reply(out);
 }
 
 /* ---------- 入口 ---------- */
@@ -475,17 +561,21 @@ void nomi_main(void)
     g_mode = kv_get_int("mode", MODE_LOOP);
     if (g_mode < 0 || g_mode > 2) g_mode = MODE_LOOP;
     load_stations();
-    g_station = -1;
-    char last[16];
+    pod_load();
+    online_load();
     int station = kv_get_int("station", -1);
-    if (kv_get("last", last, sizeof(last)) > 0 && compare(last, "radio") == 0 && station < g_station_count) {
-        g_station = station;
-    }
-    char dir[PATH_LEN], file[NAME_LEN];
+    if (station >= 0 && station < g_station_count) g_station = station;
+    char dir[PATH_LEN], file[NAME_LEN], last[16];
     if (kv_get("qdir", dir, sizeof(dir)) > 0 && load_queue(dir) > 0 && kv_get("qfile", file, sizeof(file)) > 0) {
         g_index = find_track(file);
     }
+    if (kv_get("last", last, sizeof(last)) > 0) {
+        for (int i = 1; i < 5; i++) {
+            if (nomi_equal(last, kSources[i])) g_src = i;
+        }
+    }
     draw_tile();
+    timer_start(1, 15000, 1);  // 播客：每 15 秒记一次听到哪
 }
 
 int32_t nomi_event(int32_t type, int32_t id, int32_t value)
@@ -493,36 +583,57 @@ int32_t nomi_event(int32_t type, int32_t id, int32_t value)
     switch (type) {
     case NOMI_EV_SHOW:
         show_home();
-        if (g_open_page == 1) show_dir("sd:/", "SD 卡");
-        else if (g_open_page == 2) show_radio();
+        if (g_open_page) open_page(g_open_page);
         g_open_page = 0;
         return 1;
     case NOMI_EV_HIDE:
         g_pages = 0;
         g_row_count = 0;
+        pod_save_progress(0);
+        return 1;
+    case NOMI_EV_CLOSE:
+        pod_save_progress(0);
+        return 1;
+    case NOMI_EV_TIMER:
+        if (id == 1) pod_save_progress(0);
         return 1;
     case NOMI_EV_BACK:
         g_pages = value;
         while (g_row_count && g_rows[g_row_count - 1].page > g_pages) g_row_count--;
         return 1;
     case NOMI_EV_MEDIA:
-        if (value == NOMI_MEDIA_FINISHED && g_station < 0) step(1, 0);  // 电台是直播，不会"放完"
-        else if (value == NOMI_MEDIA_NEXT) step(1, 1);
-        else if (value == NOMI_MEDIA_PREV) step(-1, 1);
-        else if (value == NOMI_MEDIA_PLAY && resume_last() < 0) ui_open();  // 没放过：打开让主人挑
+        if (value == NOMI_MEDIA_PLAY) {
+            if (resume_last() < 0) ui_open();  // 没放过：打开让主人挑
+        } else if (g_src == SRC_PODCAST) {
+            pod_media(value);
+        } else if (g_src == SRC_ONLINE) {
+            online_media(value);
+        } else if (g_src == SRC_RADIO) {
+            if (value != NOMI_MEDIA_FINISHED && g_station_count) {  // 电台是直播，不会"放完"
+                play_station((g_station + (value == NOMI_MEDIA_PREV ? -1 : 1) + g_station_count) % g_station_count);
+            }
+        } else {
+            local_step(value == NOMI_MEDIA_PREV ? -1 : 1, value != NOMI_MEDIA_FINISHED);
+        }
         return 1;
     case NOMI_EV_VOICE:
         voice(id);
+        return 1;
+    case NOMI_EV_WEB:
+        web();
         return 1;
     case NOMI_EV_CLICK:
         break;
     default:
         return 0;
     }
-    if (id == g_tile_local || id == g_tile_radio) {
-        g_open_page = id == g_tile_local ? 1 : 2;
-        ui_open();
-        return 1;
+    static const int kTilePages[4] = {ROW_SD, ROW_RADIO, ROW_PODCASTS, ROW_ONLINE};
+    for (int i = 0; i < 4; i++) {
+        if (id == g_tile_buttons[i]) {
+            g_open_page = kTilePages[i];
+            ui_open();
+            return 1;
+        }
     }
     if (g_pages && id == g_mode_button) {
         g_mode = (g_mode + 1) % 3;
@@ -535,12 +646,13 @@ int32_t nomi_event(int32_t type, int32_t id, int32_t value)
         if (g_rows[i].id != id) continue;
         char *name = g_row_names[i];
         char path[PATH_LEN], title[NAME_LEN];
-        switch (g_rows[i].kind) {
+        int kind = g_rows[i].kind;
+        switch (kind) {
         case ROW_SD:
-            show_dir("sd:/", "SD 卡");
-            break;
         case ROW_RADIO:
-            show_radio();
+        case ROW_PODCASTS:
+        case ROW_ONLINE:
+            open_page(kind);
             break;
         case ROW_QDIR:
             last_part(title, sizeof(title), g_qdir);
@@ -562,6 +674,9 @@ int32_t nomi_event(int32_t type, int32_t id, int32_t value)
         case ROW_STATION:
             if (play_station(g_rows[i].index) < 0) ui_toast("放不了这个台");
             else back_home();
+            break;
+        default:
+            if (!pod_click(kind, g_rows[i].index)) online_click(kind, g_rows[i].index);
             break;
         }
         return 1;

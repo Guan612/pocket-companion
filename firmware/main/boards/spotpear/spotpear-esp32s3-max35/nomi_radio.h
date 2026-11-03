@@ -39,6 +39,9 @@ public:
     };
 
     static NomiRadio& GetInstance();
+    // 网上的音频按文件头（至少 12 字节）认格式：扩展名、响应头常对不上（m4a 写成 .aac、类型是 octet-stream）。
+    // 认不出（不是 MP3 / AAC / m4a）返回 kAuto
+    static Station::Format SniffFormat(const std::string& head);
 
     void Start();  // 读台单、建任务和监视定时器；板子构造时调用一次
     void RegisterTools();

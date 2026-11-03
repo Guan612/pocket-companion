@@ -325,6 +325,10 @@ const char* GetText(const char* key) {
 // 封面：播客、歌各自两块缓冲轮着用，换图时 version 加一
 const uint16_t* GetImage(const char* key, int* size, int* version) {
     if (!strcmp(key, "pod_cover")) {
+        if (!NomiRadio::GetInstance().Current().owner.empty()) {  // 应用放的节目：封面是应用给的（media_meta）
+            *size = NomiMusic::kCoverSize;
+            return NomiMusic::GetInstance().Cover(*version);
+        }
         *size = NomiPodcast::kCoverSize;
         return NomiPodcast::GetInstance().Cover(*version);
     }

@@ -44,6 +44,9 @@ void TileToggle();
 std::string VoiceCommand(const std::string& app, const std::string& command, const std::string& arg,
                          bool* end_conversation);
 
+// 应用自带的网页（/app/<id>/）发来的请求：交给应用（NOMI_EV_WEB），等它回话（一般是 JSON）。出错时返回 "!原因"
+std::string WebCall(const std::string& app, const std::string& body);
+
 // 每轮对话的系统提示里加的：前台开着的应用说它在干什么（assistant_context），没有为空
 std::string PromptContext();
 

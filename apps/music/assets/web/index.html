@@ -1,0 +1,167 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>音乐 · 设置</title>
+<style>
+:root{--bg:#0f1218;--panel:#181c25;--fg:#e8ebf2;--muted:#8b93a7;--line:#2a3040;--accent:#7cc4ff;--err:#ff8a8a;--ok:#8be0a4}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.5 system-ui,-apple-system,"PingFang SC","Microsoft YaHei",sans-serif}
+main{max-width:640px;margin:0 auto;padding:16px}
+h1{font-size:20px;margin:8px 0 16px}
+h2{font-size:16px;margin:0 0 10px}
+section{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:14px;margin-bottom:14px}
+.row{display:flex;gap:8px;align-items:center;padding:8px 0;border-top:1px solid var(--line)}
+.row:first-child{border-top:0}
+.grow{flex:1;min-width:0;overflow-wrap:anywhere}
+.hint{color:var(--muted);font-size:13px}
+input{flex:1;min-width:0;font:inherit;color:var(--fg);background:#10141c;border:1px solid var(--line);border-radius:8px;padding:7px 10px}
+button{font:inherit;color:var(--fg);background:#2b3142;border:1px solid var(--line);border-radius:8px;padding:7px 12px;cursor:pointer;white-space:nowrap}
+button.primary{background:var(--accent);color:#0b1220;border:0;font-weight:600}
+button.danger{color:var(--err)}
+button:disabled{opacity:.5}
+.bar{display:flex;gap:8px;margin:8px 0}
+.msg{min-height:1.5em;font-size:13px}
+.msg.err{color:var(--err)}.msg.ok{color:var(--ok)}
+img{width:40px;height:40px;border-radius:6px;object-fit:cover;background:#10141c}
+</style>
+</head>
+<body>
+<main>
+<h1>音乐 · 设置</h1>
+
+<section>
+  <h2>播客订阅</h2>
+  <div id="subs"><p class="hint">加载中…</p></div>
+  <div class="bar"><input id="podQ" placeholder="搜播客，比如：忽左忽右"><button id="podSearch" class="primary">搜索</button></div>
+  <div class="msg" id="podMsg"></div>
+  <div id="podResults"></div>
+</section>
+
+<section>
+  <h2>在线音乐</h2>
+  <p class="hint">填一个音乐网站（格式见 docs/online-music.md），设备上跟它说「放一首晴天」就会去这个网站搜。</p>
+  <div class="bar"><input id="site" placeholder="http://example.com"><button id="siteSave" class="primary">保存</button></div>
+  <div class="bar"><input id="songQ" placeholder="试着搜一首歌"><button id="songSearch">搜索</button></div>
+  <div class="msg" id="songMsg"></div>
+  <div id="songs"></div>
+</section>
+</main>
+
+<script>
+const $ = s => document.querySelector(s);
+const esc = s => String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+
+// 交给设备上的音乐应用处理（它没在跑会先在后台起来）
+async function call(cmd, args) {
+  const res = await fetch('call', {method: 'POST', body: JSON.stringify(Object.assign({cmd}, args || {}))});
+  return res.json();
+}
+function msg(el, text, kind) { el.textContent = text || ''; el.className = 'msg' + (kind ? ' ' + kind : ''); }
+
+async function loadSubs() {
+  const box = $('#subs');
+  try {
+    const r = await call('pod_list');
+    box.innerHTML = r.subs.length ? '' : '<p class="hint">还没订阅。</p>';
+    for (const s of r.subs) {
+      const row = document.createElement('div');
+      row.className = 'row';
+      row.innerHTML = `${s.art ? `<img src="${esc(s.art)}" alt="">` : ''}<span class="grow">${esc(s.name)}</span><button>放最新一期</button><button class="danger">取消订阅</button>`;
+      const [play, del] = row.querySelectorAll('button');
+      play.onclick = async () => {
+        play.disabled = true;
+        msg($('#podMsg'), '拉节目单…');
+        try {
+          const res = await call('pod_play', {feed: s.feed});
+          msg($('#podMsg'), res.ok ? `设备上在放：${res.title}` : res.error, res.ok ? 'ok' : 'err');
+        } catch (e) { msg($('#podMsg'), '请求失败：' + e.message, 'err'); }
+        play.disabled = false;
+      };
+      del.onclick = async () => {
+        if (!confirm(`取消订阅「${s.name}」？`)) return;
+        await call('pod_unsubscribe', {feed: s.feed});
+        loadSubs();
+      };
+      box.appendChild(row);
+    }
+  } catch (e) { box.innerHTML = `<p class="msg err">读不到订阅：${esc(e.message)}</p>`; }
+}
+
+$('#podSearch').onclick = async () => {
+  const q = $('#podQ').value.trim();
+  if (!q) return;
+  const box = $('#podResults');
+  box.innerHTML = '';
+  msg($('#podMsg'), '搜索中…（设备去 Apple 播客目录查，要几秒）');
+  try {
+    const r = await call('pod_search', {q});
+    if (!r.ok) return msg($('#podMsg'), r.error, 'err');
+    msg($('#podMsg'), r.results.length ? '' : '没搜到');
+    for (const s of r.results) {
+      const row = document.createElement('div');
+      row.className = 'row';
+      row.innerHTML = `${s.art ? `<img src="${esc(s.art)}" alt="">` : ''}<span class="grow">${esc(s.name)}</span><button>订阅</button>`;
+      const btn = row.querySelector('button');
+      btn.onclick = async () => {
+        btn.disabled = true;
+        const res = await call('pod_subscribe', s);
+        msg($('#podMsg'), res.ok ? `已订阅「${s.name}」` : res.error, res.ok ? 'ok' : 'err');
+        loadSubs();
+      };
+      box.appendChild(row);
+    }
+  } catch (e) { msg($('#podMsg'), '请求失败：' + e.message, 'err'); }
+};
+$('#podQ').onkeydown = e => { if (e.key === 'Enter') $('#podSearch').click(); };
+
+function showSongs(r) {
+  const box = $('#songs');
+  box.innerHTML = '';
+  r.songs.forEach((s, i) => {
+    const row = document.createElement('div');
+    row.className = 'row';
+    row.innerHTML = `<span class="grow">${esc(s.title)} <span class="hint">${esc(s.artist)}</span></span><button>在设备上放</button>`;
+    const btn = row.querySelector('button');
+    btn.onclick = async () => {
+      btn.disabled = true;
+      msg($('#songMsg'), '取歌曲页…');
+      const res = await call('online_play', {index: String(i)});
+      msg($('#songMsg'), res.ok ? `在放「${s.title}」` : res.error, res.ok ? 'ok' : 'err');
+      btn.disabled = false;
+    };
+    box.appendChild(row);
+  });
+}
+
+async function loadOnline() {
+  try {
+    const r = await call('online_get');
+    $('#site').value = r.site || '';
+    showSongs(r);
+  } catch (e) { msg($('#songMsg'), '读不到：' + e.message, 'err'); }
+}
+
+$('#siteSave').onclick = async () => {
+  const r = await call('online_site', {site: $('#site').value.trim()});
+  msg($('#songMsg'), r.ok ? '已保存' : r.error, r.ok ? 'ok' : 'err');
+};
+$('#songSearch').onclick = async () => {
+  const q = $('#songQ').value.trim();
+  if (!q) return;
+  msg($('#songMsg'), '搜索中…');
+  try {
+    const r = await call('online_search', {q});
+    if (!r.ok) return msg($('#songMsg'), r.error, 'err');
+    msg($('#songMsg'), r.songs.length ? '' : '没搜到');
+    showSongs(r);
+  } catch (e) { msg($('#songMsg'), '请求失败：' + e.message, 'err'); }
+};
+$('#songQ').onkeydown = e => { if (e.key === 'Enter') $('#songSearch').click(); };
+
+loadSubs();
+loadOnline();
+</script>
+</body>
+</html>

@@ -404,11 +404,43 @@ esp_err_t HandleExtra(httpd_req_t* req) {
     return httpd_resp_send(req, out.data(), out.size());
 }
 
+struct PrefixEntry {
+    std::string uri;  // 前缀 + "*"
+    DirectApiConfigServer::PrefixHandler handler;
+};
+std::vector<PrefixEntry>& PrefixHandlers() {
+    static std::vector<PrefixEntry> handlers;
+    return handlers;
+}
+
+// 前缀下的地址：GET 回文件之类，POST 带请求体
+esp_err_t HandlePrefix(httpd_req_t* req) {
+    auto* entry = static_cast<PrefixEntry*>(req->user_ctx);
+    bool post = req->method == HTTP_POST;
+    std::string body;
+    if (post && !ReadBody(req, body)) return SendError(req, "提交的内容太大或没收全");
+    std::string uri = req->uri;
+    uri = uri.substr(0, uri.find('?'));
+    std::string type, out;
+    if (!entry->handler(uri, post, body, type, out)) {
+        httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "Not found");
+        return ESP_OK;
+    }
+    if (!out.empty() && out[0] == '!' && type == "application/json") return SendError(req, out.substr(1));
+    httpd_resp_set_type(req, type.c_str());
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    return httpd_resp_send(req, out.data(), out.size());
+}
+
 }  // namespace
 
 namespace DirectApiConfigServer {
 
 std::function<void()> on_city_changed;
+
+void AddPrefixHandler(const char* prefix, PrefixHandler handler) {
+    PrefixHandlers().push_back({std::string(prefix) + "*", std::move(handler)});
+}
 
 void AddJsonHandler(const char* uri, bool post, JsonHandler handler) {
     ExtraHandlers().push_back({uri, post, std::move(handler)});
@@ -422,7 +454,8 @@ std::string Start() {
     if (s_server == nullptr) {
         httpd_config_t config = HTTPD_DEFAULT_CONFIG();
         config.stack_size = 12288;  // /models 里有 HTTPS 请求
-        config.max_uri_handlers = 7 + 24;  // 自己的 7 个 + 板子挂的（超了会注册不上，多留几个）
+        config.max_uri_handlers = 7 + 32;  // 自己的 7 个 + 板子挂的（超了会注册不上，多留几个）
+        config.uri_match_fn = httpd_uri_match_wildcard;  // 前缀接口（/app/*）；其他地址不带 *，还是整个对上才算
         if (httpd_start(&s_server, &config) != ESP_OK) {
             ESP_LOGE(TAG, "Failed to start config server");
             return "";
@@ -446,6 +479,13 @@ std::string Start() {
             httpd_uri_t u = {.uri = upload.uri.c_str(), .method = HTTP_POST, .handler = HandleUpload,
                              .user_ctx = &upload};
             httpd_register_uri_handler(s_server, &u);
+        }
+        // 前缀的放最后：先让整个对得上的接口匹配
+        for (auto& prefix : PrefixHandlers()) {
+            for (httpd_method_t m : {HTTP_GET, HTTP_POST}) {
+                httpd_uri_t u = {.uri = prefix.uri.c_str(), .method = m, .handler = HandlePrefix, .user_ctx = &prefix};
+                httpd_register_uri_handler(s_server, &u);
+            }
         }
     }
     std::string ip = DeviceIp();

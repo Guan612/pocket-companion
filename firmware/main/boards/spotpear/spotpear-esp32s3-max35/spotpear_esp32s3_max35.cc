@@ -423,6 +423,10 @@ private:
         DirectApiConfigServer::AddJsonHandler("/apps/open", true, [](const std::string& body) {
             return NomiPkg::GetInstance().OpenJson(body);
         });
+        // 应用自带的网页设置页：/app/<id>/ 是包里的 assets/web/，POST /app/<id>/call 交给应用
+        DirectApiConfigServer::AddPrefixHandler(
+            "/app/", [](const std::string& uri, bool post, const std::string& body, std::string& type,
+                        std::string& out) { return NomiPkg::GetInstance().WebRequest(uri, post, body, type, out); });
         // 网页设置页的「SD 卡」卡片：每次读都当场检测
         DirectApiConfigServer::AddJsonHandler("/sd.json", false,
                                               [](const std::string&) { return NomiSdCard::GetInstance().StatusJson(); });

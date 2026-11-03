@@ -194,8 +194,9 @@ bool RangeRead(std::string& url, uint64_t from, size_t size, uint8_t* out) {
     }
     url = http.Url();
     size_t got = 0;
+    int last = 0;
     for (int stalls = 0; got < size && stalls < 3;) {
-        int n = http.Read(reinterpret_cast<char*>(out) + got, size - got);
+        int n = last = http.Read(reinterpret_cast<char*>(out) + got, size - got);
         if (n == -2) {
             stalls++;
             continue;
@@ -203,6 +204,10 @@ bool RangeRead(std::string& url, uint64_t from, size_t size, uint8_t* out) {
         if (n <= 0) break;
         stalls = 0;
         got += n;
+    }
+    if (got != size) {
+        ESP_LOGW(TAG, "Range %llu+%u: got %u (HTTP %d, last read %d): %s", static_cast<unsigned long long>(from),
+                 static_cast<unsigned>(size), static_cast<unsigned>(got), code, last, url.c_str());
     }
     return got == size;
 }
@@ -479,10 +484,20 @@ void NomiRadio::SeekTo(int second) {
 }
 
 // 节目进度交给 NomiPodcast 存（写 NVS 要在主循环里：这里可能在 PSRAM 栈的任务里）
+NomiRadio::Station::Format NomiRadio::SniffFormat(const std::string& head) {
+    if (head.size() < 12) return Station::kAuto;
+    const auto* b = reinterpret_cast<const uint8_t*>(head.data());
+    if (memcmp(b + 4, "ftyp", 4) == 0) return Station::kMp4;
+    bool sync = b[0] == 0xFF && (b[1] & 0xE0) == 0xE0;
+    if (memcmp(b, "ID3", 3) == 0 || (sync && (b[1] & 0x06) != 0)) return Station::kMp3;
+    if (sync) return Station::kAdts;  // 帧头里 layer 为 0 的是 ADTS
+    return Station::kAuto;
+}
+
 void NomiRadio::ReportProgress(bool finished) {
     if (!on_progress) return;
     Station st = Current();
-    if (!st.episode || st.song) return;
+    if (!st.episode || st.song || !st.owner.empty()) return;  // 应用放的节目，进度归应用自己记
     int pos = position_;
     Application::GetInstance().Schedule([this, st, pos, finished]() { on_progress(st, pos, finished); });
 }
@@ -729,6 +744,10 @@ bool NomiRadio::ReadMp4(const std::string& source, int start) {
             ok = RangeRead(url, moov_offset, moov_size, moov_);
         }
         heap_caps_free(head);
+        if (!moov_) {
+            ESP_LOGW(TAG, "No PSRAM for moov (%u bytes, largest free %u)", static_cast<unsigned>(moov_size),
+                     static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM)));
+        }
         if (!ok) {
             heap_caps_free(moov_);
             moov_ = nullptr;

@@ -31,7 +31,7 @@ label{display:block;margin:10px 0 0;color:var(--muted);font-size:14px}
 input,select,textarea{display:block;width:100%;margin-top:4px;padding:8px;border-radius:8px;border:1px solid var(--line);background:#14161c;color:var(--fg);font:inherit}
 label.speak{display:flex;align-items:center;gap:8px;cursor:pointer}
 label.speak input{width:auto;margin:0;accent-color:var(--accent)}
-button{font:inherit;color:var(--fg);background:#2b3142;border:1px solid var(--line);border-radius:8px;padding:7px 12px;cursor:pointer}
+button,a.btn{font:inherit;color:var(--fg);background:#2b3142;border:1px solid var(--line);border-radius:8px;padding:7px 12px;cursor:pointer;text-decoration:none}
 button.primary{background:var(--accent);color:#0b1220;border:0;font-weight:600}
 button.danger{color:var(--err)}
 button:disabled{opacity:.5}
@@ -562,7 +562,7 @@ async function loadApps() {
   for (const a of r.apps) {
     const row = document.createElement('div');
     row.className = 'row';
-    row.innerHTML = `<span style="flex:1;overflow-wrap:anywhere">${esc(a.name)} <span class="hint">${esc(a.version)}</span><br><span class="hint">程序 ${kb(a.size)} · 数据 ${kb(a.data)}</span></span><button>打开</button><button class="danger">删除</button>`;
+    row.innerHTML = `<span style="flex:1;overflow-wrap:anywhere">${esc(a.name)} <span class="hint">${esc(a.version)}</span><br><span class="hint">程序 ${kb(a.size)} · 数据 ${kb(a.data)}</span></span>${a.web ? `<a class="btn" href="/app/${encodeURIComponent(a.id)}/" target="_blank">设置</a>` : ''}<button>打开</button><button class="danger">删除</button>`;
     const [open, del] = row.querySelectorAll('button');
     open.onclick = async () => {
       try {

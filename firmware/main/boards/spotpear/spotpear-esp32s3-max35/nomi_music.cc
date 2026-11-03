@@ -59,16 +59,6 @@ struct HttpsHold {
     }
 };
 
-// 按文件头认格式：扩展名、响应头常对不上（m4a 写成 .aac、类型是 octet-stream）。不是音频返回 kAuto
-NomiRadio::Station::Format Sniff(const std::string& head) {
-    if (head.size() < 12) return NomiRadio::Station::kAuto;
-    const auto* b = reinterpret_cast<const uint8_t*>(head.data());
-    if (memcmp(b + 4, "ftyp", 4) == 0) return NomiRadio::Station::kMp4;
-    bool sync = b[0] == 0xFF && (b[1] & 0xE0) == 0xE0;
-    if (memcmp(b, "ID3", 3) == 0 || (sync && (b[1] & 0x06) != 0)) return NomiRadio::Station::kMp3;
-    if (sync) return NomiRadio::Station::kAdts;  // 帧头里 layer 为 0 的是 ADTS
-    return NomiRadio::Station::kAuto;
-}
 
 }  // namespace
 
@@ -157,7 +147,7 @@ std::string NomiMusic::Play(const Song& song) {
     std::string play_url;
     for (const auto& u : Candidates(url)) {
         std::string head;
-        if (Get(u, head, 16) && (format = Sniff(head)) != NomiRadio::Station::kAuto) {
+        if (Get(u, head, 16) && (format = NomiRadio::SniffFormat(head)) != NomiRadio::Station::kAuto) {
             play_url = u;
             break;
         }

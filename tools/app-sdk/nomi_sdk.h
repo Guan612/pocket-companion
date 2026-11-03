@@ -37,6 +37,7 @@ enum {
     NOMI_EV_MEDIA,      // 播放：value 是 NOMI_MEDIA_FINISHED 等
     NOMI_EV_SHOW,       // 界面挂上了：建页面
     NOMI_EV_HIDE,       // 界面拿下了：进程留在后台
+    NOMI_EV_WEB,        // 应用自带的网页发来请求：用 web_body 取请求体，web_reply 回话（见「网页」）
 };
 
 enum { NOMI_TEXT_TITLE = 0, NOMI_TEXT_BODY = 1, NOMI_TEXT_MUTED = 2 };
@@ -48,7 +49,7 @@ enum { NOMI_TEXT_TITLE = 0, NOMI_TEXT_BODY = 1, NOMI_TEXT_MUTED = 2 };
 #define NOMI_E_NOT_FOUND (-4)
 #define NOMI_E_TOO_BIG (-5)
 #define NOMI_E_NO_UI (-6)    // 界面没挂着（在后台）
-#define NOMI_E_NO_NET (-7)   // 没联网
+#define NOMI_E_NO_NET (-7)   // 没联网（net_get 别的失败：连不上、不是 200，都是 NOMI_E_FAIL）
 
 /* ---------- 界面：页面一层层往里压，应用里只上下滚，左边缘右划退一层 ---------- */
 
@@ -84,7 +85,8 @@ NOMI_IMPORT(kv_set) int32_t kv_set(const char *key, const char *value);
 /* ---------- 播放（权限 media）：系统只管放"这一首"，放哪首、下一首放什么（队列）是应用的事 ---------- */
 
 enum { NOMI_MEDIA_PAUSE = 1, NOMI_MEDIA_RESUME = 2, NOMI_MEDIA_STOP = 5, NOMI_MEDIA_TOGGLE = 6 };  // media_control
-#define NOMI_PLAY_LIVE 1  // media_play 的 flags：直播（电台，没有进度、断了自动重连）
+#define NOMI_PLAY_LIVE 1     // media_play 的 flags：直播（电台，没有进度、断了自动重连）
+#define NOMI_PLAY_EPISODE 2  // 节目（播客）：按节目显示，左右键是倒回 15 秒 / 快进 30 秒；不写是一首歌
 
 // NOMI_EV_MEDIA 的 value（只发给放这一首的应用；应用没在跑时系统先在后台把它拉起来）
 enum {
@@ -94,10 +96,13 @@ enum {
     NOMI_MEDIA_PLAY = 4,      // 主人点了你的 ui_player / 首页卡片上的"放"，但停着的不是你的：你决定放什么（比如接着放上次的）
 };
 
-// 放一首：src 是 sd:/ 的文件（还要 sd.read）或 http(s) 地址；title、artist 显示用（SD 卡上的歌系统会读标签换掉）。
-// 放的东西记在你名下：退出界面也接着放，放完来 NOMI_MEDIA_FINISHED
-NOMI_IMPORT(media_play) int32_t media_play(const char *src, const char *title, const char *artist, int32_t flags);
-// 网上的歌：给正在放的这首配封面（JPEG 地址）和 LRC 歌词，都可以空。SD 卡上的歌系统自己读内嵌封面和同名 .lrc
+// 放一首 / 一期：src 是 sd:/ 的文件（还要 sd.read）或 http(s) 地址；title、artist 显示用（SD 卡上的歌系统会读
+// 标签换掉；节目的 artist 写播客名）。start 从第几秒放；duration、bytes 是总长（秒）和文件大小（字节，网上的
+// MP3 按时间跳转要用），不知道填 0。网上的歌系统先探一下（https 的先试 http、按文件头认格式），不是音频返回
+// NOMI_E_NOT_FOUND，好换下一首。放的东西记在你名下：退出界面也接着放，放完来 NOMI_MEDIA_FINISHED
+NOMI_IMPORT(media_play) int32_t media_play(const char *src, const char *title, const char *artist, int32_t flags,
+                                           int32_t start, int32_t duration, int32_t bytes);
+// 网上的歌、节目：给正在放的这个配封面（JPEG 地址）和 LRC 歌词，都可以空。SD 卡上的歌系统自己读内嵌封面和同名 .lrc
 NOMI_IMPORT(media_meta) void media_meta(const char *cover_url, const char *lrc);
 NOMI_IMPORT(media_control) void media_control(int32_t cmd);  // NOMI_MEDIA_PAUSE 等
 NOMI_IMPORT(media_seek) void media_seek(int32_t second);
@@ -112,8 +117,12 @@ NOMI_IMPORT(ui_player) int32_t ui_player(void);
 
 /* ---------- 联网（权限 net） ---------- */
 
-// GET 一个 http(s) 地址（跟着跳转），正文最多 size 字节（多的截掉）；返回字节数。会卡住几秒，别在意界面卡
+// GET 一个 http(s) 地址（跟着跳转），正文最多 size 字节（够了就断开，一次最多 512KB）；返回字节数，最多等 20 秒。
+// 会卡住几秒（你自己的线程，界面不卡）
 NOMI_IMPORT(net_get) int32_t net_get(const char *url, char *buf, int32_t size);
+// 同上，收到 until 出现 count 次就不往下收了：RSS 有好几 MB，只要最新 10 期就 net_get_until(url, buf, size, "</item>", 10)
+NOMI_IMPORT(net_get_until) int32_t net_get_until(const char *url, char *buf, int32_t size, const char *until,
+                                                 int32_t count);
 
 /* ---------- 大模型（权限 assistant） ---------- */
 
@@ -123,6 +132,14 @@ NOMI_IMPORT(assistant_context) void assistant_context(const char *text);
 // 比如开始放歌了——不然对话还开着，声音出不来）
 NOMI_IMPORT(voice_arg) int32_t voice_arg(char *buf, int32_t size);
 NOMI_IMPORT(voice_reply) void voice_reply(const char *text, int32_t end);
+
+/* ---------- 网页：应用自带一个网页设置页 ---------- */
+
+// 包里放 assets/web/index.html（还可以有别的文件），设备的网页设置页「设备 → 应用」里就有「设置」，打开的是
+// http://<设备>/app/<id>/。网页里 POST 到相对地址 call 的请求体交给应用（NOMI_EV_WEB），应用回的内容（一般是
+// JSON，最多 32KB）原样回给网页；要在这次 nomi_event 里回，系统最多等 60 秒（可以先联网搜一下再回）
+NOMI_IMPORT(web_body) int32_t web_body(char *buf, int32_t size);
+NOMI_IMPORT(web_reply) void web_reply(const char *text);
 
 /* ---------- 其他 ---------- */
 

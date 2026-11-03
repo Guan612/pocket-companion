@@ -81,8 +81,8 @@ def main():
     pages = (manifest.get("memory_kb", 256) * 1024 + 65535) // 65536
     subprocess.run([
         sys.executable, "-m", "ziglang", "cc",
-        "-target", "wasm32-freestanding", "-O2", "-nostdlib", f"-I{HERE}",
-        "-Wl,--no-entry", "-Wl,-z,stack-size=16384",
+        "-target", "wasm32-freestanding", "-O2", "-g0", "-nostdlib", f"-I{HERE}",
+        "-Wl,--no-entry", "-Wl,--strip-all", "-Wl,-z,stack-size=16384",
         f"-Wl,--initial-memory={pages * 65536}", f"-Wl,--max-memory={pages * 65536}",
         *sources, "-o", str(wasm),
     ], check=True)
