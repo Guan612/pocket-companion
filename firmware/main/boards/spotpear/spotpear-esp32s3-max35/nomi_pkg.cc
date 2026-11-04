@@ -26,13 +26,13 @@
 
 namespace {
 
-constexpr int kApi = 1;                       // 固件支持的接口版本（docs/app-sdk.md）
+constexpr int kApi = 2;                       // 固件支持的接口版本（docs/app-sdk.md）：2 加了阅读器、fs_find
 constexpr size_t kMaxPackage = 4 * 1024 * 1024;
 constexpr size_t kMaxWasm = 1024 * 1024;
 constexpr size_t kMaxManifest = 16 * 1024;
 const char* const kPermissions[] = {"sd.read", "media", "assistant", "keep_awake", "net"};
 // 预装的应用包：资源分区里的文件名（板子目录 preinstall/ 下，tools/app-sdk/build.py 打的）
-const char* const kPreinstalled[] = {"nomi.music.npk"};
+const char* const kPreinstalled[] = {"nomi.music.npk", "nomi.novel.npk"};
 
 Display* display() { return NomiWasm::GetDisplay(); }  // 不在这调 Board::GetInstance()，见 nomi_wasm.h
 

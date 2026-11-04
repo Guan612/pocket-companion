@@ -443,6 +443,11 @@ private:
         // 网页设置页的「SD 卡」卡片：每次读都当场检测
         DirectApiConfigServer::AddJsonHandler("/sd.json", false,
                                               [](const std::string&) { return NomiSdCard::GetInstance().StatusJson(); });
+        // 往卡上传文件（字体、书）：请求体第一行是卡上的路径
+        DirectApiConfigServer::AddUploadHandler(
+            "/sd/upload", [](size_t length, const std::function<int(char*, size_t)>& read) {
+                return NomiSdCard::GetInstance().UploadJson(length, read);
+            });
         DirectApiProtocol::face_prompt = NomiDisplay::FacePrompt();
         DirectApiProtocol::face_handler = [this](const std::string& json, std::string& error) {
             return display_->PlayFace(json, error);

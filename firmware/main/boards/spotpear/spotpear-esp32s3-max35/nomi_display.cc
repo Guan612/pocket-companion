@@ -6,6 +6,7 @@
 #include "display/lvgl_display/lvgl_theme.h"
 #include "face_script.h"
 #include "nomi_clock.h"
+#include "nomi_font.h"
 #include "nomi_music.h"
 #include "nomi_radio.h"
 #include "nomi_ui.h"
@@ -463,6 +464,7 @@ void NomiDisplay::SetupUI() {
     };
     // 先用内置字体，资源分区里的完整中文字体加载后会经 SetTextFont 换上
     nomi_ui_create(screen, face_buf_, &BUILTIN_TEXT_FONT, &callbacks);
+    NomiFont::SetBase(&BUILTIN_TEXT_FONT);
     ui_ready_ = true;
 
     // 恢复"随时插话打断"；放到主循环里，等音频编解码器确定有没有回采之后再设
@@ -476,6 +478,7 @@ bool NomiDisplay::SetTextFont(std::shared_ptr<LvglFont> text_font) {
     if (ok && ui_ready_ && text_font && text_font->font()) {
         DisplayLockGuard lock(this);
         nomi_ui_set_font(text_font->font());
+        NomiFont::SetBase(text_font->font());  // 看书的字以它为主，缺的字用卡上的 .ttf 补
         ESP_LOGI(TAG, "Nomi UI switched to assets text font");
     }
     return ok;

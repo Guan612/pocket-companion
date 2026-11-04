@@ -9,12 +9,18 @@
 #include <driver/gpio.h>
 #include <driver/sdspi_host.h>
 #include <driver/spi_common.h>
+#include <esp_heap_caps.h>
 #include <esp_log.h>
+#include <esp_timer.h>
 #include <esp_vfs_fat.h>
 #include <ff.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <sdmmc_cmd.h>
+#include <sys/stat.h>
+
+#include <algorithm>
+#include <cstring>
 
 #define TAG "NomiSdCard"
 
@@ -127,7 +133,7 @@ bool NomiSdCard::MountLocked() {
     slot.gpio_cs = SD_CS_PIN;
     esp_vfs_fat_mount_config_t mount = {};
     mount.format_if_mount_failed = false;  // 绝不自动格式化
-    mount.max_files = 4;
+    mount.max_files = 6;  // 看书时同时开着：书、补字的字体，再加放本地歌、应用读文件、章节缓存
     mount.allocation_unit_size = 16 * 1024;
 
     // 卡应答了但 FatFs 挂不上（exFAT、NTFS、没分区）时返回 ESP_FAIL；卡不应答是超时、响应不对之类。
@@ -234,6 +240,103 @@ std::string NomiSdCard::StatusJson() {
         cJSON_AddNumberToObject(root, "total", static_cast<double>(total));
         cJSON_AddNumberToObject(root, "free", static_cast<double>(free_bytes));
     }
+    char* json = cJSON_PrintUnformatted(root);
+    std::string out = json ? json : "{}";
+    cJSON_free(json);
+    cJSON_Delete(root);
+    return out;
+}
+
+// 网页往卡上传一个文件（POST /sd/upload）：请求体第一行是卡上的路径（比如 fonts/x.ttf，UTF-8），
+// 后面是文件内容。先写到 .part，收完再改名，传一半断了不会留下半个文件。系统的 nomi/ 下不让写
+std::string NomiSdCard::UploadJson(size_t length, const std::function<int(char*, size_t)>& read) {
+    constexpr size_t kChunk = 8192;
+    auto* buf = static_cast<char*>(heap_caps_malloc(kChunk, MALLOC_CAP_SPIRAM));
+    if (!buf) return "!内存不够";
+    size_t consumed = 0, have = 0;
+    auto fill = [&]() -> bool {  // 再收一块到 buf（have 是收到多少）
+        size_t want = std::min(kChunk, length - consumed);
+        if (want == 0) return false;
+        int n = read(buf, want);
+        if (n <= 0) return false;
+        have = n;
+        consumed += n;
+        return true;
+    };
+    std::string error, path, tmp;
+    FILE* f = nullptr;
+    size_t start = 0, written = 0;
+    // 第一行：路径
+    while (error.empty()) {
+        if (!fill()) {
+            error = "上传断了";
+            break;
+        }
+        size_t nl = 0;
+        while (nl < have && buf[nl] != '\n') nl++;
+        path.append(buf, nl);
+        if (path.size() > 240) error = "路径太长";
+        if (nl < have) {
+            start = nl + 1;
+            break;
+        }
+    }
+    if (!path.empty() && path.back() == '\r') path.pop_back();
+    while (!path.empty() && path[0] == '/') path.erase(0, 1);
+    if (error.empty() && (path.empty() || path.find("..") != std::string::npos || path.find('\\') != std::string::npos ||
+                          path.back() == '/' || path.rfind("nomi/", 0) == 0)) {
+        error = "路径不对（要写成 fonts/x.ttf 这样，不能写 nomi/ 下面）";
+    }
+    Use sd;
+    if (error.empty() && !sd) error = "SD 卡没插";
+    std::string full = std::string(kMountPoint) + "/" + path;
+    if (error.empty()) {
+        // 一层层建文件夹
+        for (size_t i = strlen(kMountPoint) + 1; i < full.size(); i++) {
+            if (full[i] != '/') continue;
+            std::string dir = full.substr(0, i);
+            struct stat st;
+            if (stat(dir.c_str(), &st) != 0 && mkdir(dir.c_str(), 0775) != 0) {
+                error = "建不了文件夹";
+                break;
+            }
+        }
+    }
+    if (error.empty()) {
+        tmp = full + ".part";
+        f = fopen(tmp.c_str(), "wb");
+        if (!f) error = "写不了卡（满了？只读？）";
+    }
+    int64_t t0 = esp_timer_get_time();
+    while (error.empty()) {
+        if (have > start && fwrite(buf + start, 1, have - start, f) != have - start) {
+            error = "写卡出错（满了？）";
+            break;
+        }
+        written += have - start;
+        start = 0;
+        if (consumed >= length) break;
+        if (!fill()) error = "上传断了";
+    }
+    if (f) fclose(f);
+    while (consumed < length && fill()) {
+    }  // 出错了也把剩下的收完，浏览器才拿得到回复
+    heap_caps_free(buf);
+    if (error.empty()) {
+        remove(full.c_str());
+        if (rename(tmp.c_str(), full.c_str()) != 0) error = "改名失败";
+    }
+    if (!error.empty()) {
+        if (!tmp.empty()) remove(tmp.c_str());
+        ESP_LOGW(TAG, "Upload %s failed: %s", path.c_str(), error.c_str());
+        return "!" + error;
+    }
+    int64_t ms = (esp_timer_get_time() - t0) / 1000;
+    ESP_LOGI(TAG, "Uploaded %s: %u bytes in %lld ms", full.c_str(), static_cast<unsigned>(written), ms);
+    cJSON* root = cJSON_CreateObject();
+    cJSON_AddBoolToObject(root, "ok", true);
+    cJSON_AddStringToObject(root, "path", path.c_str());
+    cJSON_AddNumberToObject(root, "size", static_cast<double>(written));
     char* json = cJSON_PrintUnformatted(root);
     std::string out = json ? json : "{}";
     cJSON_free(json);

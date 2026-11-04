@@ -52,6 +52,8 @@ public:
     State GetState();
     // 网页设置页 GET /sd.json：当场挂一下看卡在不在、多大、还剩多少
     std::string StatusJson();
+    // 网页 POST /sd/upload：往卡上传一个文件（字体、书）。请求体第一行是卡上的路径，后面是内容
+    std::string UploadJson(size_t length, const std::function<int(char*, size_t)>& read);
 
     // FatFs 底层读写出错重试都失败时调（在 FatFs 的锁里，不能当场卸载）：下次 Release 时卸载
     void MarkBroken() { broken_ = true; }

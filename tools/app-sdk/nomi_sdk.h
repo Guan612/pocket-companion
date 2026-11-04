@@ -14,7 +14,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define NOMI_API 1
+#define NOMI_API 2  // 2：阅读器（ui_reader 等）、text_chapters、fs_find。用到这些的应用 manifest 里 "api": 2
 
 #define NOMI_IMPORT(name) __attribute__((import_module("env"), import_name(#name)))
 #define NOMI_EXPORT(name) __attribute__((export_name(#name)))
@@ -26,14 +26,14 @@ NOMI_EXPORT(nomi_event) int32_t nomi_event(int32_t type, int32_t id, int32_t val
 
 enum {
     NOMI_EV_CLICK = 1,  // 点了按钮、列表项：id 是控件
-    NOMI_EV_CHANGE,     // 开关、滑杆变了：id 是控件，value 是新值（预留）
+    NOMI_EV_CHANGE,     // 拖条松手了：id 是控件，value 是新值
     NOMI_EV_BACK,       // 左边缘右划退了一页：value 是剩几页（系统已经关掉了那一页）
     NOMI_EV_PAUSE,      // 预留
     NOMI_EV_RESUME,     // 预留
     NOMI_EV_CLOSE,      // 进程要结束了：趁这时候把进度存好（界面已经没了）
     NOMI_EV_TIMER,      // 定时器到点：id 是定时器
     NOMI_EV_VOICE,      // 大模型调了 manifest 里的语音指令：id 是第几个（从 1 起），参数用 voice_arg 取
-    NOMI_EV_READER,     // 预留（阅读器翻页）
+    NOMI_EV_READER,     // 阅读器：id 是阅读器，value 是这页开头的位置（≥ 0，存下来就是书签）或 NOMI_READER_MENU / END
     NOMI_EV_MEDIA,      // 播放：value 是 NOMI_MEDIA_FINISHED 等
     NOMI_EV_SHOW,       // 界面挂上了：建页面
     NOMI_EV_HIDE,       // 界面拿下了：进程留在后台
@@ -59,6 +59,9 @@ NOMI_IMPORT(ui_text) int32_t ui_text(const char *text, int32_t style);
 NOMI_IMPORT(ui_item) int32_t ui_item(const char *title, const char *sub, const char *right);  // 可点的一行
 NOMI_IMPORT(ui_button) int32_t ui_button(const char *text, int32_t primary);
 NOMI_IMPORT(ui_set_text) void ui_set_text(int32_t id, const char *text);
+// （api 2）拖条：label 里的 {} 换成当前值，拖的时候跟着变（比如 "跳到 {}%"）；松手时来 NOMI_EV_CHANGE，value 是新值
+NOMI_IMPORT(ui_slider) int32_t ui_slider(const char *label, int32_t min, int32_t max, int32_t value);
+NOMI_IMPORT(ui_set_value) void ui_set_value(int32_t id, int32_t value);  // 改拖条的值（不发 NOMI_EV_CHANGE）
 NOMI_IMPORT(ui_set_hidden) void ui_set_hidden(int32_t id, int32_t hidden);
 NOMI_IMPORT(ui_remove) void ui_remove(int32_t id);
 NOMI_IMPORT(ui_toast) void ui_toast(const char *text);
@@ -74,11 +77,38 @@ NOMI_IMPORT(ui_target) int32_t ui_target(int32_t id);
 // 打开自己的界面（卡片上点了"打开"时用），之后来 SHOW；已经开着就什么都不做
 NOMI_IMPORT(ui_open) void ui_open(void);
 
+/* ---------- 阅读器（api 2）：看 TXT 小说，系统排版、分页、翻页 ---------- */
+
+// 认编码（UTF-8 / GBK）；空行去掉、段首缩进两格；系统字里没有的字用 SD 卡 fonts/ 里的 .ttf 补。
+// 位置都是文件里的字节位置：书签、章节、跳转都用它。
+#define NOMI_READER_SWIPE 1   // flags：上滑下一页、下滑上一页
+#define NOMI_READER_TAP 2     // flags：点上三分之一上一页、下三分之一下一页
+#define NOMI_READER_TAP_LR 4  // flags：点左三分之一上一页、右三分之一下一页（代替 NOMI_READER_TAP）
+// 不管哪种，点中间那三分之一、长按都发 NOMI_READER_MENU
+#define NOMI_READER_MENU (-1)  // NOMI_EV_READER 的 value：点了中间 / 长按（应用弹自己的菜单：快速跳转、目录、设置……）
+#define NOMI_READER_END (-2)   // NOMI_EV_READER 的 value：在最后一页还往后翻
+// 在当前页建一个阅读器，占满整页（这页别放别的控件，标题给空字符串）。path 一般是 sd:/ 的（要 sd.read），
+// offset 是从哪开始（书签，0 = 开头）。建好就来一次 NOMI_EV_READER（这一页的位置），之后每翻一页来一次。
+// ui_set_text(阅读器, 字) 改左下角那行（比如章名），右下角的百分比系统自己写。打不开返回 NOMI_E_NOT_FOUND
+NOMI_IMPORT(ui_reader) int32_t ui_reader(const char *path, int32_t offset, int32_t flags);
+NOMI_IMPORT(reader_goto) void reader_goto(int32_t id, int32_t offset);  // 跳到某个位置（对齐到那一段的开头）
+NOMI_IMPORT(reader_set_flags) void reader_set_flags(int32_t id, int32_t flags);  // 换翻页方式
+NOMI_IMPORT(reader_text) int32_t reader_text(int32_t id, char *buf, int32_t size);  // 这一页的字（给大模型当上下文）
+// 章节（第 X 章 / 回 / 节 / 卷、楔子、尾声、Chapter N……）：返回一共几章；buf 里从第 first 章（从 0 起）起
+// 一行一个「位置 TAB 章名」，放不下的不放。第一次要把整本书读一遍（几 MB 的书几秒），之后用卡上的缓存
+NOMI_IMPORT(text_chapters) int32_t text_chapters(const char *path, int32_t first, char *buf, int32_t size);
+// offset 在第几章（从 0 起）；在第一章之前、或者这本书没分章，返回 -1
+NOMI_IMPORT(text_chapter_at) int32_t text_chapter_at(const char *path, int32_t offset);
+
 /* ---------- 存储：data:/ 应用自己的数据，pkg:/ 应用包里的 assets，sd:/ SD 卡（只读，要 sd.read） ---------- */
 
 NOMI_IMPORT(fs_list) int32_t fs_list(const char *dir, char *buf, int32_t size);  // 一行一个，目录带 '/'
 NOMI_IMPORT(fs_size) int32_t fs_size(const char *path);
 NOMI_IMPORT(fs_read) int32_t fs_read(const char *path, int32_t offset, void *buf, int32_t size);
+// （api 2）在卡上 dir（sd:/ 开头）下面、含子文件夹找文件：扩展名是 exts 之一（逗号分开，"txt" 或 "mp3,flac"）、
+// 不小于 min_size 字节。一行一个「路径 TAB 大小」（路径是 sd:/ 开头的），放不下的不放；返回放了几个。
+// 跳过 . 开头的、系统的文件夹（nomi/、System Volume Information）。卡上东西多的话要几秒
+NOMI_IMPORT(fs_find) int32_t fs_find(const char *dir, const char *exts, int32_t min_size, char *buf, int32_t size);
 NOMI_IMPORT(kv_get) int32_t kv_get(const char *key, char *buf, int32_t size);  // 没有返回 NOMI_E_NOT_FOUND
 NOMI_IMPORT(kv_set) int32_t kv_set(const char *key, const char *value);
 

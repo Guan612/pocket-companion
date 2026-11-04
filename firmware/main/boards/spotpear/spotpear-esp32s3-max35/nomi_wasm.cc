@@ -1,10 +1,12 @@
 #include "nomi_wasm.h"
 
 #include "display/display.h"
+#include "nomi_book.h"
 #include "nomi_flash_io.h"
 #include "nomi_music.h"
 #include "nomi_pkg.h"
 #include "nomi_radio.h"
+#include "nomi_reader.h"
 #include "nomi_sdcard.h"
 #include "nomi_style.h"
 #include "nomi_ui.h"
@@ -21,6 +23,7 @@
 #include <freertos/semphr.h>
 #include <freertos/task.h>
 #include <pthread.h>
+#include <strings.h>
 #include <sys/stat.h>
 #include <sys/time.h>
 #include <wasm_export.h>
@@ -426,6 +429,82 @@ int32_t ui_item(wasm_exec_env_t env, const char* title, const char* sub, const c
     return id;
 }
 
+// 拖条：label 里的 {} 换成当前值，拖的时候跟着变；松手时发 NOMI_EV_CHANGE（value 是新值）
+struct SliderTag {
+    std::weak_ptr<Proc> proc;
+    int32_t id;
+    std::string label;
+    lv_obj_t* text;
+};
+
+std::string SliderText(const std::string& label, int32_t v) {
+    size_t at = label.find("{}");
+    std::string n = std::to_string(static_cast<long>(v));
+    return at == std::string::npos ? label + "  " + n : label.substr(0, at) + n + label.substr(at + 2);
+}
+
+int32_t ui_slider(wasm_exec_env_t env, const char* label, int32_t min, int32_t max, int32_t value) {
+    Proc* p = Ctx(env);
+    UiScope ui(p);
+    lv_obj_t* parent = ui.target();
+    if (!parent) return E_NO_UI;
+    if (max <= min) max = min + 1;
+    value = std::min(std::max(value, min), max);
+    lv_obj_t* box = lv_obj_create(parent);
+    lv_obj_remove_style_all(box);
+    lv_obj_set_size(box, LV_PCT(100), LV_SIZE_CONTENT);
+    lv_obj_set_flex_flow(box, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_row(box, 16, 0);
+    lv_obj_set_style_pad_ver(box, 8, 0);
+    lv_obj_set_style_pad_hor(box, 12, 0);  // 留出拖块的半径
+    lv_obj_remove_flag(box, LV_OBJ_FLAG_SCROLLABLE);
+    std::string text = label ? label : "";
+    lv_obj_t* l = lv_label_create(box);
+    lv_label_set_text(l, SliderText(text, value).c_str());
+    lv_obj_t* sl = lv_slider_create(box);
+    lv_obj_set_size(sl, LV_PCT(100), 8);
+    lv_slider_set_range(sl, min, max);
+    lv_slider_set_value(sl, value, LV_ANIM_OFF);
+    lv_obj_set_style_bg_color(sl, lv_color_hex(C_CONTROL), LV_PART_MAIN);
+    lv_obj_set_style_bg_color(sl, lv_color_hex(C_ACCENT), LV_PART_INDICATOR);
+    lv_obj_set_style_bg_color(sl, lv_color_hex(C_TEXT), LV_PART_KNOB);
+    lv_obj_set_style_pad_all(sl, 8, LV_PART_KNOB);
+    lv_obj_set_ext_click_area(sl, 16);  // 细条好按
+    int32_t id = AddObj(p, box);
+    auto* tag = new SliderTag{p->weak_from_this(), id, text, l};
+    lv_obj_set_user_data(sl, tag);
+    lv_obj_add_event_cb(
+        sl,
+        [](lv_event_t* e) {
+            auto* t = static_cast<SliderTag*>(lv_event_get_user_data(e));
+            auto* target = static_cast<lv_obj_t*>(lv_event_get_target(e));
+            lv_event_code_t code = lv_event_get_code(e);
+            if (code == LV_EVENT_DELETE) {
+                delete t;
+            } else if (code == LV_EVENT_VALUE_CHANGED) {
+                lv_label_set_text(t->text, SliderText(t->label, lv_slider_get_value(target)).c_str());
+            } else if (code == LV_EVENT_RELEASED) {
+                if (ProcPtr proc = t->proc.lock()) Post(proc.get(), EV_CHANGE, t->id, lv_slider_get_value(target));
+            }
+        },
+        LV_EVENT_ALL, tag);
+    return id;
+}
+
+// 改拖条的值（不发 NOMI_EV_CHANGE）
+void ui_set_value(wasm_exec_env_t env, int32_t id, int32_t value) {
+    Proc* p = Ctx(env);
+    UiScope ui(p);
+    lv_obj_t* box = ui.ok() ? Obj(p, id) : nullptr;
+    for (uint32_t i = 0; box && i < lv_obj_get_child_count(box); i++) {
+        lv_obj_t* c = lv_obj_get_child(box, i);
+        if (!lv_obj_check_type(c, &lv_slider_class)) continue;
+        lv_slider_set_value(c, value, LV_ANIM_OFF);
+        auto* t = static_cast<SliderTag*>(lv_obj_get_user_data(c));
+        if (t) lv_label_set_text(t->text, SliderText(t->label, lv_slider_get_value(c)).c_str());
+    }
+}
+
 void ui_set_text(wasm_exec_env_t env, int32_t id, const char* text) {
     Proc* p = Ctx(env);
     UiScope ui(p);
@@ -742,6 +821,259 @@ int32_t fs_read(wasm_exec_env_t env, const char* path, int32_t offset, void* buf
     return result;
 }
 
+/* ---------- 阅读器和书：ui_reader、text_chapters、fs_find ---------- */
+
+constexpr int32_t READER_MENU = -1, READER_END = -2;  // NOMI_EV_READER 的 value（翻页时是位置，≥ 0）
+constexpr const char* kChapterCache = "/sd/nomi/cache/chapters";  // 章节缓存（第一次要把整本书读一遍）
+
+// 阅读器占满当前页（这页不留边、不滚：上下划是翻页）。翻到新的一页、长按、翻过最后一页都发 NOMI_EV_READER
+int32_t ui_reader(wasm_exec_env_t env, const char* path, int32_t offset, int32_t flags) {
+    Proc* p = Ctx(env);
+    int32_t err;
+    std::string dev = Resolve(p, path, false, &err);
+    if (dev.empty()) return err;
+    SdIfNeeded sd(dev);
+    if (sd.use && !*sd.use) return E_NO_SD;
+    UiScope ui(p);
+    lv_obj_t* parent = ui.target();
+    if (!parent) return E_NO_UI;
+    lv_obj_set_style_pad_all(parent, 0, 0);
+    lv_obj_remove_flag(parent, LV_OBJ_FLAG_SCROLLABLE);
+    int32_t id = static_cast<int32_t>(p->objs.size()) + 1;  // AddObj 给的就是这个
+    std::weak_ptr<Proc> weak = p->weak_from_this();
+    std::string error;
+    lv_obj_t* r = NomiReader::Create(
+        parent, dev, offset < 0 ? 0 : static_cast<uint32_t>(offset), flags,
+        [weak, id](NomiReader::Event ev, uint32_t at) {
+            ProcPtr proc = weak.lock();
+            if (!proc) return;
+            int32_t value = ev == NomiReader::kPage ? static_cast<int32_t>(std::min<uint32_t>(at, INT32_MAX))
+                            : ev == NomiReader::kMenu ? READER_MENU
+                                                      : READER_END;
+            Post(proc.get(), EV_READER, id, value);
+        },
+        error);
+    if (!r) {
+        nomi_ui_notify(error.c_str(), 3000);
+        return E_NOT_FOUND;
+    }
+    return AddObj(p, r);
+}
+
+void reader_goto(wasm_exec_env_t env, int32_t id, int32_t offset) {
+    Proc* p = Ctx(env);
+    UiScope ui(p);
+    if (ui.ok()) NomiReader::Goto(Obj(p, id), offset < 0 ? 0 : static_cast<uint32_t>(offset));
+}
+
+void reader_set_flags(wasm_exec_env_t env, int32_t id, int32_t flags) {
+    Proc* p = Ctx(env);
+    UiScope ui(p);
+    if (ui.ok()) NomiReader::SetFlags(Obj(p, id), flags);
+}
+
+// 这一页的字（给大模型当上下文）：放不下就截掉，不截半个字
+int32_t reader_text(wasm_exec_env_t env, int32_t id, char* buf, uint32_t size) {
+    Proc* p = Ctx(env);
+    std::string text;
+    {
+        UiScope ui(p);
+        lv_obj_t* o = ui.ok() ? Obj(p, id) : nullptr;
+        if (!NomiReader::Is(o)) return E_NOT_FOUND;
+        text = NomiReader::PageText(o);
+    }
+    if (size == 0) return E_FAIL;
+    size_t n = std::min<size_t>(text.size(), size - 1);
+    while (n > 0 && n < text.size() && (static_cast<uint8_t>(text[n]) & 0xC0) == 0x80) n--;
+    memcpy(buf, text.data(), n);
+    buf[n] = '\0';
+    return static_cast<int32_t>(n);
+}
+
+bool MakeDirs(const std::string& path) {
+    for (size_t i = 1; i <= path.size(); i++) {
+        if (i == path.size() || path[i] == '/') {
+            std::string part = path.substr(0, i);
+            struct stat st;
+            if (stat(part.c_str(), &st) != 0 && mkdir(part.c_str(), 0775) != 0) return false;
+        }
+    }
+    return true;
+}
+
+struct ChapterIndex {
+    std::string path;
+    int64_t size = -1, mtime = 0;
+    std::vector<NomiBook::Chapter> list;
+};
+std::mutex s_chapter_mutex;
+ChapterIndex s_chapters;  // 最近一本书的章节（换书时换掉）
+
+uint32_t Fnv(const std::string& s) {
+    uint32_t h = 2166136261u;
+    for (unsigned char c : s) {
+        h ^= c;
+        h *= 16777619u;
+    }
+    return h;
+}
+
+// 拿着 s_chapter_mutex 调。卡上的书在 kChapterCache 留缓存：文件大小、修改时间对得上就直接用
+const ChapterIndex* LoadChapters(const std::string& path) {
+    struct stat st;
+    if (stat(path.c_str(), &st) != 0) return nullptr;
+    ChapterIndex& ix = s_chapters;
+    if (ix.path == path && ix.size == st.st_size && ix.mtime == static_cast<int64_t>(st.st_mtime)) return &ix;
+    ix = ChapterIndex();
+    char header[64], name[16];
+    snprintf(header, sizeof(header), "v1 %lld %lld\n", static_cast<long long>(st.st_size),
+             static_cast<long long>(st.st_mtime));
+    snprintf(name, sizeof(name), "%08lx.txt", static_cast<unsigned long>(Fnv(path)));
+    std::string cache = std::string(kChapterCache) + "/" + name;
+    bool on_sd = path.rfind("/sd/", 0) == 0, loaded = false;
+    if (on_sd) {
+        if (FILE* f = fopen(cache.c_str(), "rb")) {
+            char line[512];
+            if (fgets(line, sizeof(line), f) && strcmp(line, header) == 0 && fgets(line, sizeof(line), f) &&
+                path + "\n" == line) {  // 第二行是书的路径：防哈希撞上
+                loaded = true;
+                while (fgets(line, sizeof(line), f)) {
+                    char* tab = strchr(line, '\t');
+                    if (!tab) continue;
+                    *tab = '\0';
+                    std::string title = tab + 1;
+                    if (!title.empty() && title.back() == '\n') title.pop_back();
+                    ix.list.push_back({static_cast<uint32_t>(strtoul(line, nullptr, 10)), title});
+                }
+            }
+            fclose(f);
+        }
+    }
+    if (!loaded) {
+        NomiBook book;
+        int64_t t0 = esp_timer_get_time();
+        if (!book.Open(path) || !book.ScanChapters(ix.list)) {
+            ix = ChapterIndex();
+            return nullptr;
+        }
+        ESP_LOGI(TAG, "Chapters of %s: %u (%lld ms)", path.c_str(), static_cast<unsigned>(ix.list.size()),
+                 (esp_timer_get_time() - t0) / 1000);
+        if (on_sd && MakeDirs(kChapterCache)) {
+            if (FILE* f = fopen(cache.c_str(), "wb")) {
+                fputs(header, f);
+                fprintf(f, "%s\n", path.c_str());
+                for (const auto& c : ix.list) fprintf(f, "%u\t%s\n", static_cast<unsigned>(c.offset), c.title.c_str());
+                fclose(f);
+            }
+        }
+    }
+    ix.path = path;
+    ix.size = st.st_size;
+    ix.mtime = st.st_mtime;
+    return &ix;
+}
+
+// 章节：返回一共几章；buf 里从第 first 章起一行一个「位置\t章名」，放不下的不放
+int32_t text_chapters(wasm_exec_env_t env, const char* path, int32_t first, char* buf, uint32_t size) {
+    int32_t err;
+    std::string s = Resolve(Ctx(env), path, false, &err);
+    if (s.empty()) return err;
+    SdIfNeeded sd(s);
+    if (sd.use && !*sd.use) return E_NO_SD;
+    std::lock_guard<std::mutex> lock(s_chapter_mutex);
+    const ChapterIndex* ix = nullptr;
+    NomiFlashIo::ForPath(s, [&] { ix = LoadChapters(s); });
+    if (!ix) return E_NOT_FOUND;
+    uint32_t n = 0;
+    for (size_t i = first < 0 ? 0 : first; i < ix->list.size(); i++) {
+        std::string line = std::to_string(ix->list[i].offset) + "\t" + ix->list[i].title + "\n";
+        if (n + line.size() + 1 > size) break;
+        memcpy(buf + n, line.data(), line.size());
+        n += line.size();
+    }
+    if (size) buf[n] = '\0';
+    return static_cast<int32_t>(ix->list.size());
+}
+
+// offset 在第几章（从 0 起）；在第一章之前、或者这本书没有章节，返回 -1
+int32_t text_chapter_at(wasm_exec_env_t env, const char* path, int32_t offset) {
+    int32_t err;
+    std::string s = Resolve(Ctx(env), path, false, &err);
+    if (s.empty()) return err;
+    SdIfNeeded sd(s);
+    if (sd.use && !*sd.use) return E_NO_SD;
+    std::lock_guard<std::mutex> lock(s_chapter_mutex);
+    const ChapterIndex* ix = nullptr;
+    NomiFlashIo::ForPath(s, [&] { ix = LoadChapters(s); });
+    if (!ix) return E_NOT_FOUND;
+    auto it = std::upper_bound(ix->list.begin(), ix->list.end(), static_cast<uint32_t>(std::max<int32_t>(offset, 0)),
+                               [](uint32_t v, const NomiBook::Chapter& c) { return v < c.offset; });
+    return static_cast<int32_t>(it - ix->list.begin()) - 1;
+}
+
+bool SkipDir(const std::string& path, const char* name) {
+    return name[0] == '.' || strcasecmp(name, "System Volume Information") == 0 || strcasecmp(name, "$RECYCLE.BIN") == 0 ||
+           path == "/sd/nomi";  // 系统自己的（应用、缓存）
+}
+
+void FindIn(const std::string& dir, int depth, const std::vector<std::string>& exts, int64_t min_size, int64_t deadline,
+            std::string& out, size_t cap, int32_t& count) {
+    if (depth > 8 || esp_timer_get_time() > deadline || out.size() >= cap) return;
+    DIR* d = opendir(dir.c_str());
+    if (!d) return;
+    std::vector<std::string> subdirs;
+    while (dirent* e = readdir(d)) {
+        std::string child = dir + "/" + e->d_name;
+        if (e->d_type == DT_DIR) {
+            if (!SkipDir(child, e->d_name)) subdirs.push_back(child);
+            continue;
+        }
+        const char* dot = strrchr(e->d_name, '.');
+        if (e->d_name[0] == '.' || !dot) continue;  // . 开头的（macOS 的 ._ 文件）不要
+        if (std::find(exts.begin(), exts.end(), nomi::Lower(dot + 1)) == exts.end()) continue;
+        struct stat st;
+        if (stat(child.c_str(), &st) != 0 || st.st_size < min_size) continue;
+        std::string line = "sd:/" + child.substr(4) + "\t" + std::to_string(static_cast<long long>(st.st_size)) + "\n";
+        if (out.size() + line.size() + 1 > cap) break;
+        out += line;
+        count++;
+    }
+    closedir(d);
+    std::sort(subdirs.begin(), subdirs.end());
+    for (const auto& sub : subdirs) FindIn(sub, depth + 1, exts, min_size, deadline, out, cap, count);
+}
+
+// 在卡上 dir 下面（含子文件夹）找扩展名是 exts（逗号分开，不带点）之一、不小于 min_size 字节的文件
+int32_t fs_find(wasm_exec_env_t env, const char* dir, const char* exts, int32_t min_size, char* buf, uint32_t size) {
+    int32_t err;
+    std::string root = Resolve(Ctx(env), dir, false, &err);
+    if (root.empty()) return err;
+    while (root.size() > 3 && root.back() == '/') root.pop_back();
+    if (root != "/sd" && root.rfind("/sd/", 0) != 0) return E_DENIED;  // 只找 SD 卡
+    NomiSdCard::Use sd;
+    if (!sd) return E_NO_SD;
+    std::vector<std::string> list;
+    std::string e = exts ? exts : "";
+    for (size_t i = 0; i <= e.size();) {
+        size_t j = e.find(',', i);
+        if (j == std::string::npos) j = e.size();
+        std::string one = nomi::Lower(e.substr(i, j - i));
+        if (!one.empty() && one[0] == '.') one.erase(0, 1);
+        if (!one.empty()) list.push_back(one);
+        i = j + 1;
+    }
+    if (list.empty() || size == 0) return E_FAIL;
+    std::string out;
+    int32_t count = 0;
+    int64_t t0 = esp_timer_get_time();
+    FindIn(root, 0, list, min_size, t0 + 20 * 1000000LL, out, size, count);
+    ESP_LOGI(TAG, "fs_find %s (%s): %d files in %lld ms", root.c_str(), e.c_str(), static_cast<int>(count),
+             (esp_timer_get_time() - t0) / 1000);
+    memcpy(buf, out.data(), out.size());
+    buf[out.size()] = '\0';
+    return count;
+}
+
 // 小设置和进度：data/kv.json，一个 JSON 对象，改一次写一次（不占设备那 16KB 的 NVS）
 void LoadKv(Proc* p) {
     std::string text, path = p->pkg->dir + "/data/kv.json";
@@ -1036,6 +1368,8 @@ NativeSymbol kNatives[] = {
     {"ui_item", (void*)ui_item, "($$$)i", nullptr},
     {"ui_button", (void*)ui_button, "($i)i", nullptr},
     {"ui_set_text", (void*)ui_set_text, "(i$)", nullptr},
+    {"ui_slider", (void*)ui_slider, "($iii)i", nullptr},
+    {"ui_set_value", (void*)ui_set_value, "(ii)", nullptr},
     {"ui_set_hidden", (void*)ui_set_hidden, "(ii)", nullptr},
     {"ui_remove", (void*)ui_remove, "(i)", nullptr},
     {"ui_toast", (void*)ui_toast, "($)", nullptr},
@@ -1044,6 +1378,13 @@ NativeSymbol kNatives[] = {
     {"fs_list", (void*)fs_list, "($*~)i", nullptr},
     {"fs_size", (void*)fs_size, "($)i", nullptr},
     {"fs_read", (void*)fs_read, "($i*~)i", nullptr},
+    {"fs_find", (void*)fs_find, "($$i*~)i", nullptr},
+    {"ui_reader", (void*)ui_reader, "($ii)i", nullptr},
+    {"reader_goto", (void*)reader_goto, "(ii)", nullptr},
+    {"reader_set_flags", (void*)reader_set_flags, "(ii)", nullptr},
+    {"reader_text", (void*)reader_text, "(i*~)i", nullptr},
+    {"text_chapters", (void*)text_chapters, "($i*~)i", nullptr},
+    {"text_chapter_at", (void*)text_chapter_at, "($i)i", nullptr},
     {"kv_get", (void*)kv_get, "($*~)i", nullptr},
     {"kv_set", (void*)kv_set, "($$)i", nullptr},
     {"media_play", (void*)media_play, "($$$iiii)i", nullptr},
