@@ -23,7 +23,8 @@
 
 static const char *TAG = "WifiBoard";
 
-// Connection timeout in seconds
+// Connection timeout in seconds. Exceeding it no longer switches to config mode:
+// it only triggers a one-time hint, the station keeps retrying in the background.
 static constexpr int CONNECT_TIMEOUT_SEC = 60;
 
 WifiBoard::WifiBoard() {
@@ -160,11 +161,14 @@ void WifiBoard::SetNetworkEventCallback(NetworkEventCallback callback) {
 }
 
 void WifiBoard::OnWifiConnectTimeout(void* arg) {
+    // 连不上不再切配网模式：站点留着按退避间隔继续扫（10 秒起步，最长 5 分钟一轮），
+    // 网络一恢复就连上、照常激活；断网期间时钟、闹钟和 SD 卡上的本地应用照常能用。
+    // 要重新配网走手动入口：启动没完成时按一下按键，或设置里「开配网热点」。
+    ESP_LOGW(TAG, "WiFi connection timeout, keep retrying in the background");
     auto* board = static_cast<WifiBoard*>(arg);
-    ESP_LOGW(TAG, "WiFi connection timeout, entering config mode");
-
-    WifiManager::GetInstance().StopStation();
-    board->StartWifiConfigMode();
+    Application::GetInstance().Schedule([board]() {
+        board->GetDisplay()->ShowNotification(Lang::Strings::WIFI_RETRY_OFFLINE, 10000);
+    });
 }
 
 void WifiBoard::StartWifiConfigMode() {

@@ -1022,19 +1022,26 @@ static void add_saved_wifi(lv_obj_t *page)
 
 static void build_network_page(lv_obj_t *page)
 {
-    // 配网模式：先告诉人怎么加网络——扫码连上热点（手机一般会自动弹出配网页）
+    // 配网模式 / 离线热点：先告诉人怎么连上设备——扫码连上热点（手机一般会自动弹出网页）。
+    // 前者是设备在等配置，后者是没连上家里 Wi-Fi 时设备自己开的控制热点
     // get_text 的返回值只到下一次调用前有效（设备上是同一个 std::string），热点名先拷出来，
     // 不然下面再取网址时会被覆盖，提示里热点名的位置也显示成网址
     char hotspot[40];
     snprintf(hotspot, sizeof(hotspot), "%s", get_text("hotspot"));
     if (hotspot[0]) {
+        bool offline = strcmp(get_text("hotspot_mode"), "offline") == 0;
         char wifi_qr[64], hint[160];
         snprintf(wifi_qr, sizeof(wifi_qr), "WIFI:T:nopass;S:%s;;", hotspot);
-        snprintf(hint, sizeof(hint), "手机扫码连热点 %s，打开 %s 添加 Wi-Fi", hotspot, get_text("hotspot_url"));
-        lv_obj_t *item = add_item(page, "配网中", hint);
+        if (offline) {
+            snprintf(hint, sizeof(hint), "手机扫码连热点 %s，连上会自动打开设置页（%s）",
+                     hotspot, get_text("hotspot_url"));
+        } else {
+            snprintf(hint, sizeof(hint), "手机扫码连热点 %s，打开 %s 添加 Wi-Fi", hotspot, get_text("hotspot_url"));
+        }
+        lv_obj_t *item = add_item(page, offline ? "离线模式" : "配网中", hint);
         add_qrcode(item, wifi_qr);
         add_saved_wifi(page);
-        return;  // 配网时没有局域网地址，网页设置页的二维码也不显示（二维码画布只有一块，也放不下两张）
+        return;  // 配网 / 离线时没有局域网地址，网页设置页的二维码也不显示（二维码画布只有一块，也放不下两张）
     } else {
         lv_obj_t *item = add_item(page, "当前 Wi-Fi", NULL);
         s_wifi_label = lv_label_create(item);

@@ -36,6 +36,7 @@
         "WIFI_CONFIG_MODE": "Wi-Fi Configuration Mode",
         "ENTERING_WIFI_CONFIG_MODE": "Entering Wi-Fi configuration mode...",
         "SCANNING_WIFI": "Scanning Wi-Fi...",
+        "WIFI_RETRY_OFFLINE": "Wi-Fi unavailable, will keep retrying; works offline, scan the QR in settings to connect",
         "NEW_VERSION": "New version ",
         "OTA_UPGRADE": "OTA Upgrade",
         "UPGRADING": "System is upgrading...",

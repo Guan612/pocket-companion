@@ -10,6 +10,7 @@
 #include <esp_http_server.h>
 #include <esp_log.h>
 #include <esp_netif.h>
+#include <esp_wifi.h>
 #include <ssid_manager.h>
 #include <wifi_manager.h>
 
@@ -323,6 +324,11 @@ esp_err_t HandleWifiAdd(httpd_req_t* req) {
     }
     SsidManager::GetInstance().AddSsid(ssid, password);
     ESP_LOGI(TAG, "Wi-Fi saved: %s", ssid.c_str());
+    // 没联网时（比如在公司存公司 Wi-Fi）立刻扫一遍：重试中的站点退避最长 5 分钟一轮，
+    // 不扫就得干等；在扫的话这一下会失败，反正那趟结果里就有。配网模式下站点是停的，别扫
+    if (!WifiManager::GetInstance().IsConnected() && !WifiManager::GetInstance().IsConfigMode()) {
+        esp_wifi_scan_start(nullptr, false);
+    }
     cJSON* ok = cJSON_CreateObject();
     cJSON_AddBoolToObject(ok, "ok", true);
     cJSON_AddStringToObject(ok, "message", exists ? "已更新密码" : "已保存，到了它附近会自动连上");
@@ -350,7 +356,11 @@ std::string DeviceIp() {
     esp_netif_t* netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
     esp_netif_ip_info_t ip = {};
     if (netif == nullptr || esp_netif_get_ip_info(netif, &ip) != ESP_OK || ip.ip.addr == 0) {
-        return "";
+        // 没联网时网页从离线热点访问（192.168.4.1），设置页的网址跟它走
+        netif = esp_netif_get_handle_from_ifkey("WIFI_AP_DEF");
+        if (netif == nullptr || esp_netif_get_ip_info(netif, &ip) != ESP_OK || ip.ip.addr == 0) {
+            return "";
+        }
     }
     char buf[16];
     snprintf(buf, sizeof(buf), IPSTR, IP2STR(&ip.ip));

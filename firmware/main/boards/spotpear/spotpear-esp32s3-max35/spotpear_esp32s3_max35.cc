@@ -17,6 +17,7 @@
 #include "nomi_open.h"
 #include "nomi_files.h"
 #include "nomi_filesapp.h"
+#include "nomi_hotspot.h"
 #include "nomi_phone.h"
 #include "nomi_photo.h"
 #include "nomi_pkg.h"
@@ -569,6 +570,13 @@ public:
         NomiPkg::GetInstance().Start();    // 预装应用、迁老数据、扫装好的应用包，登记到桌面
         NomiPhone::Start();                // 蓝牙连手机（Gadgetbridge）
         GetBacklight()->RestoreBrightness();
+    }
+
+    // 离线热点的事件要挂在默认事件循环上，而循环是 WifiManager::Initialize 建的（构造函数里还没有，
+    // 在那儿注册会 abort——崩过一轮），所以等网络栈起来再初始化
+    void StartNetwork() override {
+        WifiBoard::StartNetwork();
+        NomiHotspot::Init();
     }
 
     // 焊了 ES7210 的版本由它录音：双麦克风 + 喇叭回采（MIC3），能做设备端回声消除；

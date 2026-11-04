@@ -7,6 +7,7 @@
 #include "face_script.h"
 #include "nomi_clock.h"
 #include "nomi_font.h"
+#include "nomi_hotspot.h"
 #include "nomi_sheet.h"
 #include "nomi_photo.h"
 #include "nomi_music.h"
@@ -251,7 +252,11 @@ std::string DeviceIp() {
     esp_netif_t* netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
     esp_netif_ip_info_t ip = {};
     if (netif == nullptr || esp_netif_get_ip_info(netif, &ip) != ESP_OK || ip.ip.addr == 0) {
-        return "";
+        // 没联网时显示离线热点的地址（设置页「IP 地址」和网页设置页的二维码跟它走）
+        netif = esp_netif_get_handle_from_ifkey("WIFI_AP_DEF");
+        if (netif == nullptr || esp_netif_get_ip_info(netif, &ip) != ESP_OK || ip.ip.addr == 0) {
+            return "";
+        }
     }
     char buf[16];
     snprintf(buf, sizeof(buf), IPSTR, IP2STR(&ip.ip));
@@ -277,9 +282,25 @@ const char* GetText(const char* key) {
             text += item.ssid;
         }
     } else if (!strcmp(key, "hotspot")) {
-        text = WifiManager::GetInstance().GetApSsid();  // 不在配网模式时是空的
+        // 离线热点或配网热点，都不在时是空的（设置页签名里有它，热点开了下次下拉会重建出二维码）
+        if (NomiHotspot::Active()) {
+            text = NomiHotspot::Ssid();
+        } else {
+            text = WifiManager::GetInstance().GetApSsid();
+        }
     } else if (!strcmp(key, "hotspot_url")) {
-        if (WifiManager::GetInstance().IsConfigMode()) text = WifiManager::GetInstance().GetApWebUrl();
+        if (NomiHotspot::Active()) {
+            text = NomiHotspot::Url();
+        } else if (WifiManager::GetInstance().IsConfigMode()) {
+            text = WifiManager::GetInstance().GetApWebUrl();
+        }
+    } else if (!strcmp(key, "hotspot_mode")) {
+        // "offline" 离线热点 / "config" 配网热点 / 空都不是，网络页拿它换标题和提示语
+        if (NomiHotspot::Active()) {
+            text = "offline";
+        } else if (WifiManager::GetInstance().IsConfigMode()) {
+            text = "config";
+        }
     } else if (!strcmp(key, "ip")) {
         text = DeviceIp();
     } else if (!strcmp(key, "config_url")) {
@@ -351,7 +372,11 @@ void Action(const char* name) {
             app.Schedule([&app]() { app.AbortSpeaking(kAbortReasonNone); });
         }
     } else if (!strcmp(name, "reconfigure_wifi")) {
-        app.Schedule([]() { static_cast<WifiBoard&>(Board::GetInstance()).EnterWifiConfigMode(); });
+        app.Schedule([]() {
+            // 配网热点和离线热点用同一个 AP 接口，先收掉我们的
+            NomiHotspot::StopForConfigMode();
+            static_cast<WifiBoard&>(Board::GetInstance()).EnterWifiConfigMode();
+        });
     } else if (!strcmp(name, "factory_reset")) {
         app.Schedule([]() {
             ESP_LOGW(TAG, "Factory reset");

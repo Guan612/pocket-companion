@@ -51,7 +51,8 @@ typedef struct {
     // 拖动滑条过程中 final 为 false，松手时为 true（设备只在 final 时写 NVS）
     void (*set_int)(const char *key, int value, bool final);
     // 只读文字：personas、voices（'\n' 分隔）、wifi（带信号）、wifi_ssid、ip、config_url、version、
-    // saved_wifi（已存的 Wi-Fi，'\n' 分隔）、hotspot / hotspot_url（配网热点名和网址，不在配网模式时为空）。
+    // saved_wifi（已存的 Wi-Fi，'\n' 分隔）、hotspot / hotspot_url（热点名和网址：配网热点或离线热点
+    // 开着时有值，都没有时为空）、hotspot_mode（"config" 配网 / "offline" 离线 / 空都不是）。
     // 时钟页：clock_time（"14:32"，没对上时间为空）、clock_date、weather_temp（"26°"）、
     // weather_text（"多云 · 深圳  23~32°"，城市没找到时是提示）、weather_city（设的城市，空 = 自动）、
     // alarms（接下来要响的闹钟，按时间排，一行一个 "编号\t什么时候\t事由"）。

@@ -192,6 +192,27 @@ python tools/app-sdk/wasm_info.py apps/music/build/app.wasm   # 看导入导出�
 - 上机验证：放歌等「睡着」时间到，屏幕切时钟、变暗、息屏，歌不断；摸屏幕回收听卡片；对话中不会中途睡着。
 - **2026-11-04 上机发现并修了**：「多久后睡着」设成从不、「多久后息屏」还有时间时，到点只关背光、不进睡眠；`PowerSaveTimer::WakeUp` 只在睡眠里才回调 `OnExitSleepMode`，所以摸屏、唤醒词、按 BOOT 都亮不回来，只能按 power 重启（这个组合不放歌时本来也会这样，放歌不挡睡眠后更容易碰到）。板子加了 `screen_off_` 和 `WakeScreen()`，所有叫醒的地方都走它，息屏过就还原亮度。上机验证：睡着设从不、息屏设 2 分钟，等黑屏后摸一下能亮；黑屏时喊唤醒词也亮。
 
+## 已修：断网不再卡在配网提示，离线照常能用（2026-11-04，待上机验证）
+
+- **现象**：断网时（尤其是断着网开机）一直提示进配网模式，网络恢复了也出不来。
+- **原因**：`WifiBoard::TryWifiConnect`（boards/common/wifi_board.cc）开机起 60 秒定时器，连不上就 `OnWifiConnectTimeout` → 停站点 + `StartWifiConfigMode()` 开热点；进了配网站点就是停着的，只有网页提交配置（`ConfigModeExit`）才会再连，没有任何自动恢复。机器在 -80 dBm 弱 Wi-Fi 下，路由器重启没就绪就必中。
+- **修法**：超时不再切配网——站点留着按自己的退避间隔继续扫（10 秒起步、最长 5 分钟一轮，本来就是现成的），只在 60 秒那一刻弹一次提示「连不上 Wi-Fi，会自动重试；离线也能用，设置里可开配网热点」（新语言串 `WIFI_RETRY_OFFLINE`，zh-CN / en-US）。网络一恢复 `Connected` → `HandleNetworkConnectedEvent`（状态还是 starting）→ 照常激活。
+- **离线模式就是现状**：应用系统、时钟闹钟、本地音乐 / 小说 / 图片都不依赖网络（自己查 `NetworkUp()`，联网接口返回 `E_NO_NET`），唤醒词模型开机就从本地资源分区加载。语音对话离线不可用（没有协议，按了没反应）。屏幕每轮扫描会弹「连接 / 扫描 Wi-Fi...」，状态栏图标显示离线。注意离线开不了 SNTP，**时钟页时间不对**（机器没有 RTC 硬件），联网后自动对时。
+- **配网只剩手动入口**：启动没完成（=没网）时按一下 BOOT 键、设置页「开配网热点」、网页提交配置后重连。首开（没存过 Wi-Fi）仍然自动进配网，没变。
+- 上机验证：**正常联网路径已验**（刷机后 9 秒同步网络时间、无超时提示、照常进待机）。断网分支待验：关路由器 Wi-Fi 重启设备，等 60 秒应只弹一次提示、界面照常；开回 Wi-Fi 最快 10 秒、最慢 5 分钟自动重连激活。串口里对应 `WiFi connection timeout, keep retrying in the background` 一条。
+- **2026-11-04 刷机顺带看到的**：这台机器的口号从 COM11 变成了 COM3（插拔换了 USB 口）；开机 SRAM 最低水位降到 ~5.2KB（handoff 之前记 9.6KB，蓝牙开机就开 + 资源分区开机就应用，底部更紧了，目前没出事）。
+
+## 离线热点：断网自动开个控制热点（2026-11-04，待上机验证）
+
+用户要的：离线时网页控制也得有——设备自己开个热点，手机连上来用网页设置页控制。
+
+- **`nomi_hotspot.cc/.h`**（板子目录）：开机注册事件，断网满 60 秒开热点（开机没网、运行中断网都算；闪断不打扰），拿到 IP 自动关。**APSTA 模式**：`esp_wifi_set_mode(APSTA)` 只给跑着的站点加开一个 AP 面，重试照旧（绕开 WifiManager 的互斥，它只管自己那套）。SSID `Nomi-XXXX`（softAP MAC 后四位）、开放热点、captive portal（复用组件的 `DnsServer`，所有域名指到 192.168.4.1，手机连上自动弹设置页）。
+- **网页服务不用动**：80 端口监听所有网卡，热点一开，全功能设置页自动从 `http://192.168.4.1/` 可达；`DeviceIp()`（config_server 和 nomi_display 两处）没 STA IP 时落到 AP。离线时没有协议（没 TLS ~30KB），内存够 AP + DNS 用。
+- **界面**：不做新浮层——设置→网络页里那张二维码直接换（`hotspot` 文本在设置页签名里，热点开了下次下拉自动重建；nomi_display 的胶水加了 `hotspot_mode`：`config` / `offline`）。离线热点标题「离线模式」，提示「连上会自动打开设置页」；配网热点照旧「配网中」。60 秒超时提示改成「下拉设置可扫码连热点控制」。
+- **换地方连新 Wi-Fi**（公司场景）：连着热点在网页上存公司 Wi-Fi（`/wifi/add`，本来就是这一份 SsidManager）→ 没联网时存完立刻触发一次扫描（不然退避最长 5 分钟才发现）→ 连上公司网后热点自动关，手机切到公司网照常访问设备。注意公司网开了 AP 隔离（客户端互相不通）时，手机访问不到设备，热点方案在**连不上任何网**时才好用。
+- **和配网热点的冲突**：手动「开配网热点」前先 `NomiHotspot::StopForConfigMode()`（同一个 AP 接口，nomi_display 的 reconfigure_wifi 动作里调）。
+- 上机验证：**正常联网路径已验**（刷入后完整启动：4 秒拿到 IP、激活进待机、时间同步、热点没误开；第一版在构造函数里注册事件崩了重启循环，挪到 `StartNetwork` 之后修好——见「踩过的坑」）。断网分支待验：关路由 Wi-Fi 重启 → 60 秒后热点广播、提示弹一次、网络页有二维码；手机扫码连上自动弹设置页；开回路由 Wi-Fi → 热点自动关、自动重连激活；连着热点时看内部 RAM 余量（日志 `Hotspot Nomi-XXXX up, internal free`）。
+
 ## 第 ④ 步：完成情况（2026-11-03）
 
 目标达成：固件里不再有电台台单、播客、在线点歌的业务，全在音乐应用里；老 NVS 数据不迁移，设备上的已经用 `tools/erase_legacy_nvs.py` 清掉（备份在仓库外 `C:\Users\yuxin\code\ESP32\`）。
@@ -223,6 +244,7 @@ python tools/app-sdk/wasm_info.py apps/music/build/app.wasm   # 看导入导出�
 - **拉了新代码别只 `idf.py reconfigure`**：sdkconfig 是旧的，新组件（比如 WAMR）会按自己的默认值补进去（WASI 默认开，链接就报 `os_openat` 未定义）。要跑 `python scripts/build.py spotpear/spotpear-esp32s3-max35 --name spotpear-esp32s3-max35` 按 config.json 重新生成 sdkconfig。
 - WAMR 必须在 pthread 里跑（加载时调 `pthread_self`），普通 FreeRTOS 任务里断言重启。
 - 板子构造函数里别调 `Board::GetInstance()`（单例没建完，自己等自己）。显示对象由板子传给 `NomiWasm::Init`。
+- **板子构造函数里默认事件循环还没建**（`WifiManager::Initialize` 才建）：注册 Wi-Fi 事件（`esp_event_handler_instance_register`）直接 abort、重启循环。要挂 Wi-Fi 事件的模块在板子里重载 `StartNetwork()`，`WifiBoard::StartNetwork()` 之后挂（离线热点 `NomiHotspot::Init` 就这么干的）。
 - LVGL 字体声明（`LV_FONT_DECLARE`）别写进匿名命名空间，链接找不到。
 - zig 默认带调试信息，app.wasm 大三倍：`build.py` 已加 `-g0 -Wl,--strip-all`。
 - 应用内存别开太大：开到 1MB 时 PSRAM 不够读 m4a 的 moov，连固件自己的播客都放不了（2026-11-04 起 moov 不整块读了，但 PSRAM 还是紧）。
