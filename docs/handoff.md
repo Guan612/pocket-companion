@@ -6,7 +6,7 @@
 
 Pocket Companion 是一个桌面语音伙伴：底座是小智 xiaozhi-esp32 v2.5.2（`firmware/`，git subtree），硬件是 SpotPear ESP32-S3 3.5 寸板，界面是自己画的 Nomi，设备直连 OpenAI 兼容接口，不要任何服务端。
 
-最近在做的是**应用化**：固件只做系统能力（解码播放、联网、存储、界面控件、大模型），业务做成可安装的应用包（WebAssembly，`.npk`）。音乐（本地、电台、播客、在线点歌）已经搬进了音乐应用，并且预装在机器里，不插 SD 卡也能用。
+最近在做的是**应用化**：固件只做系统能力（解码播放、联网、存储、界面控件、大模型），业务做成可安装的应用包（WebAssembly，`.npk`）。音乐（本地、电台、播客、在线点歌）已经搬进了音乐应用，并且预装在机器里，不插 SD 卡也能用。2026-11-04 又加了蓝牙连手机（Gadgetbridge）和地图应用，见「手机连接、地图」。
 
 迁移分五步，进度：
 
@@ -32,10 +32,14 @@ Pocket Companion 是一个桌面语音伙伴：底座是小智 xiaozhi-esp32 v2.
 | `nomi_app.c/.h` | 桌面和应用层（打开、右划返回、应用管理） |
 | `nomi_display.cc` | 界面和系统的胶水：界面要的文字、图片、按钮动作 |
 | `spotpear_esp32s3_max35.cc` | 板子初始化、大模型工具注册（含 `self.app.command`）、网页接口挂载（应用、SD 卡） |
+| `nomi_phone.cc/.h` | 手机连接：蓝牙（NimBLE）装成 Bangle.js 手表，收发 Gadgetbridge 的消息、对时 |
+| `nomi_canvas.cc/.h` | 画布控件：应用给一份线、多边形、圆、字的清单，屏幕刷新时照着画 |
 | `preinstall/nomi.music.npk` | 预装的音乐应用包（**手动打的，改了应用要重打**） |
 | `firmware/main/protocols/direct_api_config_*` | 网页设置页（页面 HTML 在 `direct_api_config_page.h`） |
 | `firmware/partitions/v2/16m_apps.csv` | 这块板子的分区表 |
 | `apps/music/` | 音乐应用源码：`main.c`（界面、分发、本地、电台）`podcast.c` `online.c` `assets/`（台单、网页） |
+| `apps/map/` | 地图应用（不预装，网页上传装在 SD 卡上）：道路图、导航转向、手机定位 |
+| `tools/map/make_map.py` | 用 OpenStreetMap 做离线道路包（`.nmap`），`--upload 设备IP` 直接传到卡上 `maps/` |
 | `tools/app-sdk/` | SDK：`nomi_sdk.h`（接口）`nomi_text.h`（文字工具）`build.py`（编译打包）`examples/counter` |
 | `tools/device-sim/` | 浏览器整机模拟器（应用平台还没接进去） |
 
@@ -49,6 +53,8 @@ idf.py build                      # 平时
 idf.py reconfigure build          # 板子目录里新加了 .cc（源文件是 glob 的，配置时才扫）
 python scripts/build.py spotpear/spotpear-esp32s3-max35 --name spotpear-esp32s3-max35
                                   # 改了板子 config.json（分区表、sdkconfig 项）：重新生成 sdkconfig，全量编译
+idf.py reconfigure -DCMAKE_NINJA_FORCE_RESPONSE_FILE=1 build
+                                  # build.py 重建了编译缓存，编到最后报 CreateProcess failed 时接着跑这个（见「踩过的坑」）
 idf.py -p COM11 flash             # 刷机（会写程序、资源、分区表；不写 nvs 和应用分区）
 ```
 
@@ -94,6 +100,31 @@ python tools/app-sdk/wasm_info.py apps/music/build/app.wasm   # 看导入导出�
 - 首页左右翻：历史、表情、收听卡片、时钟；往上推是桌面（应用网格）；下拉是设置；任何地方叫它说话从底下升起对话浮层，不翻页。
 - 收听卡片：装了带 `tile` 的应用就盖上一层（`nomi_ui_listen_slot`），系统收听页整层藏起来。音乐应用在卡片里用 `ui_now_playing`（和系统收听页同一个组件：左边封面、控制、进度，右边 7 行歌词），顶上一排放「本地 / 电台 / 播客 / 在线」入口。
 
+## 手机连接、地图（2026-11-04）
+
+用户要的：板子上看「该怎么走」——转向、距离、速度、朝向，还有周围道路的大概样子（参考过 moto-gps-waveshare 的道路拓扑画法，只借了这个思路，没用它的代码）。定下来的做法：**不写手机 App**，手机装开源的 Gadgetbridge + OsmAnd / CoMaps 导航，板子用蓝牙装成 Bangle.js 手表收它的消息；道路图用 OpenStreetMap 做成离线包放 SD 卡。导航数据只从 Gadgetbridge 来，地图数据只在卡上，地图应用不预装（用户定的）。
+
+- **手机连接**（系统，`nomi_phone.cc`）：NimBLE 外设，Nordic UART 服务，名字「Bangle.js Nomi」（Gadgetbridge 按服务 UUID + 名字开头认 Bangle.js）。手机发来一行一条 `\x10GB({...})`，系统按 `"t"` 交给 `phone_listen` 过这一类的应用（`nomi_wasm.cc` 的 `OnPhoneMessage`），自己只认连上时那行 `setTime(秒)` 对时。发回去的行尾要 `\r\n`。不加密：Gadgetbridge 加设备时选「不配对」。
+- **内存**：蓝牙开起来要约 28KB 内部 RAM，原来平时只空 40～50KB、开机最低到过 4.8KB，直接开就起不来。做了这几样（板子 `config.json`）：
+  - `CONFIG_BT_CTRL_RUN_IN_FLASH_ONLY=y`：控制器代码放闪存，省约 20KB IRAM（代价是程序变大，见下面分区）。
+  - `CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=0`：普通 `malloc` 不论大小都先给 PSRAM（原来小块的给内部）。
+  - `CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP=y`：Wi-Fi、lwIP 的缓冲放 PSRAM。
+  - `CONFIG_CAMERA_PSRAM_DMA=y`：摄像头 DMA 直接写 PSRAM，省掉内部 30KB 的 DMA 缓冲。
+  - NimBLE 的内存放 PSRAM，只开外设角色、一个连接。
+  - 结果：平时内部空闲 59.7KB、开机最低 9.6KB。蓝牙要开机就开（`NomiPhone::Start` 在 `NomiPkg` 之后）：试过推迟开，那时内部 RAM 已经碎了，控制器要的那块连续内存申请不到。
+- **分区**：程序 4.01MB 超了 3.94MB 的程序槽，资源分区 6MB → 5MB、两个程序槽各 4.44MB（还能 OTA），见 [flash-partitions.md](flash-partitions.md)。现在剩 10%。
+- **拍照**：内存改完后拍照失败了（`image_to_jpeg` 要好几块 600KB 的临时缓冲，PSRAM 拿不出）。改成在摄像头这一帧上原地把 RGB565 换算成 YUYV，直接交给 esp_new_jpeg 编码，额外只要放结果的 256KB。上机拍过 640×480、36KB 的 JPEG，画面对（转了 90°，原来就这样）；大模型认图这一步用户还没再试。
+- **接口 api 4**：`phone_*`、画布 `ui_canvas` `canvas_*`（`nomi_canvas.cc`）、`screen_keep_on`（前台应用要屏幕常亮：停掉休眠计时、屏幕关着的话叫亮；退到后台、退出自动放开）。见 [app-sdk.md](app-sdk.md)。
+- **地图应用**（`apps/map` 0.1.0）：
+  - 道路：卡上 `maps/*.nmap`，按定位读周围 3×3 块（约 3 公里见方）；车头朝上，自己在下方、地图跟着朝向转；步行 / 骑车 / 开车只画能走的路，缩放跟着变（步行看近、开车看远）；走过的轨迹叠上去；右上角指北。
+  - 导航：底栏大箭头（17 种 action 都画了）、「X 米后左转」、路名、到达时间、速度。Gadgetbridge 不给路线形状，要走的那条路画不出高亮。
+  - 定位：界面挂着时发 `gps_power` 让手机推、拿下时停，30 秒没来再要一次；导航中或定位一直在来时屏幕常亮。
+  - 点屏幕出菜单换出行方式（存 kv `mode`），菜单里有 OSM 的署名。
+- **地图包**（`tools/map/make_map.py`）：从 Overpass 取 OSM 道路（几个镜像轮着试、失败重试），按 0.01° 切块、裁到块边、抽稀，格式见脚本开头。每条路记着谁能走（按 OSM 默认，再看 foot / bicycle / motor_vehicle 这些标签）。成都 30.61～30.69, 104.03～104.12：6468 条路、134KB，已传到设备卡上 `maps/成都.nmap`。坐标 WGS-84，和手机 GPS 一致。
+- **上机验证过**：Gadgetbridge 连上、对时；`gps_power` 手机那边收到了（logcat 里定位监听起来了）；连着蓝牙时对话（HTTPS）、开机取天气、放本地 FLAC、拍照都正常；用假消息喂过 17 种转向箭头、一段走路定位、导航底栏，截图看过道路图（车头朝上、按方式过滤）；常亮有日志 `Keep screen on: yes/no`。
+- **没验证**：真的导航消息（OsmAnd / CoMaps → Gadgetbridge → 板子），尤其中文路名会不会乱码（Gadgetbridge 给 Bangle.js 发字可能会转码）、`distance` 的真实格式；真的 GPS（测的时候手机在室内没定位）；在屏幕上点着换出行方式；连着蓝牙放在线的歌；常亮时屏幕已经关了能不能叫亮（提交前才补的，只编译过）。
+- **调试**：手机 USB 连着这台电脑时，`adb logcat` 能看 Gadgetbridge 收发（别 `adb uninstall`、`pm clear`，会清掉用户的数据）。调试时临时加过两个网页接口（假装手机发一行、截屏成 BMP），提交前删了，要用再临时加。
+
 ## 已修：对话浮层的交互（2026-11-04，待上机验证）
 
 问题：开着设置页叫它说话，浮层（`s_sheet`）盖住底部退出把手，设置页又锁着翻页，AI 说完之前退不出去；顺带浮层本身也只能干等。
@@ -106,7 +137,7 @@ python tools/app-sdk/wasm_info.py apps/music/build/app.wasm   # 看导入导出�
 - 桌面、应用查过没有同类死锁：返回走全高左边缘（`nomi_app.c` 的 `add_edge`），浮层只盖底部 120px，上段照常能划。
 - 上机验证：开着设置页说话、说话中退出设置、对话中下拉进设置再退出、翻到收听页/时钟页再说话，都不卡；说话中点 × 立刻闭嘴（一问一答回待机、连续对话回听）；× 收起后本轮不再升、下一轮对话照常升；浮层收起后设置页恢复锁住；半透明下对话文字读得清、下面内容隐约可见。
 
-## 图片、文件、打开方式、媒体库（2026-11-04，没提交）
+## 图片、文件、打开方式、媒体库（2026-11-04，已提交）
 
 接口版本升到 3（`kApi`、`NOMI_API`、`build.py` 的 `API`）。三个预装应用都改成 api 3、升了版本（音乐 0.5.0、小说 0.3.0、图片 0.2.0），预装包已重打。固件剩 4%（0x2ca20）。
 
@@ -176,15 +207,19 @@ python tools/app-sdk/wasm_info.py apps/music/build/app.wasm   # 看导入导出�
 |---|---|
 | PSRAM 紧 | 音乐应用常驻约占 750KB（内存 512KB + 运行时），装上后剩 1.3MB、最大块 1.3MB。m4a 的目录 2026-11-04 改成按需读了（最多约 100KB，和节目多长无关），不再是瓶颈 |
 | CPU 满载 | 唤醒词 + 收音一直 ~38%；放 96k/24 位 FLAC 解码 + 读卡 ~22%；表情页放歌时的动画 ~30%。三样叠在一起会卡（用户接受「到上限就算了」）。已做：解码优先级降到界面之下、放歌时表情隔帧画 |
-| 内部 RAM | 平时空闲 ~50KB，开机联网那阵最低到过 4.8KB。TLS 一条要 ~30KB，同时只能一条（`HoldForHttps`） |
+| 内部 RAM | 开蓝牙后平时空闲 ~60KB、开机最低 9.6KB（见「手机连接、地图」）。TLS 一条要 ~30KB，同时只能一条（`HoldForHttps`） |
 | 音乐网站慢 | inmp3.com 搜一次 ~15 秒，取歌曲页 + 探格式又十几秒 |
-| 没验证 | 第 ④ 步的迁移（台单顺序、播客进度接着放）、搜台、收听卡片；拔掉 SD 卡开机音乐应用能不能起来（远程做不了）；首页卡片顶上四个入口改宽后是否都显示全（没看屏幕） |
+| 没验证 | 第 ④ 步的迁移（台单顺序、播客进度接着放）、搜台、收听卡片；拔掉 SD 卡开机音乐应用能不能起来（远程做不了）；首页卡片顶上四个入口改宽后是否都显示全（没看屏幕）；真的手机导航和 GPS（见「手机连接、地图」） |
 | 小毛病 | 随机播放时「上一首」也是随机；预装应用删不了也没有「恢复」；网页装应用不能自己选装在哪；装在 SD 卡上的应用在后台跑着（有首页卡片、在放歌）时拔卡，卡一直算挂着，图标要等它停了才灰 |
 
 ## 踩过的坑（速查）
 
 - **栈在 PSRAM 的任务不能读写内部闪存（含 NVS）**：读写闪存时 cache 关掉、访问不了 PSRAM，`esp_task_stack_isane_cache_disabled` 断言重启。应用进程、`nomi_jobs`、播客 / 音乐后台任务的栈都在 PSRAM：碰 `/int` 走 `NomiFlashIo::Run` / `ForPath`，写 NVS 排到主循环（`Application::Schedule`）。
-- **Windows 上全量重编会撞 CreateProcess 的 32767 字符上限**：`project_elf_src` 那条编译命令带全部组件的 include（WAMR 又加了几个目录），超了就报 `CreateProcess failed / The parameter is incorrect`。修法（已写进 build 缓存）：`idf.py reconfigure -DCMAKE_NINJA_FORCE_RESPONSE_FILE=1`，include 进 @rsp 文件。
+- **Windows 上全量重编会撞 CreateProcess 的 32767 字符上限**：`project_elf_src` 那条编译命令带全部组件的 include（WAMR 又加了几个目录），超了就报 `CreateProcess failed / The parameter is incorrect`。修法（已写进 build 缓存）：`idf.py reconfigure -DCMAKE_NINJA_FORCE_RESPONSE_FILE=1`，include 进 @rsp 文件。`scripts/build.py` 会重建编译缓存，跑完它要再来一次。
+- **分区挪了位置，第一次刷机前删 `firmware/build/*_flashed.bin`**：IDF 6.1 只刷和上次不一样的部分，按文件名拿上次刷进去的副本比，不管分区挪没挪。
+- **Gadgetbridge 把每行 `\n` 前面那个字符当 `\r` 去掉**（Espruino 的习惯）：板子发回去只带 `\n`，会吃掉 JSON 最后的 `}`，手机上弹「Malformed JSON」。行尾要 `\r\n`。
+- **蓝牙要开机就开**：控制器要一大块连续的内部 RAM，开机一阵过去就碎了，推迟开申请不到。
+- **`CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=0` 之后普通 `malloc` 都给 PSRAM**：要内部 RAM 的（DMA、闪存操作时要用的、要快的）自己 `heap_caps_malloc(…, MALLOC_CAP_INTERNAL)`。
 - **拉了新代码别只 `idf.py reconfigure`**：sdkconfig 是旧的，新组件（比如 WAMR）会按自己的默认值补进去（WASI 默认开，链接就报 `os_openat` 未定义）。要跑 `python scripts/build.py spotpear/spotpear-esp32s3-max35 --name spotpear-esp32s3-max35` 按 config.json 重新生成 sdkconfig。
 - WAMR 必须在 pthread 里跑（加载时调 `pthread_self`），普通 FreeRTOS 任务里断言重启。
 - 板子构造函数里别调 `Board::GetInstance()`（单例没建完，自己等自己）。显示对象由板子传给 `NomiWasm::Init`。
