@@ -1354,7 +1354,9 @@ bool Application::CanEnterSleepMode() {
     }
 
     if (!audio_service_.IsIdle()) {
-        return false;
+        // 播放队列没排空：状态已是待机，说明不是在对话，是板子的后台播放（放歌、电台、播客）。
+        // 板子声明了不算忙就照常睡——屏幕按设置切时钟/表情、调暗、息屏，歌继续放
+        return playback_allows_sleep_ && playback_allows_sleep_();
     }
 
     // Now it is safe to enter sleep mode

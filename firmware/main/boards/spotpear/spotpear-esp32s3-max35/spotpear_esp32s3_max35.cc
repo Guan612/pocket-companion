@@ -203,6 +203,9 @@ private:
     }
 
     void InitializePowerSave() {
+        // 放歌不算忙：待机时后台还在放（电台、歌、节目）不挡睡着——屏幕按设置变时钟/表情、
+        // 调暗、息屏，歌继续放；摸一下屏幕照常回原来的页面
+        Application::GetInstance().SetPlaybackAllowsSleep([]() { return NomiRadio::GetInstance().Wanted(); });
         const esp_timer_create_args_t dim_args = {
             .callback = [](void* arg) {
                 auto* self = static_cast<SpotpearMax35Board*>(arg);

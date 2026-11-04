@@ -119,6 +119,9 @@ public:
     void WakeWordInvoke(const std::string& wake_word);
     bool UpgradeFirmware(const std::string& url, const std::string& version = "");
     bool CanEnterSleepMode();
+    // 板子声明「后台播放不算忙」：返回 true 时播放队列里剩的东西（放歌、电台、播客）不挡睡着。
+    // 能查到队列没排空时设备状态已是待机（对话中进不来），队列里有货只可能是后台在放
+    void SetPlaybackAllowsSleep(std::function<bool()> check) { playback_allows_sleep_ = std::move(check); }
     void SendMcpMessage(const std::string& payload);
     void RegisterMcpBroadcastCallback(std::function<void(const std::string&)> callback);
     void SetAecMode(AecMode mode);
@@ -152,6 +155,7 @@ private:
     std::unique_ptr<Ota> ota_;
 
     std::function<void(const std::string&)> mcp_broadcast_callback_;
+    std::function<bool()> playback_allows_sleep_;  // 板子给的「后台播放不挡睡」判断，见 SetPlaybackAllowsSleep
 
     bool has_server_time_ = false;
     bool aborted_ = false;
