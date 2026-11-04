@@ -57,6 +57,7 @@ private:
     std::mutex camera_mutex_;  // 抓拍不能和别的抓拍同时拿帧
     bool camera_ready_ = false;  // 摄像头初始化成功（采集平时停着，抓拍时才开）
     std::atomic<bool> sleeping_{false};
+    std::atomic<bool> screen_off_{false};  // 到息屏时间把背光关了（不一定在睡眠里，见 WakeScreen）
     bool holding_ = false;     // BOOT 键按住说话中
     bool alarm_press_ = false;  // 这次按 BOOT 键是为了关闹钟：松开、单击都不再当说话
     esp_timer_handle_t dim_timer_ = nullptr;  // 睡着一会儿后调暗屏幕
@@ -170,7 +171,7 @@ private:
                                          BATTERY_LOWER_RESISTOR, BATTERY_USB_DETECT_PIN);
         // 插拔 USB 时立刻刷新电量显示，并重置休眠计时
         battery_->OnChargingStatusChanged([this](bool charging) {
-            power_save_timer_->WakeUp();
+            WakeScreen();
             display_->UpdateStatusBar(true);
         });
     }
@@ -193,13 +194,25 @@ private:
         });
         power_save_timer_->OnExitSleepMode([this]() {
             sleeping_ = false;
+            screen_off_ = false;
             esp_timer_stop(dim_timer_);
             display_->SetSleep(false);
             GetBacklight()->RestoreBrightness();
         });
         // 到点只息屏，不真关机（这块板没有软关机电路）
-        power_save_timer_->OnShutdownRequest([this]() { GetBacklight()->SetBrightness(0); });
+        power_save_timer_->OnShutdownRequest([this]() {
+            screen_off_ = true;
+            GetBacklight()->SetBrightness(0);
+        });
         power_save_timer_->SetEnabled(true);
+    }
+
+    // 有人用了：重置休眠计时，屏幕关着的话亮起来。
+    // 「多久后睡着」设成从不、「多久后息屏」有时间时，到点只关背光、不进睡眠，PowerSaveTimer::WakeUp
+    // 不会回调 OnExitSleepMode，亮度要在这里还原——不然摸屏、唤醒词、按键都叫不亮，只能重启
+    void WakeScreen() {
+        power_save_timer_->WakeUp();
+        if (screen_off_.exchange(false)) GetBacklight()->RestoreBrightness();
     }
 
     void InitializePowerSave() {
@@ -218,7 +231,7 @@ private:
         };
         ESP_ERROR_CHECK(esp_timer_create(&dim_args, &dim_timer_));
         CreatePowerSaveTimer();
-        NomiDisplay::on_user_activity = [this]() { power_save_timer_->WakeUp(); };
+        NomiDisplay::on_user_activity = [this]() { WakeScreen(); };
         // 设置页改了时间就换一个计时器；在主循环里换，避免和其他调用撞上
         NomiDisplay::on_power_timing_changed = [this]() {
             Application::GetInstance().Schedule([this]() {
@@ -312,7 +325,7 @@ private:
 
     void InitializeButtons() {
         boot_button_.OnPressDown([this]() {
-            power_save_timer_->WakeUp();
+            WakeScreen();
             // 闹钟在响：按一下就是关掉它
             alarm_press_ = NomiClock::GetInstance().IsRinging();
             if (alarm_press_) {
@@ -368,7 +381,7 @@ private:
         clock.RegisterTools();
         clock.on_ring_start = [this](const std::string& time, const std::string& label) {
             NomiRadio::GetInstance().SetAlarmHold(true);  // 电台先停，别和铃声混在一起
-            power_save_timer_->WakeUp();  // 睡着 / 息屏也要亮起来
+            WakeScreen();  // 睡着 / 息屏也要亮起来
             GetBacklight()->RestoreBrightness();
             display_->ShowAlarm(time, label);
         };
@@ -516,7 +529,7 @@ public:
     // 进入对话等高功耗状态时说明有人在用，重置休眠计时
     virtual void SetPowerSaveLevel(PowerSaveLevel level) override {
         if (level != PowerSaveLevel::LOW_POWER) {
-            power_save_timer_->WakeUp();
+            WakeScreen();
         }
         WifiBoard::SetPowerSaveLevel(level);
     }
