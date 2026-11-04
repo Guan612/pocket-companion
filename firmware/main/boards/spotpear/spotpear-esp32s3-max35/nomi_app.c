@@ -91,10 +91,6 @@ static void icon_set_color(lv_obj_t *icon, uint32_t color)
 }
 
 
-static const lv_point_precise_t kMapTip[] = {{11, 16}, {18, 32}, {25, 16}};
-static const nomi_icon_line_t kMapLines[] = {{kMapTip, 3}};
-static const nomi_icon_circle_t kMapCircles[] = {{9, 3, 18}, {15, 9, 6}};
-static const nomi_icon_t kMapIcon = {kMapLines, 1, kMapCircles, 2};
 
 // 应用管理：托盘上一个往下的箭头（下载安装）
 static const lv_point_precise_t kMgrShaft[] = {{18, 4}, {18, 22}};
@@ -103,45 +99,12 @@ static const lv_point_precise_t kMgrTray[] = {{5, 22}, {5, 31}, {31, 31}, {31, 2
 static const nomi_icon_line_t kMgrLines[] = {{kMgrShaft, 2}, {kMgrHead, 3}, {kMgrTray, 4}};
 static const nomi_icon_t kAppMgrIcon = {kMgrLines, 3, NULL, 0};
 
-/* ---------- 占位应用：框架先跑通，内容后面一个个做成应用包 ---------- */
-
-static void placeholder_open(const nomi_app_t *app, lv_obj_t *root)
-{
-    lv_obj_t *list = lv_obj_create(root);
-    lv_obj_remove_style_all(list);
-    lv_obj_set_size(list, LV_PCT(100), LV_PCT(100));
-    lv_obj_set_flex_flow(list, LV_FLEX_FLOW_COLUMN);
-    lv_obj_set_style_pad_hor(list, 32, 0);
-    lv_obj_set_style_pad_ver(list, 20, 0);
-    lv_obj_set_style_pad_row(list, 12, 0);
-    lv_obj_set_scroll_dir(list, LV_DIR_VER);
-    lv_obj_set_scrollbar_mode(list, LV_SCROLLBAR_MODE_AUTO);
-
-    lv_obj_t *title = lv_label_create(list);
-    lv_label_set_text(title, app->name);
-    lv_obj_t *hint = lv_label_create(list);
-    lv_obj_set_width(hint, LV_PCT(100));
-    lv_obj_set_style_text_color(hint, lv_color_hex(C_MUTED), 0);
-    char buf[256];
-    snprintf(buf, sizeof(buf),
-             "%s还在做。先拿这页试交互：往下滚一点，喊「糯米糯米」说句话，说完应该还停在这里；"
-             "从屏幕左边缘往右划，回到桌面。",
-             (const char *)app->user);
-    lv_label_set_text(hint, buf);
-    for (int i = 1; i <= 30; i++) {
-        lv_obj_t *row = lv_label_create(list);
-        snprintf(buf, sizeof(buf), "第 %d 行", i);
-        lv_label_set_text(row, buf);
-    }
-}
-
-static const nomi_app_t kMap = {"map", "地图", &kMapIcon, placeholder_open, NULL, NULL, NULL, "地图"};
-
 /* ---------- 系统应用「应用管理」：看装了哪些、删掉不要的 ---------- */
 
 static lv_obj_t *s_mgr_root, *s_mgr_list;
 static lv_obj_t *s_armed;  // 点过一次、等再点一次确认的删除按钮
 static void appmgr_build(void);
+static void appmgr_row(lv_obj_t *list, const nomi_app_t *app, bool removable);
 
 static void on_uninstall(lv_event_t *e)
 {
@@ -203,54 +166,65 @@ static void appmgr_build(void)
         lv_obj_set_style_text_color(sum, lv_color_hex(C_MUTED), 0);
         lv_label_set_text(sum, s_hooks.summary());
     }
-    for (int i = 0; i < s_app_count; i++) {
-        const nomi_app_t *app = s_apps[i];
-        lv_obj_t *row = lv_obj_create(list);
-        lv_obj_remove_style_all(row);
-        lv_obj_set_size(row, LV_PCT(100), 64);
-        lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
-        lv_obj_set_flex_align(row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-        lv_obj_set_style_pad_column(row, 16, 0);
-        lv_obj_remove_flag(row, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
-        lv_obj_t *icon = lv_obj_create(row);
-        lv_obj_remove_style_all(icon);
-        lv_obj_set_size(icon, ICON_PX, ICON_PX);
-        lv_obj_remove_flag(icon, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
-        nomi_icon_draw(icon, app->icon, ICON_PX);
-        // 名字，下面一行小字：是哪些文件的默认打开方式
-        lv_obj_t *info = lv_obj_create(row);
-        lv_obj_remove_style_all(info);
-        lv_obj_set_height(info, LV_SIZE_CONTENT);
-        lv_obj_set_flex_grow(info, 1);
-        lv_obj_set_flex_flow(info, LV_FLEX_FLOW_COLUMN);
-        lv_obj_remove_flag(info, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
-        lv_obj_t *name = lv_label_create(info);
-        lv_obj_set_width(name, LV_PCT(100));
-        lv_label_set_long_mode(name, LV_LABEL_LONG_MODE_DOTS);
-        lv_label_set_text(name, app->name);
-        const char *defaults = s_hooks.defaults ? s_hooks.defaults(app) : NULL;
-        if (defaults) {
-            lv_obj_t *sub = lv_label_create(info);
-            lv_obj_set_width(sub, LV_PCT(100));
-            lv_label_set_long_mode(sub, LV_LABEL_LONG_MODE_DOTS);
-            lv_obj_set_style_text_color(sub, lv_color_hex(C_MUTED), 0);
-            lv_label_set_text(sub, defaults);
+    // 两遍：先内置的（预装、系统应用，不能删），再自己装的；各自照桌面上的顺序
+    for (int pass = 0; pass < 2; pass++) {
+        for (int i = 0; i < s_app_count; i++) {
+            const nomi_app_t *app = s_apps[i];
+            bool removable = s_hooks.can_uninstall && s_hooks.can_uninstall(app);
+            if (removable != (pass == 1)) continue;
+            appmgr_row(list, app, removable);
         }
-        if (app->dimmed) {  // 和桌面上一样灰着
-            icon_set_color(icon, C_DIMMED);
-            lv_obj_set_style_text_color(name, lv_color_hex(C_DIMMED), 0);
-        }
-        if (defaults && s_hooks.clear_defaults) {
-            lv_obj_add_event_cb(appmgr_button(row, "清除默认", C_TEXT), on_clear_defaults, LV_EVENT_CLICKED,
-                                (void *)app);
-        }
-        if (s_hooks.can_uninstall && s_hooks.can_uninstall(app)) {
-            lv_obj_add_event_cb(appmgr_button(row, "删除", C_DANGER), on_uninstall, LV_EVENT_CLICKED, (void *)app);
-        } else {
-            lv_obj_t *tag = lv_label_create(row);
-            lv_obj_set_style_text_color(tag, lv_color_hex(C_MUTED), 0);
-            lv_label_set_text(tag, "内置");
-        }
+    }
+}
+
+// 应用管理里的一行：图标、名字（下面一行默认打开哪些文件）、清除默认、删除 / 内置
+static void appmgr_row(lv_obj_t *list, const nomi_app_t *app, bool removable)
+{
+    lv_obj_t *row = lv_obj_create(list);
+    lv_obj_remove_style_all(row);
+    lv_obj_set_size(row, LV_PCT(100), 64);
+    lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(row, 16, 0);
+    lv_obj_remove_flag(row, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_t *icon = lv_obj_create(row);
+    lv_obj_remove_style_all(icon);
+    lv_obj_set_size(icon, ICON_PX, ICON_PX);
+    lv_obj_remove_flag(icon, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
+    nomi_icon_draw(icon, app->icon, ICON_PX);
+    // 名字，下面一行小字：是哪些文件的默认打开方式
+    lv_obj_t *info = lv_obj_create(row);
+    lv_obj_remove_style_all(info);
+    lv_obj_set_height(info, LV_SIZE_CONTENT);
+    lv_obj_set_flex_grow(info, 1);
+    lv_obj_set_flex_flow(info, LV_FLEX_FLOW_COLUMN);
+    lv_obj_remove_flag(info, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_t *name = lv_label_create(info);
+    lv_obj_set_width(name, LV_PCT(100));
+    lv_label_set_long_mode(name, LV_LABEL_LONG_MODE_DOTS);
+    lv_label_set_text(name, app->name);
+    const char *defaults = s_hooks.defaults ? s_hooks.defaults(app) : NULL;
+    if (defaults) {
+        lv_obj_t *sub = lv_label_create(info);
+        lv_obj_set_width(sub, LV_PCT(100));
+        lv_label_set_long_mode(sub, LV_LABEL_LONG_MODE_DOTS);
+        lv_obj_set_style_text_color(sub, lv_color_hex(C_MUTED), 0);
+        lv_label_set_text(sub, defaults);
+    }
+    if (app->dimmed) {  // 和桌面上一样灰着
+        icon_set_color(icon, C_DIMMED);
+        lv_obj_set_style_text_color(name, lv_color_hex(C_DIMMED), 0);
+    }
+    if (defaults && s_hooks.clear_defaults) {
+        lv_obj_add_event_cb(appmgr_button(row, "清除默认", C_TEXT), on_clear_defaults, LV_EVENT_CLICKED,
+                            (void *)app);
+    }
+    if (removable) {
+        lv_obj_add_event_cb(appmgr_button(row, "删除", C_DANGER), on_uninstall, LV_EVENT_CLICKED, (void *)app);
+    } else {
+        lv_obj_t *tag = lv_label_create(row);
+        lv_obj_set_style_text_color(tag, lv_color_hex(C_MUTED), 0);
+        lv_label_set_text(tag, "内置");
     }
 }
 
@@ -551,8 +525,7 @@ static void build_launcher(lv_obj_t *tile)
     lv_obj_set_style_pad_row(s_grid, 14, 0);
     lv_obj_set_scroll_dir(s_grid, LV_DIR_VER);  // 应用多了往下滚
     lv_obj_set_scrollbar_mode(s_grid, LV_SCROLLBAR_MODE_OFF);
-    // 音乐、小说、图片已经是应用包（apps/music、apps/novel、apps/photo，预装），装上后自己登记
-    nomi_apps_add(&kMap);
+    // 桌面上的应用都是登记进来的：应用包（音乐、小说、图片预装）装上后自己登记，系统应用「文件」板子登记
     add_edge(tile, on_launcher_edge);
 }
 
