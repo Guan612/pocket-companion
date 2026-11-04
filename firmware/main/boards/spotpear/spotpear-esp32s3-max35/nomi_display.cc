@@ -341,6 +341,12 @@ void Action(const char* name) {
         auto& radio = NomiRadio::GetInstance();
         radio.SeekTo(atoi(name + 12));
         if (!radio.Wanted()) radio.Toggle();
+    } else if (!strcmp(name, "abort_speaking")) {
+        // 对话浮层的 ×：正在说话就打断（Schedule 进主循环，协议要在那边发）；
+        // 别的状态不动对话，浮层自己收就行
+        if (app.GetDeviceState() == kDeviceStateSpeaking) {
+            app.Schedule([&app]() { app.AbortSpeaking(kAbortReasonNone); });
+        }
     } else if (!strcmp(name, "reconfigure_wifi")) {
         app.Schedule([]() { static_cast<WifiBoard&>(Board::GetInstance()).EnterWifiConfigMode(); });
     } else if (!strcmp(name, "factory_reset")) {

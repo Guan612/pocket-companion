@@ -61,13 +61,15 @@ static bool s_music_face;     // 表情页正在放"跟着音乐晃"那段表演
 static uint32_t s_radio_refresh_at;  // 下次对收听页的时刻
 static lv_obj_t *s_canvas, *s_hist_list;
 static lv_obj_t *s_status, *s_battery, *s_subtitle, *s_toast, *s_dots;
-// 对话浮层：不在表盘（表情页）时叫它说话，从屏幕底下升起来，不翻页、不关应用，说完收回去
+// 对话浮层：不在表盘（表情页）时叫它说话，从屏幕底下升起来，不翻页、不关应用，说完收回去。
+// 半透明压在页面上；右上角 × 随时收起（说话中点它先打断），收起后本轮对话不再升，下一轮照常
 #define SHEET_H 120
 #define SHEET_LINGER_MS 1500  // 说完后浮层再留多久（看完最后一句）
 #define WAVE_N 41             // 浮层顶上那条细线的点数
 static lv_obj_t *s_sheet, *s_sheet_text, *s_sheet_wave;
 static lv_point_precise_t s_wave_pts[WAVE_N];
 static bool s_sheet_up;
+static bool s_sheet_dismissed;    // 点过 ×：本轮对话别再升起来（新一轮对话开始时清掉）
 static uint32_t s_sheet_hide_at;  // 对话结束后到这个时刻收起浮层，0 表示不在倒计时
 static lv_timer_t *s_toast_timer;
 static uint32_t s_last_ms, s_emotion_until;
@@ -126,6 +128,7 @@ static void clock_refresh(bool force);
 static void radio_refresh(bool force);
 static void set_text_if_changed(lv_obj_t *label, const char *text);
 static void update_dots(void);
+static void lock_outer_if_settings(void);
 
 // 二维码用 Nayuki 的 qrcodegen：设备上由小智依赖的 esp_emote_gfx 带进来，模拟器里由 LVGL 带进来。
 // 两份同名，不能同时链接，所以不打开 LVGL 的 qrcode 控件，只声明这里用到的三个函数。
@@ -213,6 +216,13 @@ static void sheet_slide(bool up)
     if (up == s_sheet_up) return;
     s_sheet_up = up;
     if (up) lv_obj_remove_flag(s_sheet, LV_OBJ_FLAG_HIDDEN);
+    // 浮层会盖住设置页底部的退出把手：起来时把设置页的翻页锁放开（对话期间上下推就能退出去），
+    // 收回去再照常锁上；手指正拖着就不动，等 SCROLL_END 里锁
+    if (up) {
+        if (lv_tileview_get_tile_active(s_outer) == s_settings_tile) lv_obj_set_scroll_dir(s_outer, LV_DIR_VER);
+    } else if (!lv_obj_is_scrolling(s_outer)) {
+        lock_outer_if_settings();
+    }
     lv_anim_delete(s_sheet, set_sheet_y);
     lv_anim_t a;
     lv_anim_init(&a);
@@ -267,8 +277,10 @@ static void sheet_tick(nomi_state_t state, uint32_t now)
     if (talking) s_sheet_hide_at = 0;
     else if (in_conversation(s_last_state) && !placeholder) s_sheet_hide_at = now + SHEET_LINGER_MS;
     if (s_sheet_hide_at && (int32_t)(now - s_sheet_hide_at) >= 0) s_sheet_hide_at = 0;
+    // 新一轮对话开始时清掉 × 收起的记号，浮层照常升起来
+    if (talking && !in_conversation(s_last_state)) s_sheet_dismissed = false;
     // 在表盘上就交给脸；翻到别处、开着应用就用浮层
-    bool want = (talking || s_sheet_hide_at) && !s_sleeping && !face_in_front();
+    bool want = (talking || s_sheet_hide_at) && !s_sleeping && !face_in_front() && !s_sheet_dismissed;
     if (!want && !talking && !s_sheet_hide_at) lv_label_set_text(s_sheet_text, "");  // 下次从空的开始
     sheet_slide(want);
     if (!s_sheet_up) return;
@@ -283,6 +295,16 @@ static void sheet_tick(nomi_state_t state, uint32_t now)
     lv_obj_add_flag(s_subtitle, LV_OBJ_FLAG_HIDDEN);
 }
 
+// 浮层右上角 ×：收起浮层；正在说话就先打断（一问一答里说半截就回待机，连续对话里回到听）。
+// 只打断说话：在听 / 想的时候没什么可打断的，话照说，浮层收掉就行
+static void on_sheet_close(lv_event_t *e)
+{
+    (void)e;
+    s_sheet_dismissed = true;
+    nomi_state_t state = s_cb.get_state ? s_cb.get_state() : NOMI_STATE_IDLE;
+    if (state == NOMI_STATE_SPEAKING) action("abort_speaking");
+}
+
 static void create_sheet(lv_obj_t *screen)
 {
     s_sheet = lv_obj_create(screen);
@@ -290,7 +312,7 @@ static void create_sheet(lv_obj_t *screen)
     lv_obj_set_size(s_sheet, FACE_W, SHEET_H + 20);  // 多出来的 20 藏在屏幕下面，底下两个圆角看不见
     lv_obj_set_pos(s_sheet, 0, FACE_H);
     lv_obj_set_style_bg_color(s_sheet, lv_color_hex(C_SHEET), 0);
-    lv_obj_set_style_bg_opa(s_sheet, LV_OPA_COVER, 0);
+    lv_obj_set_style_bg_opa(s_sheet, LV_OPA_80, 0);  // 半透明：底下还能看见一点，字要读得清，别低于八成
     lv_obj_set_style_radius(s_sheet, 18, 0);
     lv_obj_set_style_border_width(s_sheet, 1, 0);
     lv_obj_set_style_border_side(s_sheet, LV_BORDER_SIDE_TOP, 0);
@@ -312,6 +334,24 @@ static void create_sheet(lv_obj_t *screen)
     lv_obj_set_style_text_align(s_sheet_text, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_set_pos(s_sheet_text, 32, 40);
     lv_label_set_text(s_sheet_text, "");
+
+    // 右上角 ×：细线两笔（不靠字体，中文字体里 × 缺不缺字不用管），44×44 的手感区
+    lv_obj_t *sheet_close = lv_obj_create(s_sheet);
+    lv_obj_remove_style_all(sheet_close);
+    lv_obj_set_size(sheet_close, 44, 44);
+    lv_obj_align(sheet_close, LV_ALIGN_TOP_RIGHT, -4, 4);
+    lv_obj_add_flag(sheet_close, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_remove_flag(sheet_close, LV_OBJ_FLAG_SCROLLABLE);
+    static lv_point_precise_t close_a[] = {{15, 15}, {29, 29}};
+    static lv_point_precise_t close_b[] = {{29, 15}, {15, 29}};
+    for (int i = 0; i < 2; i++) {
+        lv_obj_t *seg = lv_line_create(sheet_close);
+        lv_obj_set_style_line_width(seg, 2, 0);
+        lv_obj_set_style_line_rounded(seg, true, 0);
+        lv_obj_set_style_line_color(seg, lv_color_hex(C_MUTED), 0);
+        lv_line_set_points(seg, i ? close_b : close_a, 2);
+    }
+    lv_obj_add_event_cb(sheet_close, on_sheet_close, LV_EVENT_CLICKED, NULL);
 }
 
 static void face_tick(lv_timer_t *timer)
@@ -1024,6 +1064,8 @@ static void build_system_page(lv_obj_t *page)
 // 设置页里外层翻页是锁住的，只有按在底部小白条上时才放开，往上推才能回主界面
 static void lock_outer_if_settings(void)
 {
+    // 对话浮层升着的时候不锁：把手被它盖住了，留着上下推，对话里进设置页也能随时退出去
+    if (s_sheet_up) return;
     if (lv_tileview_get_tile_active(s_outer) == s_settings_tile) {
         lv_obj_set_scroll_dir(s_outer, LV_DIR_NONE);
     }
