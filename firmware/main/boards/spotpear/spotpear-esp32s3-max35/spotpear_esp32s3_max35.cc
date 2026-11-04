@@ -14,7 +14,9 @@
 #include "nomi_clock.h"
 #include "nomi_display.h"
 #include "nomi_music.h"
+#include "nomi_open.h"
 #include "nomi_files.h"
+#include "nomi_filesapp.h"
 #include "nomi_photo.h"
 #include "nomi_pkg.h"
 #include "nomi_radio.h"
@@ -456,6 +458,7 @@ private:
         DirectApiConfigServer::AddJsonHandler("/sd/mkdir", true, NomiFiles::MkdirJson);
         DirectApiConfigServer::AddJsonHandler("/sd/rename", true, NomiFiles::RenameJson);
         DirectApiConfigServer::AddJsonHandler("/sd/delete", true, NomiFiles::DeleteJson);
+        DirectApiConfigServer::AddJsonHandler("/sd/open", true, NomiOpen::OpenJson);  // 在设备上打开
         DirectApiConfigServer::AddStreamHandler(
             "/sd/file/", [](const std::string& uri, const DirectApiConfigServer::StreamBegin& begin,
                             const DirectApiConfigServer::StreamWrite& write) {
@@ -511,6 +514,11 @@ public:
         NomiMusic::GetInstance().Start();  // 下封面的后台任务
         NomiWasm::Init(display_);          // 应用包的运行时（docs/app-sdk.md）
         NomiPhoto::Start(display_);        // 后台解图（缩略图、看图、电子相框）
+        {
+            DisplayLockGuard lock(display_);
+            NomiFilesApp::Register();      // 系统应用「文件」
+        }
+        NomiOpen::Start();                 // 记住的「用什么打开」
         NomiPkg::GetInstance().Start();    // 预装应用、迁老数据、扫装好的应用包，登记到桌面
         GetBacklight()->RestoreBrightness();
     }

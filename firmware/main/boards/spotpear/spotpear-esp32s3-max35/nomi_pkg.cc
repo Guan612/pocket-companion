@@ -4,6 +4,7 @@
 #include "board.h"
 #include "display/display.h"
 #include "nomi_flash_io.h"
+#include "nomi_open.h"
 #include "nomi_sdcard.h"
 #include "nomi_ui.h"
 #include "nomi_wasm.h"
@@ -26,7 +27,7 @@
 
 namespace {
 
-constexpr int kApi = 3;                       // 固件支持的接口版本（docs/app-sdk.md）：2 阅读器、fs_find；3 图片、写卡
+constexpr int kApi = 3;                       // 固件支持的接口版本（docs/app-sdk.md）：2 阅读器、fs_find；3 图片、写卡、打开文件
 constexpr size_t kMaxPackage = 4 * 1024 * 1024;
 constexpr size_t kMaxWasm = 1024 * 1024;
 constexpr size_t kMaxManifest = 16 * 1024;
@@ -176,6 +177,22 @@ std::string ParseManifest(const std::string& text, NomiPackage& pkg) {
         }
     }
     if (problem.empty()) {
+        // 能打开的文件类型：小写字母数字的扩展名，不带点
+        cJSON* ext = nullptr;
+        cJSON_ArrayForEach(ext, cJSON_GetObjectItem(root, "opens")) {
+            std::string e = cJSON_IsString(ext) ? ext->valuestring : "";
+            bool ok = !e.empty() && e.size() <= 8 &&
+                      std::all_of(e.begin(), e.end(), [](char c) { return (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9'); });
+            if (!ok || pkg.opens.size() >= 16) {
+                problem = "opens 里写小写的扩展名、不带点（比如 \"txt\"），最多 16 个";
+                break;
+            }
+            if (std::find(pkg.opens.begin(), pkg.opens.end(), e) == pkg.opens.end()) pkg.opens.push_back(e);
+        }
+        if (problem.empty() && !pkg.opens.empty() && !pkg.Has("sd.read") && !pkg.Has("sd.write"))
+            problem = "能打开卡上的文件（opens）要申请 sd.read 权限";
+    }
+    if (problem.empty()) {
         cJSON* icon = cJSON_GetObjectItem(root, "icon");
         cJSON* line = nullptr;
         cJSON_ArrayForEach(line, cJSON_GetObjectItem(icon, "lines")) {
@@ -291,6 +308,17 @@ void Uninstall(const nomi_app_t* app) {
 }
 
 void LauncherShown() { NomiPkg::GetInstance().CheckSd("", true); }
+
+// 应用管理：这个应用是哪些文件的默认打开方式（nomi_open 记着），清掉
+const char* Defaults(const nomi_app_t* app) {
+    static std::string text;  // 应用管理马上拷进标签
+    text = NomiOpen::DefaultsOf(app->id);
+    if (text.empty()) return nullptr;
+    text = "默认打开 " + text;
+    return text.c_str();
+}
+
+void ClearDefaults(const nomi_app_t* app) { NomiOpen::ClearDefaults(app->id); }
 
 void DimmedTap(const nomi_app_t* app) {
     if (app->open == NomiWasm::Open) NomiPkg::GetInstance().CheckSd(app->id);
@@ -627,7 +655,8 @@ void NomiPkg::Preinstall() {
 void NomiPkg::Start() {
     {
         DisplayLockGuard ui(display());
-        static const nomi_appmgr_hooks_t hooks = {CanUninstall, Uninstall, Summary, LauncherShown, DimmedTap};
+        static const nomi_appmgr_hooks_t hooks = {CanUninstall, Uninstall,  Summary,      LauncherShown,
+                                                  DimmedTap,    Defaults,   ClearDefaults};
         nomi_appmgr_set_hooks(&hooks);
     }
     NomiFlashIo::Start();
@@ -855,6 +884,8 @@ std::string NomiPkg::ListJson() {
             cJSON_AddBoolToObject(item, "web", web);
             cJSON* perms = cJSON_AddArrayToObject(item, "permissions");
             for (const auto& perm : p->permissions) cJSON_AddItemToArray(perms, cJSON_CreateString(perm.c_str()));
+            cJSON* opens = cJSON_AddArrayToObject(item, "opens");
+            for (const auto& e : p->opens) cJSON_AddItemToArray(opens, cJSON_CreateString(e.c_str()));
             cJSON_AddItemToArray(arr, item);
         }
     }
@@ -864,6 +895,15 @@ std::string NomiPkg::ListJson() {
     cJSON_free(json);
     cJSON_Delete(out);
     return result;
+}
+
+std::vector<const NomiPackage*> NomiPkg::AppsFor(const std::string& ext) {
+    std::vector<const NomiPackage*> out;
+    std::lock_guard<std::mutex> lock(mutex_);
+    for (const auto& p : packages_) {
+        if (std::find(p->opens.begin(), p->opens.end(), ext) != p->opens.end()) out.push_back(p.get());
+    }
+    return out;
 }
 
 std::string NomiPkg::Remove(const std::string& id) {
@@ -890,6 +930,7 @@ std::string NomiPkg::Remove(const std::string& id) {
     }
     if (!victim) return "没有装这个应用";
     NomiWasm::Kill(id);
+    NomiOpen::ClearDefaults(id);  // 记成默认打开方式的也忘掉
     if (victim->internal) {
         NomiFlashIo::Run([&] { RemoveTree(victim->dir); });
     } else {

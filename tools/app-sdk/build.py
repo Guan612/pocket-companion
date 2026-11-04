@@ -56,6 +56,13 @@ def check_manifest(m):
             errors.append(f"voice 指令的 name 只能用小写字母、数字、下划线（最多 24 个）：{name!r}")
         if not isinstance(desc, str) or not desc or len(desc.encode("utf-8")) > 300:
             errors.append(f"voice 指令「{name}」要写 description（UTF-8 最多 300 字节）")
+    opens = m.get("opens", [])
+    if not isinstance(opens, list) or len(opens) > 16 or not all(
+        isinstance(e, str) and re.fullmatch(r"[a-z0-9]{1,8}", e) for e in opens
+    ):
+        errors.append('opens 里写小写的扩展名、不带点（比如 "txt"），最多 16 个')
+    elif opens and not {"sd.read", "sd.write"} & set(m.get("permissions", [])):
+        errors.append("能打开卡上的文件（opens）要申请 sd.read 权限")
     return errors
 
 

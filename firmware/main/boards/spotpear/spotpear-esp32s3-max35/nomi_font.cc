@@ -48,6 +48,8 @@ namespace NomiFont {
 
 void SetBase(const lv_font_t* font) { s_base = font; }
 
+const lv_font_t* Base() { return s_base ? s_base : LV_FONT_DEFAULT; }
+
 const lv_font_t* AcquireReading() {
     if (!s_base) return LV_FONT_DEFAULT;
     if (s_users++ > 0) return &s_reading;

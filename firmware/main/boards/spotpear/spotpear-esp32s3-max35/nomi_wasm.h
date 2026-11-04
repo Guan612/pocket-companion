@@ -26,6 +26,9 @@ Display* GetDisplay();
 void Open(const nomi_app_t* app, lv_obj_t* root);
 void Close(const nomi_app_t* app);
 bool Back(const nomi_app_t* app);
+// 打开方式（nomi_open）选好了应用：打开它（没开就开），界面挂上后发 NOMI_EV_OPEN，path 是 sd:/ 开头的。
+// 显示锁里调
+void OpenFile(const NomiPackage* pkg, const std::string& path);
 
 // 有首页卡片的应用：开机后在后台跑起来画卡片
 void StartBackground(const NomiPackage* pkg);

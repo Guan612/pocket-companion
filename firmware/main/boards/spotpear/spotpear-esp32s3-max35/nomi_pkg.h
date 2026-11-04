@@ -38,6 +38,8 @@ struct NomiPackage {
         std::string name, description;
     };
     std::vector<Voice> voice;
+    // 能打开卡上哪些文件（manifest 的 opens：小写扩展名，不带点）
+    std::vector<std::string> opens;
     // 线条图标（manifest 里的 icon），nomi_app_t 指着这里
     std::vector<std::vector<lv_point_precise_t>> icon_points;
     std::vector<nomi_icon_line_t> icon_lines;
@@ -81,6 +83,8 @@ public:
     const NomiPackage* Find(const std::string& id);
     // 每轮对话的系统提示里加的：装好的应用有哪些语音指令（没有为空）
     std::string PromptContext();
+    // 能打开这种文件的应用（ext 小写、不带点），按桌面上的顺序；灰着的也在里面
+    std::vector<const NomiPackage*> AppsFor(const std::string& ext);
 
 private:
     std::mutex mutex_;

@@ -52,6 +52,7 @@ struct nomi_app {
     void *user;               // 应用自己的数据（应用包：它的安装信息）
     bool dimmed;              // 桌面上灰着、点了只弹提示（比如装在 SD 卡上但卡没插）；改了要 nomi_apps_refresh
     const char *dimmed_hint;  // 灰着时点了弹什么
+    bool system;              // 系统应用（文件）：桌面上排在应用包后面、应用管理前面
 };
 
 // launcher_tile：外层翻页里放桌面的那一格；user_activity：应用里有触摸时调（重置休眠计时）；
@@ -90,6 +91,9 @@ typedef struct {
     void (*launcher_shown)(void);
     // 点了灰着的应用，dimmed_hint 已经弹过了（设备再去看一眼卡，插回来了就恢复并打开它）
     void (*dimmed_tap)(const nomi_app_t *app);
+    // 下面两个也可以不给。这个应用记成了哪些文件的默认打开方式（"默认打开 .jpg .png"，没有返回 NULL）；清掉
+    const char *(*defaults)(const nomi_app_t *app);
+    void (*clear_defaults)(const nomi_app_t *app);
 } nomi_appmgr_hooks_t;
 void nomi_appmgr_set_hooks(const nomi_appmgr_hooks_t *hooks);
 

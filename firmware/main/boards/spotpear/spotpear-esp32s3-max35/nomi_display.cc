@@ -7,6 +7,7 @@
 #include "face_script.h"
 #include "nomi_clock.h"
 #include "nomi_font.h"
+#include "nomi_sheet.h"
 #include "nomi_photo.h"
 #include "nomi_music.h"
 #include "nomi_radio.h"
@@ -600,6 +601,7 @@ std::string NomiDisplay::FacePrompt() {
 void NomiDisplay::SetSleep(bool sleeping) {
     if (!ui_ready_) return;
     DisplayLockGuard lock(this);
+    if (sleeping) NomiSheet::Close();  // 浮层（选应用、长按菜单）在最上层，不收会压在时钟上
     nomi_ui_set_sleep(sleeping);
 }
 

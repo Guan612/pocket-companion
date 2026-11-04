@@ -159,6 +159,25 @@ static void on_uninstall(lv_event_t *e)
     appmgr_build();
 }
 
+static void on_clear_defaults(lv_event_t *e)
+{
+    activity();
+    if (s_hooks.clear_defaults) s_hooks.clear_defaults((const nomi_app_t *)lv_event_get_user_data(e));
+    appmgr_build();
+}
+
+static lv_obj_t *appmgr_button(lv_obj_t *row, const char *text, uint32_t color)
+{
+    lv_obj_t *btn = lv_button_create(row);
+    lv_obj_set_style_bg_color(btn, lv_color_hex(C_CONTROL), 0);
+    lv_obj_set_style_shadow_width(btn, 0, 0);
+    lv_obj_set_style_radius(btn, 16, 0);
+    lv_obj_t *label = lv_label_create(btn);
+    lv_obj_set_style_text_color(label, lv_color_hex(color), 0);
+    lv_label_set_text(label, text);
+    return btn;
+}
+
 // 建（重建）应用管理的列表。旧列表异步删：重建往往是它自己里面的按钮触发的
 static void appmgr_build(void)
 {
@@ -198,22 +217,35 @@ static void appmgr_build(void)
         lv_obj_set_size(icon, ICON_PX, ICON_PX);
         lv_obj_remove_flag(icon, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
         nomi_icon_draw(icon, app->icon, ICON_PX);
-        lv_obj_t *name = lv_label_create(row);
+        // 名字，下面一行小字：是哪些文件的默认打开方式
+        lv_obj_t *info = lv_obj_create(row);
+        lv_obj_remove_style_all(info);
+        lv_obj_set_height(info, LV_SIZE_CONTENT);
+        lv_obj_set_flex_grow(info, 1);
+        lv_obj_set_flex_flow(info, LV_FLEX_FLOW_COLUMN);
+        lv_obj_remove_flag(info, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_t *name = lv_label_create(info);
+        lv_obj_set_width(name, LV_PCT(100));
+        lv_label_set_long_mode(name, LV_LABEL_LONG_MODE_DOTS);
         lv_label_set_text(name, app->name);
-        lv_obj_set_flex_grow(name, 1);
+        const char *defaults = s_hooks.defaults ? s_hooks.defaults(app) : NULL;
+        if (defaults) {
+            lv_obj_t *sub = lv_label_create(info);
+            lv_obj_set_width(sub, LV_PCT(100));
+            lv_label_set_long_mode(sub, LV_LABEL_LONG_MODE_DOTS);
+            lv_obj_set_style_text_color(sub, lv_color_hex(C_MUTED), 0);
+            lv_label_set_text(sub, defaults);
+        }
         if (app->dimmed) {  // 和桌面上一样灰着
             icon_set_color(icon, C_DIMMED);
             lv_obj_set_style_text_color(name, lv_color_hex(C_DIMMED), 0);
         }
+        if (defaults && s_hooks.clear_defaults) {
+            lv_obj_add_event_cb(appmgr_button(row, "清除默认", C_TEXT), on_clear_defaults, LV_EVENT_CLICKED,
+                                (void *)app);
+        }
         if (s_hooks.can_uninstall && s_hooks.can_uninstall(app)) {
-            lv_obj_t *btn = lv_button_create(row);
-            lv_obj_set_style_bg_color(btn, lv_color_hex(C_CONTROL), 0);
-            lv_obj_set_style_shadow_width(btn, 0, 0);
-            lv_obj_set_style_radius(btn, 16, 0);
-            lv_obj_t *label = lv_label_create(btn);
-            lv_obj_set_style_text_color(label, lv_color_hex(C_DANGER), 0);
-            lv_label_set_text(label, "删除");
-            lv_obj_add_event_cb(btn, on_uninstall, LV_EVENT_CLICKED, (void *)app);
+            lv_obj_add_event_cb(appmgr_button(row, "删除", C_DANGER), on_uninstall, LV_EVENT_CLICKED, (void *)app);
         } else {
             lv_obj_t *tag = lv_label_create(row);
             lv_obj_set_style_text_color(tag, lv_color_hex(C_MUTED), 0);
@@ -465,7 +497,11 @@ void nomi_apps_add(const nomi_app_t *app)
         if (s_apps[i] == app) return;
     }
     if (s_app_count >= MAX_APPS) return;
-    s_apps[s_app_count++] = app;
+    int at = s_app_count;
+    while (!app->system && at > 0 && s_apps[at - 1]->system) at--;  // 系统应用一直在最后
+    memmove(&s_apps[at + 1], &s_apps[at], (s_app_count - at) * sizeof(s_apps[0]));
+    s_apps[at] = app;
+    s_app_count++;
     s_apps[s_app_count] = NULL;
     rebuild_grid();
 }

@@ -16,7 +16,8 @@
 
 #define NOMI_API 3  // 用到的最高版本写进 manifest 的 "api"。
 // 2：阅读器（ui_reader 等）、text_chapters、fs_find。
-// 3：图片（ui_photo 等）、写卡（fs_write 等，权限 sd.write）
+// 3：图片（ui_photo 等）、写卡（fs_write 等，权限 sd.write）、打开文件（manifest 的 opens、NOMI_EV_OPEN）、
+//    选文件（ui_files）
 
 #define NOMI_IMPORT(name) __attribute__((import_module("env"), import_name(#name)))
 #define NOMI_EXPORT(name) __attribute__((export_name(#name)))
@@ -41,6 +42,8 @@ enum {
     NOMI_EV_HIDE,       // 界面拿下了：进程留在后台
     NOMI_EV_WEB,        // 应用自带的网页发来请求：用 web_body 取请求体，web_reply 回话（见「网页」）
     NOMI_EV_PHOTO,      // （api 3）全屏看图：id 是看图控件，value 是 NOMI_PHOTO_NEXT / PREV / MENU
+    NOMI_EV_OPEN,       // （api 3）打开一个文件：用 open_path 取路径（见「打开文件」）
+    NOMI_EV_FILE,       // （api 3）文件列表里选了：id 是 ui_files 的控件，value 0 文件、1 文件夹，files_picked 取路径
 };
 
 enum { NOMI_TEXT_TITLE = 0, NOMI_TEXT_BODY = 1, NOMI_TEXT_MUTED = 2 };
@@ -145,6 +148,22 @@ NOMI_IMPORT(fs_rename) int32_t fs_rename(const char *from, const char *to);
 NOMI_IMPORT(fs_mkdir) int32_t fs_mkdir(const char *path);  // （api 3）一层层建，已经有了也算成功
 NOMI_IMPORT(kv_get) int32_t kv_get(const char *key, char *buf, int32_t size);  // 没有返回 NOMI_E_NOT_FOUND
 NOMI_IMPORT(kv_set) int32_t kv_set(const char *key, const char *value);
+
+/* ---------- 打开文件、选文件（api 3）：「文件」里点了卡上的文件、网页文件管理里点了「设备上打开」 ---------- */
+
+// manifest 里 "opens": ["txt"] 声明能打开哪些扩展名（小写、不带点，要 sd.read）。能开的应用有好几个时系统让人选
+// （能记住），选中的应用界面挂上之后来 NOMI_EV_OPEN（新起的进程先来 SHOW）。这时用 open_path 取路径（sd:/ 开头），
+// 直接显示这个文件：小说翻到这本书、图片看这张、音乐放这首
+NOMI_IMPORT(open_path) int32_t open_path(char *buf, int32_t size);
+
+// 选文件：系统的文件列表（和设备上的「文件」一个样），占当前页的一块（放在页面里，跟着页面上下滚）。从 dir
+// （sd:/ 开头，也是最上能到哪，"sd:/" 是整张卡）往下一层层点，顶上是路径和「上一级」。只列 exts 里的扩展名
+// （"txt" 或 "mp3,flac"，空字符串 = 都列；文件夹都列）。点了文件来 NOMI_EV_FILE（value 0），flags 有
+// NOMI_FILES_PICK_DIR 时每层顶上多一行「选这个文件夹」，选了来 NOMI_EV_FILE（value 1）。用 files_picked 取路径。
+// 要 sd.read
+#define NOMI_FILES_PICK_DIR 1
+NOMI_IMPORT(ui_files) int32_t ui_files(const char *dir, const char *exts, int32_t flags);
+NOMI_IMPORT(files_picked) int32_t files_picked(char *buf, int32_t size);
 
 /* ---------- 播放（权限 media）：系统只管放"这一首"，放哪首、下一首放什么（队列）是应用的事 ---------- */
 

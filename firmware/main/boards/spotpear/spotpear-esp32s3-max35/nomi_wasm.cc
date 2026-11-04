@@ -2,6 +2,7 @@
 
 #include "display/display.h"
 #include "nomi_book.h"
+#include "nomi_filelist.h"
 #include "nomi_files.h"
 #include "nomi_flash_io.h"
 #include "nomi_music.h"
@@ -58,7 +59,7 @@ constexpr int kWebWaitMs = 60000;                // 网页请求等应用回话�
 // 和 tools/app-sdk/nomi_sdk.h 一致
 enum {
     EV_CLICK = 1, EV_CHANGE, EV_BACK, EV_PAUSE, EV_RESUME, EV_CLOSE, EV_TIMER, EV_VOICE, EV_READER, EV_MEDIA,
-    EV_SHOW, EV_HIDE, EV_WEB, EV_PHOTO
+    EV_SHOW, EV_HIDE, EV_WEB, EV_PHOTO, EV_OPEN, EV_FILE
 };
 enum { TEXT_TITLE = 0, TEXT_BODY, TEXT_MUTED };
 enum { MEDIA_FINISHED = 1, MEDIA_NEXT = 2, MEDIA_PREV = 3, MEDIA_PLAY = 4 };
@@ -99,6 +100,8 @@ struct Proc : std::enable_shared_from_this<Proc> {
     SemaphoreHandle_t voice_done = nullptr;
     std::string req_arg, req_reply;
     bool req_end = false;
+    std::string open_arg;  // NOMI_EV_OPEN 要打开的文件（sd:/ 开头，text_mutex）
+    std::string file_pick;  // ui_files 里选中的（sd:/ 开头，text_mutex）
 
     ~Proc() {
         if (queue) vQueueDelete(queue);
@@ -1263,6 +1266,62 @@ int32_t fs_mkdir(wasm_exec_env_t env, const char* path) {
     return ok ? 0 : E_FAIL;
 }
 
+/* ---------- 选文件：系统的文件列表控件（和「文件」应用同一个） ---------- */
+
+constexpr int32_t FILES_PICK_DIR = 1;
+
+// 卡上文件的列表：从 dir（sd:/ 开头，也是最上能到哪）往下一层层点。只列 exts 里的扩展名（"txt" / "mp3,flac"，
+// 空 = 都列）。点了文件（value 0）、选了文件夹（FILES_PICK_DIR，value 1）发 NOMI_EV_FILE，files_picked 取路径
+int32_t ui_files(wasm_exec_env_t env, const char* dir, const char* exts, int32_t flags) {
+    Proc* p = Ctx(env);
+    int32_t err;
+    std::string dev = Resolve(p, dir, false, &err);
+    if (dev.empty()) return err;
+    if (!OnSd(dev)) return E_DENIED;
+    UiScope ui(p);
+    lv_obj_t* parent = ui.target();
+    if (!parent) return E_NO_UI;
+    NomiFileList::Options opt;
+    opt.top = dev == "/sd" ? "" : dev.substr(4);
+    std::string list = exts ? exts : "";
+    size_t pos = 0;
+    while (pos <= list.size()) {
+        size_t comma = list.find(',', pos);
+        if (comma == std::string::npos) comma = list.size();
+        std::string e = list.substr(pos, comma - pos);
+        e.erase(0, e.find_first_not_of(" ."));
+        while (!e.empty() && e.back() == ' ') e.pop_back();
+        for (char& c : e) {
+            if (c >= 'A' && c <= 'Z') c = c - 'A' + 'a';
+        }
+        if (!e.empty()) opt.exts.push_back(e);
+        pos = comma + 1;
+    }
+    opt.pick_dir = flags & FILES_PICK_DIR;
+    int32_t id = static_cast<int32_t>(p->objs.size()) + 1;  // AddObj 给的就是这个
+    std::weak_ptr<Proc> weak = p->weak_from_this();
+    opt.on_pick = [weak, id](const std::string& rel, bool is_dir) {
+        ProcPtr proc = weak.lock();
+        if (!proc) return;
+        {
+            std::lock_guard<std::mutex> lock(proc->text_mutex);
+            proc->file_pick = "sd:/" + rel;
+        }
+        Post(proc.get(), EV_FILE, id, is_dir ? 1 : 0);
+    };
+    std::string top = opt.top;
+    return AddObj(p, NomiFileList::Create(parent, top, std::move(opt)));
+}
+
+// NOMI_EV_FILE 选中的路径（sd:/ 开头）
+int32_t files_picked(wasm_exec_env_t env, char* buf, uint32_t size) {
+    Proc* p = Ctx(env);
+    std::lock_guard<std::mutex> lock(p->text_mutex);
+    int32_t n;
+    CopyOut(p->file_pick, buf, size, &n);
+    return n;
+}
+
 // 小设置和进度：data/kv.json，一个 JSON 对象，改一次写一次（不占设备那 16KB 的 NVS）
 void LoadKv(Proc* p) {
     std::string text, path = p->pkg->dir + "/data/kv.json";
@@ -1478,6 +1537,15 @@ void assistant_context(wasm_exec_env_t env, const char* text) {
     p->context = text ? std::string(text).substr(0, 600) : "";
 }
 
+// NOMI_EV_OPEN 要打开的文件（sd:/ 开头）
+int32_t open_path(wasm_exec_env_t env, char* buf, uint32_t size) {
+    Proc* p = Ctx(env);
+    std::lock_guard<std::mutex> lock(p->text_mutex);
+    int32_t n;
+    CopyOut(p->open_arg, buf, size, &n);
+    return n;
+}
+
 // 语音指令（NOMI_EV_VOICE）、网页请求（NOMI_EV_WEB）带的参数
 int32_t voice_arg(wasm_exec_env_t env, char* buf, uint32_t size) {
     Proc* p = Ctx(env);
@@ -1576,6 +1644,8 @@ NativeSymbol kNatives[] = {
     {"ui_grid", (void*)ui_grid, "()i", nullptr},
     {"ui_thumb", (void*)ui_thumb, "($)i", nullptr},
     {"ui_photo", (void*)ui_photo, "($i)i", nullptr},
+    {"ui_files", (void*)ui_files, "($$i)i", nullptr},
+    {"files_picked", (void*)files_picked, "(*~)i", nullptr},
     {"photo_show", (void*)photo_show, "(i$)", nullptr},
     {"photo_set_flags", (void*)photo_set_flags, "(ii)", nullptr},
     {"photo_preload", (void*)photo_preload, "($)", nullptr},
@@ -1600,6 +1670,7 @@ NativeSymbol kNatives[] = {
     {"net_get_until", (void*)net_get_until, "($*~$i)i", nullptr},
     {"assistant_context", (void*)assistant_context, "($)", nullptr},
     {"voice_arg", (void*)voice_arg, "(*~)i", nullptr},
+    {"open_path", (void*)open_path, "(*~)i", nullptr},
     {"voice_reply", (void*)voice_reply, "($i)", nullptr},
     {"web_body", (void*)voice_arg, "(*~)i", nullptr},
     {"web_reply", (void*)web_reply, "($)", nullptr},
@@ -1877,17 +1948,47 @@ void RunInWorker(void (*fn)(void*), void* arg) {
     xQueueSend(s_jobs, &job, portMAX_DELAY);
 }
 
+// 打开文件时，界面挂上之后要交过去的文件：应用 id → sd:/ 路径（显示锁里读写）
+std::map<std::string, std::string> s_open_pending;
+
+// 交一个文件给它（排在 SHOW 后面：新起的进程先跑 nomi_main、收 SHOW 建好页面，再收 OPEN）
+void GiveFile(Proc* p, const std::string& path) {
+    {
+        std::lock_guard<std::mutex> lock(p->text_mutex);
+        p->open_arg = path;
+    }
+    Post(p, EV_OPEN, 0, 0);
+}
+
 void Open(const nomi_app_t* app, lv_obj_t* root) {
     auto* pkg = static_cast<const NomiPackage*>(app->user);
+    std::string file;
+    auto it = s_open_pending.find(pkg->id);
+    if (it != s_open_pending.end()) {
+        file = std::move(it->second);
+        s_open_pending.erase(it);
+    }
     if (ProcPtr p = Find(pkg->id)) {  // 在后台跑着：把界面挂上去，它收到 SHOW 再建页面
         DetachUi(p.get());
         p->root = root;
         p->shown = true;
         p->loading = AddLoading(root);
         Post(p.get(), EV_SHOW, 0, 0);
+        if (!file.empty()) GiveFile(p.get(), file);
         return;
     }
-    Spawn(pkg, root);
+    ProcPtr p = Spawn(pkg, root);
+    if (p && !file.empty()) GiveFile(p.get(), file);
+}
+
+void OpenFile(const NomiPackage* pkg, const std::string& path) {
+    if (nomi_app_current() == &pkg->app) {  // 已经开在前台：直接交过去
+        if (ProcPtr p = Find(pkg->id)) GiveFile(p.get(), path);
+        return;
+    }
+    s_open_pending[pkg->id] = path;
+    nomi_app_open(pkg->id.c_str());  // 开了会走到上面的 Open
+    s_open_pending.erase(pkg->id);   // 没开成（灰着、开不了）别留着
 }
 
 void Close(const nomi_app_t* app) {

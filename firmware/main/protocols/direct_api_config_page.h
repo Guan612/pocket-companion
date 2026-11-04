@@ -475,6 +475,7 @@ loadWifi();
 // 应用包：板子没挂 /apps.json 时整块不显示
 const appMsg = (text, cls) => { $('#appMsg').textContent = text; $('#appMsg').className = 'hint ' + (cls || ''); };
 const kb = b => b < 1024 * 1024 ? Math.max(1, Math.round(b / 1024)) + ' KB' : (b / 1048576).toFixed(1) + ' MB';
+let fmOpens = new Set();  // 装着的应用能打开哪些扩展名：文件管理里这些文件有「设备上打开」
 async function loadApps() {
   let r;
   try {
@@ -483,6 +484,8 @@ async function loadApps() {
     r = await res.json();
   } catch (e) { return; }
   $('#appsCard').hidden = false;
+  fmOpens = new Set(r.apps.flatMap(a => a.opens || []));
+  if (fmLoaded) fmLoad(fmPath);
   const box = $('#appsList');
   box.innerHTML = r.apps.length ? '' : '<p class="hint">还没装应用。</p>';
   for (const a of r.apps) {
@@ -568,9 +571,16 @@ async function fmLoad(path) {
     const p = fmJoin(e.name);
     const row = document.createElement('div');
     row.className = 'fm-row';
+    const ext = ((e.name.match(/\.([^.]+)$/) || [])[1] || '').toLowerCase();
+    const canOpen = !e.dir && fmOpens.has(ext);
     row.innerHTML = `<span class="fm-name${e.dir ? ' dir' : ''}">${esc(e.name)}${e.dir ? ' /' : ''}</span>` +
-      `<span class="hint">${e.dir ? '' : kb(e.size) + ' · '}${when(e.time)}</span><button>改名</button><button class="danger">删除</button>`;
-    const [ren, del] = row.querySelectorAll('button');
+      `<span class="hint">${e.dir ? '' : kb(e.size) + ' · '}${when(e.time)}</span>` +
+      `${canOpen ? '<button class="fm-open">设备上打开</button>' : ''}<button class="fm-ren">改名</button><button class="danger fm-del">删除</button>`;
+    const ren = row.querySelector('.fm-ren'), del = row.querySelector('.fm-del'), open = row.querySelector('.fm-open');
+    if (open) open.onclick = async () => {
+      const res = await fmPost('/sd/open', {path: p});
+      sdMsg(res.ok ? (res.app ? `已在设备上用「${res.app}」打开` : res.choose) : res.error, res.ok ? 'ok' : 'err');
+    };
     row.querySelector('.fm-name').onclick = () => e.dir ? fmLoad(p) : fmImgName(e.name) ? fmShow(p, e.name) : (location.href = '/sd/file/' + fmEnc(p));
     ren.onclick = async () => {
       const n = (prompt('改成什么名字？', e.name) || '').trim();

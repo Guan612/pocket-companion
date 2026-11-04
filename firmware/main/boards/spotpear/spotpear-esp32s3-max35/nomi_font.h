@@ -10,6 +10,8 @@ namespace NomiFont {
 
 // 系统字：显示那边设好字体时调（资源分区里的字，一直有效）
 void SetBase(const lv_font_t* font);
+// 系统字（还没设好时是 LVGL 默认字）：浮在最上层（lv_layer_top）的东西不跟着屏幕继承字体，要自己设
+const lv_font_t* Base();
 
 // 显示锁里调。第一个用的人进来时挂卡、打开卡上的字体；最后一个 Release 时关掉、放开卡
 const lv_font_t* AcquireReading();
