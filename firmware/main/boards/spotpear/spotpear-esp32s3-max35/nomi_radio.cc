@@ -165,33 +165,36 @@ private:
     std::string type_, range_;
 };
 
-// 读一段（Range）到 out（size 字节）；url 换成跳转后的最终地址，下次直接去那里
-bool RangeRead(std::string& url, uint64_t from, size_t size, uint8_t* out) {
-    EpisodeHttp http;
-    int code = http.Open(url, from, from + size - 1);
-    if (code != 206 && !(code == 200 && from == 0)) {
-        ESP_LOGW(TAG, "Range %llu+%u -> HTTP %d", static_cast<unsigned long long>(from), static_cast<unsigned>(size), code);
-        return false;
+// m4a 用的连接：读目录表、下载音频都走这一条（内部 RAM 只够同时一条 TLS），开新的一段前先关掉旧的。
+// 跳转后的地址记下来，下一段直接去那里；被叫停时马上返回
+class Mp4Http : public Mp4Source {
+public:
+    Mp4Http(const std::string& url, const std::atomic<bool>& stopping) : url_(url), stopping_(stopping) {}
+    int Read(uint8_t* buf, size_t len) override {
+        if (stopping_) return -1;
+        return http_.Read(reinterpret_cast<char*>(buf), static_cast<int>(len));
     }
-    url = http.Url();
-    size_t got = 0;
-    int last = 0;
-    for (int stalls = 0; got < size && stalls < 3;) {
-        int n = last = http.Read(reinterpret_cast<char*>(out) + got, size - got);
-        if (n == -2) {
-            stalls++;
-            continue;
+    void Close() override { http_.Close(); }
+
+protected:
+    bool DoOpen(uint64_t from, uint64_t to) override {
+        http_.Close();
+        if (stopping_) return false;
+        int code = http_.Open(url_, static_cast<int64_t>(from), to == kToEnd ? -1 : static_cast<int64_t>(to - 1));
+        if (code != 206 && !(code == 200 && from == 0)) {
+            ESP_LOGW(TAG, "m4a range %llu -> HTTP %d", static_cast<unsigned long long>(from), code);
+            http_.Close();
+            return false;
         }
-        if (n <= 0) break;
-        stalls = 0;
-        got += n;
+        url_ = http_.Url();
+        return true;
     }
-    if (got != size) {
-        ESP_LOGW(TAG, "Range %llu+%u: got %u (HTTP %d, last read %d): %s", static_cast<unsigned long long>(from),
-                 static_cast<unsigned>(size), static_cast<unsigned>(got), code, last, url.c_str());
-    }
-    return got == size;
-}
+
+private:
+    EpisodeHttp http_;
+    std::string url_;
+    const std::atomic<bool>& stopping_;
+};
 
 }  // namespace
 
@@ -425,6 +428,10 @@ void NomiRadio::ReaderLoop() {
     for (;;) {
         xSemaphoreTake(reader_go_, portMAX_DELAY);
         Station st = Current();
+        if (mp4_ && st.url != mp4_url_) {  // 换了别的在放：上一期 m4a 的目录窗口（几十 KB PSRAM）放掉
+            mp4_.reset();
+            mp4_url_.clear();
+        }
         bool mp4 = st.format == Station::kMp4 || (st.format == Station::kAuto && IsMp4(st.url, ""));
         bool ok = st.local    ? ReadLocal(st.url, st.start)
                   : !st.episode ? ReadStream(PreferHttp(st.url), 0, 0, true)
@@ -614,83 +621,53 @@ bool NomiRadio::ReadStream(const std::string& source, int redirects, int start, 
     return ok || stopping_;  // 被叫停不算失败
 }
 
-// m4a 节目：先拿到 moov（目录），按 start 秒找到那一帧的字节位置，从那里开始下载，
-// 一帧帧补上 ADTS 头送去解码。同一期快进快退时 moov 用缓存
+// m4a 节目：先顺着读一遍 moov，记下目录表在文件里的位置（表本身只留一段窗口在内存里），
+// 按 start 秒找到那一帧，从那里开始下载，一帧帧补上 ADTS 头送去解码。放到窗口外面时先断开、
+// 读下一段目录表，再从断开的那一帧接着下（收流缓冲里有几秒，垫得住）。
+// 同一期快进快退、对话后接着放时目录用缓存
 bool NomiRadio::ReadMp4(const std::string& source, int start) {
-    std::string url = source;
-    if (moov_url_ != source || moov_ == nullptr) {
-        heap_caps_free(moov_);
-        moov_ = nullptr;
-        moov_url_.clear();
-        auto* head = static_cast<uint8_t*>(heap_caps_malloc(65536, MALLOC_CAP_SPIRAM));
-        uint64_t moov_offset = 0, moov_size = 0, next = 0, base = 0;
-        bool found = false;
-        size_t got = 65536;
-        for (int hop = 0; hop < 5 && !found; hop++) {
-            // 第一次读开头 64KB；moov 不在里面（在文件末尾）就跳到下一个顶层盒子再看
-            if (!RangeRead(url, base, hop == 0 ? 65536 : 16, head)) {
-                heap_caps_free(head);
-                return false;
+    Mp4Http src(source, stopping_);
+    if (mp4_url_ != source || !mp4_) {
+        mp4_.reset();
+        mp4_url_.clear();
+        auto track = std::make_unique<Mp4Track>();
+        int64_t t0 = esp_timer_get_time();
+        if (!track->Open(src)) {
+            if (!stopping_) {
+                ESP_LOGW(TAG, "m4a index not read: no AAC track, network error or no PSRAM (largest free %u)",
+                         static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM)));
             }
-            got = hop == 0 ? 65536 : 16;
-            found = Mp4FindMoov(head, got, base, moov_offset, moov_size, next);
-            base = next;
-        }
-        if (!found || moov_size > 4 * 1024 * 1024) {
-            ESP_LOGW(TAG, "No usable moov (%llu bytes)", static_cast<unsigned long long>(moov_size));
-            heap_caps_free(head);
             return false;
         }
-        moov_ = static_cast<uint8_t*>(heap_caps_malloc(moov_size, MALLOC_CAP_SPIRAM));
-        bool ok = moov_ != nullptr;
-        if (ok && moov_offset == 0 && moov_size <= got) {
-            memcpy(moov_, head, moov_size);
-        } else if (ok) {
-            ok = RangeRead(url, moov_offset, moov_size, moov_);
-        }
-        heap_caps_free(head);
-        if (!moov_) {
-            ESP_LOGW(TAG, "No PSRAM for moov (%u bytes, largest free %u)", static_cast<unsigned>(moov_size),
-                     static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM)));
-        }
-        if (!ok) {
-            heap_caps_free(moov_);
-            moov_ = nullptr;
-            return false;
-        }
-        moov_url_ = source;
-        moov_size_ = moov_size;
-        ESP_LOGI(TAG, "m4a moov: %u bytes", static_cast<unsigned>(moov_size));
+        ESP_LOGI(TAG, "m4a index: %u frames, %u KB in memory (%lld ms)", static_cast<unsigned>(track->samples()),
+                 static_cast<unsigned>(track->MemoryBytes() / 1024), (esp_timer_get_time() - t0) / 1000);
+        mp4_ = std::move(track);
+        mp4_url_ = source;
     }
-    Mp4Track track;
-    if (!Mp4ParseMoov(moov_, moov_size_, track)) {
-        ESP_LOGW(TAG, "m4a has no AAC track");
-        return false;
-    }
-    SetDuration(source, Mp4DurationSeconds(track));
+    Mp4Track& track = *mp4_;
+    track.Attach(&src);
+    SetDuration(source, track.DurationSeconds());
+    uint32_t sample = 0;
     Mp4Cursor cursor;
-    if (!Mp4Seek(track, Mp4SampleAtSecond(track, start), cursor)) {
-        reached_end_ = true;  // 位置已经在结尾
-        return true;
-    }
-    EpisodeHttp http;
-    int code = http.Open(url, int64_t(cursor.offset));
-    if (code != 206) {
-        ESP_LOGW(TAG, "m4a range -> HTTP %d", code);
-        return false;
+    int found = track.SampleAtSecond(start, sample) ? track.Seek(sample, cursor) : -1;
+    auto* buf = found > 0 ? static_cast<uint8_t*>(heap_caps_malloc(8192, MALLOC_CAP_SPIRAM)) : nullptr;
+    if (found <= 0 || !buf) {
+        track.Attach(nullptr);
+        if (found == 0) reached_end_ = true;  // 位置已经在结尾
+        return found == 0 || stopping_;
     }
     codec_ = kCodecAac;
-    auto* buf = static_cast<uint8_t*>(heap_caps_malloc(8192, MALLOC_CAP_SPIRAM));
     size_t have = 0, used = 0;  // buf 里收到了多少、用掉了多少
-    uint64_t pos = cursor.offset;
+    uint64_t pos = 0;
+    uint32_t opened = UINT32_MAX;  // 下音频的这段是连接第几次开的：读目录表会占用连接，数变了就从当前帧重开
     int stalled_ms = 0;
     bool ok = true;
-    // 从网络取 n 字节（skip 为 true 时扔掉）
+    // 从网络取 n 字节（out 为空时扔掉）
     auto take = [&](uint8_t* out, size_t n) -> bool {
         while (n > 0) {
             if (used == have) {
                 if (stopping_) return false;
-                int r = http.Read(reinterpret_cast<char*>(buf), 8192);
+                int r = src.Read(buf, 8192);
                 if (r == -2 && stalled_ms < 12000) {
                     stalled_ms += 4000;
                     continue;
@@ -714,11 +691,32 @@ bool NomiRadio::ReadMp4(const std::string& source, int start) {
     uint8_t frame[2048 + 7];
     while (!stopping_) {
         uint32_t size;
-        if (!Mp4SampleSize(track, cursor, size)) {
+        int r = track.Sample(cursor, size);
+        if (r == 0) {
             reached_end_ = true;  // 最后一帧也送出去了
             break;
         }
-        if (cursor.offset < pos || size > 2048) {
+        if (r < 0) {
+            if (!stopping_) ESP_LOGW(TAG, "m4a index read failed at frame %u", static_cast<unsigned>(cursor.sample));
+            ok = false;
+            break;
+        }
+        if (size > 2048) {
+            ESP_LOGW(TAG, "m4a layout not supported (frame %u)", static_cast<unsigned>(cursor.sample));
+            ok = false;
+            break;
+        }
+        if (opened != src.opens()) {  // 还没开始下，或者刚读了目录表
+            if (!src.Open(cursor.offset, Mp4Source::kToEnd)) {
+                ok = false;
+                break;
+            }
+            opened = src.opens();
+            pos = cursor.offset;
+            have = used = 0;
+            stalled_ms = 0;
+        }
+        if (cursor.offset < pos) {
             ESP_LOGW(TAG, "m4a layout not supported (frame %u)", static_cast<unsigned>(cursor.sample));
             ok = false;
             break;
@@ -727,10 +725,12 @@ bool NomiRadio::ReadMp4(const std::string& source, int start) {
             ok = stopping_;
             break;
         }
-        Mp4AdtsHeader(track, size, frame);
+        track.AdtsHeader(size, frame);
         if (!WriteAudio(frame, size + 7)) break;
-        Mp4Advance(track, cursor, size);
+        track.Advance(cursor, size);
     }
+    track.Attach(nullptr);
+    src.Close();
     heap_caps_free(buf);
     return ok || stopping_;
 }

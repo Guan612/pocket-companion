@@ -15,8 +15,11 @@
 
 #include <atomic>
 #include <functional>
+#include <memory>
 #include <mutex>
 #include <string>
+
+class Mp4Track;
 
 class NomiRadio {
 public:
@@ -100,10 +103,10 @@ private:
     std::atomic<bool> paused_{false};  // 本地文件对话、闹钟时：解码停住不送声音，不断开、不丢位置
     std::atomic<bool> decode_failed_{false};  // 这次播放一直解不出来，解码任务放弃了
     esp_timer_handle_t timer_ = nullptr;
-    // m4a 的目录（moov）：同一期节目快进快退时不用再下一遍
-    std::string moov_url_;
-    uint8_t* moov_ = nullptr;
-    size_t moov_size_ = 0;
+    // m4a 的目录（moov 里各个表在哪、内存里的窗口）：同一期节目快进快退、对话后接着放时不用再读一遍。
+    // 只有收流任务碰它
+    std::string mp4_url_;
+    std::unique_ptr<Mp4Track> mp4_;
 
     NomiRadio() = default;
     void Monitor();
