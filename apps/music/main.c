@@ -2,6 +2,8 @@
 //
 // 系统只管"放这一首"（解码、封面、歌词、进度条），放哪首、下一首放什么都在应用里：
 // - 本地（这个文件）：队列是一个文件夹里的歌（按文件名排），列表循环 / 单曲循环 / 随机；放到哪首记在 kv 里。
+//   语音点歌在系统的媒体库里找（library_list：卡上的歌系统记着）；「文件」里点了一首（NOMI_EV_OPEN）：
+//   它所在的文件夹排成队列，从这首放。
 // - 电台（这个文件）：台单在 kv "stations" 里（一行"台名\t地址"，应用自带的网页上增删、排序），
 //   还没动过就用 assets/stations.txt 里那几个默认的；台单里没有的台名去网上的电台目录搜（radio-browser）。
 // - 播客（podcast.c）：订阅、最新几期、每个播客听到哪。
@@ -13,7 +15,6 @@
 #define MAX_STATIONS 40
 #define MAX_ROWS 200
 #define MAX_PAGES 8
-#define MAX_SCAN_DIRS 48
 
 char g_net[NET_BUF];
 int g_src = SRC_NONE;
@@ -607,33 +608,48 @@ static void draw_tile(void)
 
 enum { VOICE_PLAY = 1, VOICE_SKIP, VOICE_MODE, VOICE_PODCAST, VOICE_SUBSCRIBE, VOICE_ONLINE, VOICE_RADIO };
 
-// 在 SD 卡里按名字找：先广度优先一层层找文件名、文件夹名里带这个词的
+// 在卡上的歌里按名字找（系统的媒体库，整张卡）：文件夹名、文件名里带这个词的，浅的优先，同一层文件夹先于歌
+// （说歌手名放整个文件夹）。找到文件夹时 found_file 为空。g_net 借来装列表（这时不联网）
 static int search(const char *word, char *found_dir, char *found_file)
 {
-    static char dirs[MAX_SCAN_DIRS][PATH_LEN];
-    static char *names[400];
-    int head = 0, tail = 0;
-    copy(dirs[tail++], "sd:/", PATH_LEN);
-    while (head < tail) {
-        char dir[PATH_LEN];
-        copy(dir, dirs[head++], PATH_LEN);
-        int n = list_dir(dir, names, 400, 1);
-        for (int i = 0; i < n; i++) {
-            if (!contains(names[i], word)) continue;
-            if (is_dir(names[i])) {
-                nomi_fmt(found_dir, PATH_LEN, "%s%s", dir, names[i]);
-                found_file[0] = '\0';
-            } else {
-                copy(found_dir, dir, PATH_LEN);
-                copy(found_file, names[i], NAME_LEN);
+    int best = 1 << 30;  // 层数 * 2 + 是不是歌
+    int32_t first = 0, total = 1;
+    while (first < total && best > 0) {
+        total = library_list(NOMI_LIB_AUDIO, first, g_net, NET_BUF);
+        if (total <= 0) break;
+        int got = 0;
+        for (char *p = g_net; *p;) {
+            char *line = p;
+            while (*p && *p != '\n') p++;
+            if (*p) *p++ = '\0';
+            got++;
+            char *tab = line;
+            while (*tab && *tab != '\t') tab++;
+            *tab = '\0';
+            // 「sd:/文件夹/…/歌.mp3」一段段看
+            char *c = line + 4;
+            for (int depth = 0;; depth++) {
+                char *slash = c;
+                while (*slash && *slash != '/') slash++;
+                int is_file = !*slash;
+                int score = depth * 2 + is_file;
+                *slash = '\0';
+                int hit = score < best && contains(c, word);
+                if (!is_file) *slash = '/';
+                if (hit) {
+                    best = score;
+                    nomi_copy_n(found_dir, PATH_LEN, line, is_file ? c : slash + 1);  // 文件夹带结尾的 /
+                    if (is_file) copy(found_file, c, NAME_LEN);
+                    else found_file[0] = '\0';
+                }
+                if (is_file) break;
+                c = slash + 1;
             }
-            return 1;
         }
-        for (int i = 0; i < n && tail < MAX_SCAN_DIRS; i++) {
-            if (is_dir(names[i])) nomi_fmt(dirs[tail++], PATH_LEN, "%s%s", dir, names[i]);
-        }
+        if (got == 0) break;
+        first += got;
     }
-    return 0;
+    return best < (1 << 30);
 }
 
 // 回话并结束这次指令
@@ -901,6 +917,15 @@ int32_t nomi_event(int32_t type, int32_t id, int32_t value)
     case NOMI_EV_VOICE:
         voice(id);
         return 1;
+    case NOMI_EV_OPEN: {  // 「文件」里点了一首：它所在的文件夹排成队列，从这首放
+        char path[PATH_LEN], dir[PATH_LEN];
+        if (open_path(path, sizeof(path)) <= 0) return 1;
+        char *name = path + nomi_strlen(path);
+        while (name > path && name[-1] != '/') name--;
+        nomi_copy_n(dir, PATH_LEN, path, name);
+        if (load_queue(dir) <= 0 || play_track(find_track(name)) < 0) ui_toast("这首放不了");
+        return 1;
+    }
     case NOMI_EV_WEB:
         web();
         return 1;

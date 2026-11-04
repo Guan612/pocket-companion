@@ -1,14 +1,15 @@
 {
   "id": "nomi.music",
   "name": "音乐",
-  "version": "0.4.0",
-  "api": 1,
+  "version": "0.5.0",
+  "api": 3,
   "description": "SD 卡里的歌（按文件夹排队列，列表循环 / 单曲循环 / 随机）、电台、播客、在线点歌；首页收听卡片也是它",
   "icon": {
     "lines": [[[23, 5], [23, 26]], [[23, 5], [31, 9], [31, 14]]],
     "circles": [[11, 21, 13]]
   },
   "permissions": ["sd.read", "media", "assistant", "net"],
+  "opens": ["mp3", "flac", "wav", "aac", "m4a"],
   "memory_kb": 512,
   "tile": true,
   "voice": [

@@ -1,9 +1,11 @@
 // 图片：看 SD 卡里的照片。
 //
 // 系统给能力：解码（JPEG 边读边解、按 EXIF 转正）、缩略图（ui_thumb，解好的缓存在卡上）、全屏看图（ui_photo）、
-// 电子相框（photo_frame：设备睡着时系统自己轮播）、整卡找文件（fs_find）。应用管业务：分相册、顺序、菜单、语音。
-// - 相册：整张卡找 .jpg / .jpeg / .png（大于 20KB；cover、folder 这类专辑封面不算），按所在文件夹分，
-//   相册里按文件名排。每次打开重新找（照片多时一两秒）。
+// 电子相框（photo_frame：设备睡着时系统自己轮播）、媒体库（library_list：卡上的图片系统记着）、
+// 打开文件（「文件」里点了图片，NOMI_EV_OPEN）。应用管业务：分相册、顺序、菜单、语音。
+// - 相册：卡上的 .jpg / .jpeg / .png（大于 20KB；cover、folder 这类专辑封面不算），按所在文件夹分，
+//   相册里按文件名排。每次打开问一遍媒体库（卡没变时马上就有）；「重新找照片」让系统重扫整张卡。
+// - 「文件」里点了一张：打开它所在的相册、看这张；不算照片的（小图、封面）单独看这一张。
 // - 相册里：最上面「设成电子相框」，下面缩略图一页 16 张，上一页 / 下一页。
 // - 看图：翻页方式四选一（默认左右滑、点左右）；点中间（或长按）出菜单：电子相框、换图间隔、翻页方式、回相册。
 // kv：last（上次看的相册）、frame（相框相册）、frame_sec（换图间隔）、turn（翻页方式）。
@@ -20,7 +22,7 @@
 enum { TIMER_SCAN = 1 };
 enum { VOICE_OPEN = 1, VOICE_FRAME };
 
-static char g_buf[160 * 1024];       // fs_find 的结果，原地切成一条条路径
+static char g_buf[160 * 1024];       // 媒体库给的图片列表，原地切成一条条路径
 static int32_t g_photo[MAX_PHOTOS];  // 每张照片的路径在 g_buf 里的位置（按相册、文件名排好）
 static int32_t g_tmp[MAX_PHOTOS];    // 排序用
 static int g_photo_count;
@@ -164,22 +166,41 @@ static int is_cover(const char *name)
            starts_nocase(name, "albumart") || starts_nocase(name, "thumb") || name[0] == '.';
 }
 
-static int scan_photos(void)
+// 问媒体库要卡上的图片（卡变了系统要扫一遍，几秒；rescan 不管记着的、重扫），分成相册。
+// 一次取不完分几次取，接着放进 g_buf；不要的（小图、封面）当场挤掉
+static int scan_photos(int rescan)
 {
     g_photo_count = g_album_count = 0;
-    int n = fs_find("sd:/", "jpg,jpeg,png", MIN_PHOTO, g_buf, sizeof(g_buf) - 1);
     g_scanned = 1;
-    if (n < 0) return n;
-    // 「路径\t大小\n」一行一个：原地把 \t 换成结尾
-    char *p = g_buf;
-    while (*p && g_photo_count < MAX_PHOTOS) {
-        char *line = p;
-        while (*p && *p != '\n') p++;
-        if (*p) *p++ = 0;
-        char *tab = line;
-        while (*tab && *tab != '\t') tab++;
-        *tab = 0;
-        if (!is_cover(line + last_slash(line) + 1)) g_photo[g_photo_count++] = (int32_t)(line - g_buf);
+    int32_t used = 0, first = 0, total = 1;
+    int kind = NOMI_LIB_IMAGE | (rescan ? NOMI_LIB_RESCAN : 0);
+    while (first < total && g_photo_count < MAX_PHOTOS && used < (int32_t)sizeof(g_buf) - 1024) {
+        total = library_list(kind, first, g_buf + used, (int32_t)sizeof(g_buf) - used);
+        kind = NOMI_LIB_IMAGE;  // 重扫一次就够
+        if (total < 0) return total;
+        // 「路径\t大小\n」一行一个：留下的路径（带结尾）往前挪到 w，记下位置
+        int got = 0;
+        int32_t w = used;
+        char *p = g_buf + used;
+        while (*p) {
+            char *line = p;
+            while (*p && *p != '\n') p++;
+            if (*p) *p++ = 0;
+            got++;
+            char *tab = line;
+            while (*tab && *tab != '\t') tab++;
+            int32_t size = *tab ? nomi_atoi(tab + 1) : 0;
+            *tab = 0;
+            if (size < MIN_PHOTO || is_cover(line + last_slash(line) + 1) || g_photo_count >= MAX_PHOTOS) continue;
+            int32_t len = (int32_t)(tab - line) + 1;
+            char *dst = g_buf + w;
+            for (int32_t k = 0; k < len && dst != line; k++) dst[k] = line[k];
+            g_photo[g_photo_count++] = w;
+            w += len;
+        }
+        if (got == 0) break;
+        first += got;
+        used = w;
     }
     sort_photos();
     // 排好序以后同一个文件夹的挨在一起：一段就是一个相册
@@ -294,7 +315,7 @@ static void draw_list(void)
         nomi_fmt(sub, sizeof(sub), is_frame_album(a) ? "%d 张 · 电子相框" : "%d 张", g_albums[a].count);
         g_album_rows[g_album_row_count++] = ui_item(name, sub, ">");
     }
-    g_rescan = ui_item("重新找照片", "", "");
+    g_rescan = ui_item("重新找照片", "整张卡重新找一遍", "");
 }
 
 static void show_list(void)
@@ -412,6 +433,28 @@ static void show_turn(void)
         return;                 \
     } while (0)
 
+// 「文件」里点了一张：在相册里就打开那个相册、翻到那一页、看这张；不在（小图、封面、刚拷的）单独看
+static void open_file(const char *path)
+{
+    for (int a = 0; a < g_album_count; a++) {
+        for (int i = 0; i < g_albums[a].count; i++) {
+            if (!nomi_equal(path_of(g_albums[a].first + i), path)) continue;
+            show_album(a, i / PER_PAGE * PER_PAGE);
+            show_photo(i);
+            return;
+        }
+    }
+    close_to(1);
+    g_album = -1;  // 不在相册里：翻不了上一张下一张，也没有菜单，左边缘右划回列表
+    push_page("");
+    g_viewer = ui_photo(path, g_turn);
+    if (g_viewer < 0) {
+        g_viewer = 0;
+        close_to(1);
+        ui_toast("这张图打不开");
+    }
+}
+
 static void open_album(int album)
 {
     if (g_pages < 1) {  // 界面没挂着：挂上再开
@@ -426,7 +469,7 @@ static void voice(int command)
 {
     char arg[200], reply[300], name[NAME_LEN], last[PATH_LEN];
     voice_arg(arg, sizeof(arg));
-    if (!g_scanned) scan_photos();
+    if (!g_scanned) scan_photos(0);
     if (command == VOICE_OPEN) {
         int album = arg[0] ? find_album(arg) : (kv_get("last", last, sizeof(last)) > 0 ? album_by_dir(last) : -1);
         if (album < 0) {
@@ -473,7 +516,7 @@ int32_t nomi_event(int32_t type, int32_t id, int32_t value)
     case NOMI_EV_SHOW:
         show_list();
         if (g_pending[0]) {
-            if (!g_scanned) scan_photos();
+            if (!g_scanned) scan_photos(0);
             draw_list();
             int album = album_by_dir(g_pending);
             g_pending[0] = 0;
@@ -483,12 +526,22 @@ int32_t nomi_event(int32_t type, int32_t id, int32_t value)
     case NOMI_EV_HIDE:
         g_pages = 0;
         g_viewer = 0;
-        g_scanned = 0;  // 下次打开重新找（可能新拷了照片）
+        g_scanned = 0;  // 下次打开再问一遍媒体库（可能新拷了照片）
         assistant_context("");
         return 1;
+    case NOMI_EV_OPEN: {  // 「文件」里点了一张（界面已经挂上、列表建好了）
+        char path[PATH_LEN];
+        if (open_path(path, sizeof(path)) <= 0) return 1;
+        if (!g_scanned) {
+            scan_photos(0);
+            draw_list();
+        }
+        open_file(path);
+        return 1;
+    }
     case NOMI_EV_TIMER:
         if (id == TIMER_SCAN && g_pages >= 1) {
-            scan_photos();
+            scan_photos(0);
             draw_list();
         }
         return 1;
@@ -532,7 +585,7 @@ int32_t nomi_event(int32_t type, int32_t id, int32_t value)
     if (g_pages == 1) {
         if (id == g_rescan) {
             ui_toast("正在整张卡找照片…");
-            scan_photos();
+            scan_photos(1);
             draw_list();
             return 1;
         }

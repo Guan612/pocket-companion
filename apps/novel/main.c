@@ -1,9 +1,11 @@
 // 小说：看 SD 卡里的 TXT。
 //
 // 系统给能力：排版、分页、翻页、认编码（UTF-8 / GBK）、缺字用卡上的字体补（ui_reader），找章节（text_chapters），
-// 整张卡找文件（fs_find）。应用管业务：书架、书签、目录、菜单、语音指令。
-// - 书架：整张卡找 .txt（大于 16KB 的，小的多半是说明、歌词），最近看的排前面，右边是读到百分之几。
-//   上次找到的记在 kv 里，打开就先显示，再在后台重新找一遍。
+// 媒体库（library_list：卡上的 .txt 系统记着）、打开文件（「文件」里点了 .txt，NOMI_EV_OPEN）。
+// 应用管业务：书架、书签、目录、菜单、语音指令。
+// - 书架：卡上的 .txt（大于 16KB 的，小的多半是说明、歌词），最近看的排前面，右边是读到百分之几。
+//   上次的记在 kv 里，打开就先显示，再在后台问一遍媒体库（卡没变时马上就有）；「重新找书」让系统重扫整张卡。
+// - 「文件」里点了 .txt（或网页上「设备上打开」）：直接打开这本，不在书架上的（小于 16KB）也能看。
 // - 看书：一整页都是阅读器；点屏幕中间（或长按）出快速跳转：拖进度、上一章 / 下一章、目录、翻页方式、回书架。
 //   翻页方式五选一：滑 + 点上下（默认）、滑 + 点左右、只滑、只点上下、只点左右。左边缘右划回书架。
 // - 书签：每本书读到哪（文件里的字节位置）记在 kv "p.<路径哈希>"，翻页后 10 秒内存一次，退出时也存。
@@ -22,7 +24,7 @@
 enum { TIMER_SCAN = 1, TIMER_SAVE = 2 };
 enum { VOICE_OPEN = 1, VOICE_NEXT, VOICE_PREV, VOICE_CHAPTER };
 
-static char g_buf[48 * 1024];  // fs_find、目录（同一时间只做一件事）
+static char g_buf[48 * 1024];  // 媒体库的书、目录（同一时间只做一件事）
 static char g_line[512];
 
 static struct {
@@ -152,7 +154,7 @@ static void save_offset(void)
 
 /* ---------- 书架：整张卡找书、最近看的 ---------- */
 
-// 「路径\t大小」一行一本，读进 g_books，按书名排
+// 「路径\t大小」一行一本，读进 g_books（小于 MIN_BOOK 的不要），按书名排
 static void parse_books(char *text)
 {
     g_book_count = 0;
@@ -163,11 +165,14 @@ static void parse_books(char *text)
         char *tab = p;
         while (tab < end && *tab != '\t') tab++;
         if (tab < end) {
-            nomi_copy_n(g_books[g_book_count].path, PATH_LEN, p, tab);
             char num[16];
             nomi_copy_n(num, sizeof(num), tab + 1, end);
-            g_books[g_book_count].size = nomi_atoi(num);
-            g_book_count++;
+            int32_t size = nomi_atoi(num);
+            if (size >= MIN_BOOK) {
+                nomi_copy_n(g_books[g_book_count].path, PATH_LEN, p, tab);
+                g_books[g_book_count].size = size;
+                g_book_count++;
+            }
         }
         p = *end ? end + 1 : end;
     }
@@ -196,10 +201,11 @@ static void load_books(void)
     if (kv_get("books", g_buf, sizeof(g_buf)) > 0) parse_books(g_buf);
 }
 
-// 整张卡找一遍（几秒）；找到的记进 kv。返回找到几本，没插卡等返回 < 0
-static int scan_books(void)
+// 问媒体库要卡上的 .txt（卡变了系统要扫一遍，几秒；rescan 不管记着的、重扫）；记进 kv。
+// 返回书架上几本，没插卡等返回 < 0
+static int scan_books(int rescan)
 {
-    int n = fs_find("sd:/", "txt", MIN_BOOK, g_buf, sizeof(g_buf) - 1);
+    int n = library_list(NOMI_LIB_BOOK | (rescan ? NOMI_LIB_RESCAN : 0), 0, g_buf, sizeof(g_buf));
     if (n < 0) return n;
     kv_set("books", g_buf);
     parse_books(g_buf);
@@ -290,7 +296,7 @@ static void draw_shelf(void)
     for (int i = 0; i < g_book_count; i++) {
         if (!shown[i]) add_shelf_row(i);
     }
-    g_scan_row = ui_item("重新找书", "整张卡找 .txt（大于 16KB 的）", "");
+    g_scan_row = ui_item("重新找书", "整张卡重新找一遍 .txt（大于 16KB 的）", "");
 }
 
 static void show_shelf(void)
@@ -556,7 +562,7 @@ static void voice(int command)
     voice_arg(arg, sizeof(arg));
     if (command == VOICE_OPEN) {
         const char *path = find_book(arg);
-        if (!path && !g_scanned && scan_books() >= 0) path = find_book(arg);
+        if (!path && !g_scanned && scan_books(0) >= 0) path = find_book(arg);
         if (!path) {
             nomi_fmt(reply, sizeof(reply), arg[0] ? "SD 卡里没找到「%s」这本书" : "还没看过小说，问问主人想看哪本", arg);
             REPLY(reply, 0);
@@ -615,9 +621,14 @@ int32_t nomi_event(int32_t type, int32_t id, int32_t value)
     case NOMI_EV_CLOSE:
         save_offset();
         return 1;
+    case NOMI_EV_OPEN: {  // 「文件」里点了一本（界面已经挂上、书架建好了）
+        char path[PATH_LEN];
+        if (open_path(path, sizeof(path)) > 0 && !open_book(path)) ui_toast("这本书打不开");
+        return 1;
+    }
     case NOMI_EV_TIMER:
         if (id == TIMER_SCAN) {
-            scan_books();
+            scan_books(0);
             g_scanned = 1;  // 没插卡也算找过了，别反复找
             draw_shelf();
         } else if (id == TIMER_SAVE) {
@@ -656,7 +667,7 @@ int32_t nomi_event(int32_t type, int32_t id, int32_t value)
     // 点击
     if (id == g_scan_row && g_pages == 1) {
         ui_toast("正在整张卡找书…");
-        scan_books();
+        scan_books(1);
         g_scanned = 1;
         draw_shelf();
         return 1;

@@ -1,8 +1,8 @@
 {
   "id": "nomi.novel",
   "name": "小说",
-  "version": "0.2.0",
-  "api": 2,
+  "version": "0.3.0",
+  "api": 3,
   "description": "看 SD 卡里的 TXT 小说（UTF-8 / GBK）：书架、目录、记住读到哪；看书时点屏幕中间出快速跳转（拖进度、上一章下一章、目录）",
   "icon": {
     "lines": [[[17, 10], [4, 7], [4, 28], [17, 31], [17, 10]],
@@ -10,6 +10,7 @@
     "circles": []
   },
   "permissions": ["sd.read", "assistant"],
+  "opens": ["txt"],
   "memory_kb": 256,
   "voice": [
     {
