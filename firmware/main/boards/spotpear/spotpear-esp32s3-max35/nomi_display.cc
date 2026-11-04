@@ -380,6 +380,7 @@ void Action(const char* name) {
 bool NomiDisplay::aec_supported = false;
 std::function<void()> NomiDisplay::on_user_activity;
 std::function<void()> NomiDisplay::on_power_timing_changed;
+std::function<void(bool on)> NomiDisplay::on_keep_awake;
 
 namespace {
 

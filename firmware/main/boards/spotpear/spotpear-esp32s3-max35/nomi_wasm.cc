@@ -4,9 +4,12 @@
 #include "nomi_book.h"
 #include "nomi_filelist.h"
 #include "nomi_files.h"
+#include "nomi_canvas.h"
+#include "nomi_display.h"
 #include "nomi_media.h"
 #include "nomi_flash_io.h"
 #include "nomi_music.h"
+#include "nomi_phone.h"
 #include "nomi_photo.h"
 #include "nomi_pkg.h"
 #include "nomi_radio.h"
@@ -35,6 +38,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cstring>
+#include <deque>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -60,11 +64,12 @@ constexpr int kWebWaitMs = 60000;                // 网页请求等应用回话�
 // 和 tools/app-sdk/nomi_sdk.h 一致
 enum {
     EV_CLICK = 1, EV_CHANGE, EV_BACK, EV_PAUSE, EV_RESUME, EV_CLOSE, EV_TIMER, EV_VOICE, EV_READER, EV_MEDIA,
-    EV_SHOW, EV_HIDE, EV_WEB, EV_PHOTO, EV_OPEN, EV_FILE
+    EV_SHOW, EV_HIDE, EV_WEB, EV_PHOTO, EV_OPEN, EV_FILE, EV_PHONE
 };
 enum { TEXT_TITLE = 0, TEXT_BODY, TEXT_MUTED };
 enum { MEDIA_FINISHED = 1, MEDIA_NEXT = 2, MEDIA_PREV = 3, MEDIA_PLAY = 4 };
-constexpr int32_t E_FAIL = -1, E_DENIED = -2, E_NO_SD = -3, E_NOT_FOUND = -4, E_NO_UI = -6, E_NO_NET = -7;
+constexpr int32_t E_FAIL = -1, E_DENIED = -2, E_NO_SD = -3, E_NOT_FOUND = -4, E_TOO_BIG = -5, E_NO_UI = -6,
+                  E_NO_NET = -7, E_NO_PHONE = -8;
 
 struct Event {
     int32_t type, id, value;
@@ -103,6 +108,9 @@ struct Proc : std::enable_shared_from_this<Proc> {
     bool req_end = false;
     std::string open_arg;  // NOMI_EV_OPEN 要打开的文件（sd:/ 开头，text_mutex）
     std::string file_pick;  // ui_files 里选中的（sd:/ 开头，text_mutex）
+    std::vector<std::string> phone_types;  // phone_listen 要的消息类型（text_mutex）
+    std::deque<std::string> phone_inbox;   // 收到还没取的（text_mutex）
+    bool keep_awake = false;               // screen_keep_on：界面在前台时不让屏幕睡（显示锁里读写）
 
     ~Proc() {
         if (queue) vQueueDelete(queue);
@@ -154,6 +162,22 @@ bool OwnsMedia(const Proc* p) {
 }
 
 bool KeepResident(const Proc* p) { return p->shown || p->pkg->tile || OwnsMedia(p); }
+
+// 要不要屏幕一直亮着：前台那个应用开了 screen_keep_on。变了才告诉板子。显示锁里调（拿锁顺序：显示锁在前）
+bool s_keep_awake = false;
+void UpdateKeepAwake() {
+    bool want = false;
+    {
+        std::lock_guard<std::mutex> lock(s_procs_mutex);
+        for (auto& p : s_procs) {
+            if (!p->exiting && p->keep_awake && p->root && nomi_app_current() == &p->pkg->app) want = true;
+        }
+    }
+    if (want == s_keep_awake) return;
+    s_keep_awake = want;
+    ESP_LOGI(TAG, "Keep screen on: %s", want ? "yes" : "no");
+    if (NomiDisplay::on_keep_awake) NomiDisplay::on_keep_awake(want);
+}
 
 // 改界面：拿显示锁；进程在退就什么都不做
 class UiScope {
@@ -1344,6 +1368,173 @@ int32_t files_picked(wasm_exec_env_t env, char* buf, uint32_t size) {
     return n;
 }
 
+/* ---------- 手机连接（权限 phone）：蓝牙收发 Gadgetbridge 的消息，系统只认类型，字段归应用 ---------- */
+
+constexpr size_t kPhoneInbox = 16;  // 每个应用最多攒几条没取的（多了丢最老的）
+enum { PHONE_MESSAGE = 1, PHONE_CONNECTED = 2, PHONE_DISCONNECTED = 3 };  // NOMI_EV_PHONE 的 value
+
+// 蓝牙任务里调：交给要这一类消息的应用
+void OnPhoneMessage(const std::string& type, const std::string& json) {
+    std::lock_guard<std::mutex> lock(s_procs_mutex);
+    for (auto& p : s_procs) {
+        if (p->exiting) continue;
+        bool want;
+        {
+            std::lock_guard<std::mutex> text(p->text_mutex);
+            want = std::find(p->phone_types.begin(), p->phone_types.end(), type) != p->phone_types.end();
+            if (want) {
+                if (p->phone_inbox.size() >= kPhoneInbox) p->phone_inbox.pop_front();
+                p->phone_inbox.push_back(json);
+            }
+        }
+        if (want) Post(p.get(), EV_PHONE, 0, PHONE_MESSAGE);
+    }
+}
+
+void OnPhoneState(bool connected) {
+    std::lock_guard<std::mutex> lock(s_procs_mutex);
+    for (auto& p : s_procs) {
+        bool listening;
+        {
+            std::lock_guard<std::mutex> text(p->text_mutex);
+            listening = !p->phone_types.empty();
+        }
+        if (listening) Post(p.get(), EV_PHONE, 0, connected ? PHONE_CONNECTED : PHONE_DISCONNECTED);
+    }
+}
+
+// 要收哪几类消息（逗号分开，比如 "nav,gps"；空字符串 = 不收了）。返回手机连着没有（1 / 0）
+int32_t phone_listen(wasm_exec_env_t env, const char* types) {
+    Proc* p = Ctx(env);
+    if (!p->pkg->Has("phone")) return E_DENIED;
+    std::vector<std::string> list;
+    std::string s = types ? types : "";
+    for (size_t pos = 0; pos <= s.size();) {
+        size_t comma = s.find(',', pos);
+        if (comma == std::string::npos) comma = s.size();
+        std::string t = s.substr(pos, comma - pos);
+        while (!t.empty() && t.front() == ' ') t.erase(0, 1);
+        while (!t.empty() && t.back() == ' ') t.pop_back();
+        if (!t.empty() && list.size() < 16) list.push_back(t);
+        pos = comma + 1;
+    }
+    {
+        std::lock_guard<std::mutex> lock(p->text_mutex);
+        p->phone_types = std::move(list);
+        if (p->phone_types.empty()) p->phone_inbox.clear();
+    }
+    return NomiPhone::Connected() ? 1 : 0;
+}
+
+// 取一条收到的（JSON，UTF-8）：返回长度，没有了返回 0；buf 放不下返回 E_TOO_BIG（这条就丢了）
+int32_t phone_read(wasm_exec_env_t env, char* buf, uint32_t size) {
+    Proc* p = Ctx(env);
+    std::lock_guard<std::mutex> lock(p->text_mutex);
+    if (p->phone_inbox.empty()) return 0;
+    std::string msg = std::move(p->phone_inbox.front());
+    p->phone_inbox.pop_front();
+    if (size == 0 || msg.size() >= size) return E_TOO_BIG;
+    memcpy(buf, msg.data(), msg.size());
+    buf[msg.size()] = '\0';
+    return static_cast<int32_t>(msg.size());
+}
+
+// 发一条 JSON 给手机（比如让手机开始推定位）。没连上返回 E_NO_PHONE
+int32_t phone_send(wasm_exec_env_t env, const char* json) {
+    Proc* p = Ctx(env);
+    if (!p->pkg->Has("phone")) return E_DENIED;
+    if (!json || !*json || strlen(json) > 4096) return E_FAIL;
+    return NomiPhone::Send(json) ? 0 : E_NO_PHONE;
+}
+
+int32_t phone_connected(wasm_exec_env_t env) { return NomiPhone::Connected() ? 1 : 0; }
+
+// 界面在前台时不让屏幕睡（导航、计时这类）：1 开、0 关；应用退到后台、退出时自动放开。要 keep_awake 权限
+int32_t screen_keep_on(wasm_exec_env_t env, int32_t on) {
+    Proc* p = Ctx(env);
+    if (!p->pkg->Has("keep_awake")) return E_DENIED;
+    UiScope ui(p);
+    p->keep_awake = on != 0;
+    UpdateKeepAwake();
+    return 0;
+}
+
+/* ---------- 画布：应用自己画（线、实心多边形、圆、字），clear → 一样样加 → show ---------- */
+
+lv_obj_t* CanvasOf(Proc* p, int32_t id) {
+    lv_obj_t* o = Obj(p, id);
+    return NomiCanvas::Is(o) ? o : nullptr;
+}
+
+// height 0：占满当前页（这页别放别的控件，标题给空字符串）
+int32_t ui_canvas(wasm_exec_env_t env, int32_t height) {
+    Proc* p = Ctx(env);
+    UiScope ui(p);
+    lv_obj_t* parent = ui.target();
+    if (!parent) return E_NO_UI;
+    lv_obj_t* c = NomiCanvas::Create(parent, height);
+    lv_obj_add_flag(c, LV_OBJ_FLAG_CLICKABLE);  // 点一下发 NOMI_EV_CLICK（应用拿来出菜单）
+    int32_t id = AddObj(p, c);
+    BindClick(c, p, id);
+    return id;
+}
+
+void canvas_clear(wasm_exec_env_t env, int32_t id) {
+    Proc* p = Ctx(env);
+    UiScope ui(p);
+    if (ui.ok()) NomiCanvas::Clear(CanvasOf(p, id));
+}
+
+// 点是 x0,y0,x1,y1…（int32），拷出来再用：应用内存里不一定对齐
+std::vector<int32_t> CopyPoints(const void* xy, uint32_t bytes) {
+    std::vector<int32_t> v(bytes / 8 * 2);
+    if (!v.empty()) memcpy(v.data(), xy, v.size() * sizeof(int32_t));
+    return v;
+}
+
+void canvas_line(wasm_exec_env_t env, int32_t id, const void* xy, uint32_t bytes, int32_t width, int32_t color) {
+    Proc* p = Ctx(env);
+    auto pts = CopyPoints(xy, bytes);
+    UiScope ui(p);
+    if (ui.ok()) NomiCanvas::Line(CanvasOf(p, id), pts.data(), pts.size() / 2, width, color);
+}
+
+void canvas_fill(wasm_exec_env_t env, int32_t id, const void* xy, uint32_t bytes, int32_t color) {
+    Proc* p = Ctx(env);
+    auto pts = CopyPoints(xy, bytes);
+    UiScope ui(p);
+    if (ui.ok()) NomiCanvas::Fill(CanvasOf(p, id), pts.data(), pts.size() / 2, color);
+}
+
+void canvas_circle(wasm_exec_env_t env, int32_t id, int32_t x, int32_t y, int32_t r, int32_t width, int32_t color) {
+    Proc* p = Ctx(env);
+    UiScope ui(p);
+    if (ui.ok()) NomiCanvas::Circle(CanvasOf(p, id), x, y, r, width, color);
+}
+
+int32_t canvas_text(wasm_exec_env_t env, int32_t id, int32_t x, int32_t y, const char* text, int32_t size,
+                    int32_t color, int32_t align) {
+    Proc* p = Ctx(env);
+    UiScope ui(p);
+    lv_obj_t* c = ui.ok() ? CanvasOf(p, id) : nullptr;
+    return c && text ? NomiCanvas::Text(c, x, y, text, size, color, align) : 0;
+}
+
+void canvas_show(wasm_exec_env_t env, int32_t id) {
+    Proc* p = Ctx(env);
+    UiScope ui(p);
+    if (ui.ok()) NomiCanvas::Show(CanvasOf(p, id));
+}
+
+// 画布多大：宽 << 16 | 高
+int32_t canvas_size(wasm_exec_env_t env, int32_t id) {
+    Proc* p = Ctx(env);
+    UiScope ui(p);
+    lv_obj_t* c = ui.ok() ? CanvasOf(p, id) : nullptr;
+    if (!c) return E_NOT_FOUND;
+    return (NomiCanvas::Width(c) << 16) | (NomiCanvas::Height(c) & 0xffff);
+}
+
 // 小设置和进度：data/kv.json，一个 JSON 对象，改一次写一次（不占设备那 16KB 的 NVS）
 void LoadKv(Proc* p) {
     std::string text, path = p->pkg->dir + "/data/kv.json";
@@ -1669,6 +1860,19 @@ NativeSymbol kNatives[] = {
     {"ui_photo", (void*)ui_photo, "($i)i", nullptr},
     {"ui_files", (void*)ui_files, "($$i)i", nullptr},
     {"files_picked", (void*)files_picked, "(*~)i", nullptr},
+    {"phone_listen", (void*)phone_listen, "($)i", nullptr},
+    {"phone_read", (void*)phone_read, "(*~)i", nullptr},
+    {"phone_send", (void*)phone_send, "($)i", nullptr},
+    {"phone_connected", (void*)phone_connected, "()i", nullptr},
+    {"screen_keep_on", (void*)screen_keep_on, "(i)i", nullptr},
+    {"ui_canvas", (void*)ui_canvas, "(i)i", nullptr},
+    {"canvas_clear", (void*)canvas_clear, "(i)", nullptr},
+    {"canvas_line", (void*)canvas_line, "(i*~ii)", nullptr},
+    {"canvas_fill", (void*)canvas_fill, "(i*~i)", nullptr},
+    {"canvas_circle", (void*)canvas_circle, "(iiiiii)", nullptr},
+    {"canvas_text", (void*)canvas_text, "(iii$iii)i", nullptr},
+    {"canvas_show", (void*)canvas_show, "(i)", nullptr},
+    {"canvas_size", (void*)canvas_size, "(i)i", nullptr},
     {"photo_show", (void*)photo_show, "(i$)", nullptr},
     {"photo_set_flags", (void*)photo_set_flags, "(ii)", nullptr},
     {"photo_preload", (void*)photo_preload, "($)", nullptr},
@@ -1806,6 +2010,7 @@ void* ProcThread(void* arg) {
             s_tile_owner = nullptr;
         }
         p->target = nullptr;
+        UpdateKeepAwake();  // 退出的应用要过屏幕常亮的话，放开
         std::lock_guard<std::mutex> procs(s_procs_mutex);
         s_procs.erase(std::remove(s_procs.begin(), s_procs.end(), self), s_procs.end());
     }
@@ -1936,6 +2141,9 @@ void Init(Display* display) {
         ESP_LOGE(TAG, "wasm_runtime_full_init failed");
         return;
     }
+    // 手机（蓝牙）发来的消息交给要这一类的应用；连上 / 断开告诉在收消息的应用
+    NomiPhone::SetListeners(OnPhoneMessage, OnPhoneState);
+
     // 应用放的歌 / 节目放完了（主循环里）：告诉那个应用，接着放什么由它定
     NomiRadio::GetInstance().on_finished = [](const NomiRadio::Station& item) {
         if (item.owner.empty()) return;
@@ -1998,6 +2206,7 @@ void Open(const nomi_app_t* app, lv_obj_t* root) {
         p->loading = AddLoading(root);
         Post(p.get(), EV_SHOW, 0, 0);
         if (!file.empty()) GiveFile(p.get(), file);
+        UpdateKeepAwake();  // 它之前要过屏幕常亮的话，回到前台接着亮
         return;
     }
     ProcPtr p = Spawn(pkg, root);
@@ -2024,6 +2233,7 @@ void Close(const nomi_app_t* app) {
             if (!p->exiting) live = p;
         }
     }
+    UpdateKeepAwake();  // 界面拿下了：它要过的屏幕常亮放开
     if (!live) return;
     if (KeepResident(live.get())) Post(live.get(), EV_HIDE, 0, 0);  // 有卡片、或在放它的歌：留在后台
     else Exit(live.get());

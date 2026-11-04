@@ -63,6 +63,7 @@ private:
     bool camera_ready_ = false;  // 摄像头初始化成功（采集平时停着，抓拍时才开）
     std::atomic<bool> sleeping_{false};
     std::atomic<bool> screen_off_{false};  // 到息屏时间把背光关了（不一定在睡眠里，见 WakeScreen）
+    bool keep_awake_ = false;  // 前台应用要屏幕一直亮着（导航）：休眠计时停着（只在主循环里读写）
     bool holding_ = false;     // BOOT 键按住说话中
     bool alarm_press_ = false;  // 这次按 BOOT 键是为了关闹钟：松开、单击都不再当说话
     esp_timer_handle_t dim_timer_ = nullptr;  // 睡着一会儿后调暗屏幕
@@ -209,7 +210,7 @@ private:
             screen_off_ = true;
             GetBacklight()->SetBrightness(0);
         });
-        power_save_timer_->SetEnabled(true);
+        power_save_timer_->SetEnabled(!keep_awake_);
     }
 
     // 有人用了：重置休眠计时，屏幕关着的话亮起来。
@@ -238,6 +239,14 @@ private:
         ESP_ERROR_CHECK(esp_timer_create(&dim_args, &dim_timer_));
         CreatePowerSaveTimer();
         NomiDisplay::on_user_activity = [this]() { WakeScreen(); };
+        // 前台应用要屏幕一直亮着（地图导航时）：屏幕关着的话亮起来、休眠计时停掉，放开后从头数
+        NomiDisplay::on_keep_awake = [this](bool on) {
+            Application::GetInstance().Schedule([this, on]() {
+                keep_awake_ = on;
+                if (on) WakeScreen();
+                power_save_timer_->SetEnabled(!on);
+            });
+        };
         // 设置页改了时间就换一个计时器；在主循环里换，避免和其他调用撞上
         NomiDisplay::on_power_timing_changed = [this]() {
             Application::GetInstance().Schedule([this]() {

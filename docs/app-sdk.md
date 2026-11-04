@@ -101,6 +101,7 @@ int32_t nomi_event(int32_t type, int32_t id, int32_t value);   // 其他所有�
 | `NOMI_EV_READER` | 阅读器：翻到新的一页、长按、在最后一页还往后翻 | 阅读器 id / 这页开头的字节位置（≥ 0，就是书签），或 `NOMI_READER_MENU`（长按）、`NOMI_READER_END` |
 | `NOMI_EV_MEDIA` | 你放的歌放完了，或主人在系统的播放控件上点了上一首 / 下一首 / 放 | 0 / `NOMI_MEDIA_FINISHED`、`NEXT`、`PREV`、`PLAY`，见第 5 节 |
 | `NOMI_EV_SHOW` / `NOMI_EV_HIDE` | 界面挂上 / 拿下 | — |
+| `NOMI_EV_PHONE` | （api 4）来了要收的手机消息、手机连上 / 断开 | 0 / `NOMI_PHONE_MESSAGE`（用 `phone_read` 取到返回 0 为止）、`NOMI_PHONE_CONNECTED`、`NOMI_PHONE_DISCONNECTED`，见第 5 节「手机连接」 |
 
 规矩：
 
@@ -125,7 +126,7 @@ int32_t ui_slider(const char *label, int32_t min, int32_t max, int32_t value);
 int32_t ui_progress(int32_t value, int32_t max);
 int32_t ui_image(const char *path, int32_t w, int32_t h);  // 系统解码 JPEG / PNG，按大小缩放
 int32_t ui_reader(const char *path, int32_t offset, int32_t flags);  // 阅读器（api 2）：系统排版、分页、翻页
-int32_t ui_canvas(int32_t w, int32_t h);                   // 自己画（地图之类），见下
+int32_t ui_canvas(int32_t height);                         // 画布（api 4）：自己画（地图、导航箭头），见下
 
 void ui_set_text(int32_t id, const char *text);
 void ui_set_value(int32_t id, int32_t value);
@@ -152,17 +153,23 @@ void    ui_open(void);           // 打开自己的界面（卡片上点了"打�
   - `reader_goto` 给的位置对齐到那一段的开头（拖进度条、跳章不会从半句话开始）；`ui_reader` 的 offset 是书签，原样用。
   - 往回翻：刚往后翻过的原样退回去；从书签、目录跳进来的，就从前面的段落开头排到这页开头，取最后一整页。
   - 还有 `reader_goto`（跳到某个位置）、`reader_set_flags`（换翻页方式）、`reader_text`（这一页的字，给大模型当上下文）、`text_chapters` / `text_chapter_at`（章节，见第 5 节）。
-- **画布**（`ui_canvas`）给地图这种要自己画的：
+- **画布**（`ui_canvas`，api 4）给地图、导航箭头、仪表这种要自己画的。系统存一份「画什么」的清单，屏幕刷新时照着画（抗锯齿）：`canvas_clear` 清空，一样样加，`canvas_show` 一次换上屏，画到一半的不会被刷出来。坐标以画布左上角为原点、单位像素，颜色 `0xRRGGBB`。
 
 ```c
-void canvas_clear(int32_t id, int32_t color);
-void canvas_line(int32_t id, int32_t x0, int32_t y0, int32_t x1, int32_t y1, int32_t width, int32_t color);
-void canvas_rect(int32_t id, int32_t x, int32_t y, int32_t w, int32_t h, int32_t color, int32_t filled);
-void canvas_text(int32_t id, int32_t x, int32_t y, const char *text, int32_t color);
-void canvas_image(int32_t id, const char *path, int32_t x, int32_t y);  // 贴一张图（地图瓦片）
+int32_t ui_canvas(int32_t height);  // 0 = 占满整页（这页别放别的控件，标题给空字符串），否则宽占满、高 height
+int32_t canvas_size(int32_t id);    // 宽 << 16 | 高
+void    canvas_clear(int32_t id);
+void    canvas_line(int32_t id, const int32_t *xy, int32_t bytes, int32_t width, int32_t color);  // 折线，两头圆；bytes = 点数 * 8
+void    canvas_fill(int32_t id, const int32_t *xy, int32_t bytes, int32_t color);   // 实心凸多边形（箭头、三角）
+void    canvas_circle(int32_t id, int32_t x, int32_t y, int32_t r, int32_t width, int32_t color);  // width 0 = 实心
+// y 是字的顶。size：NOMI_CANVAS_TEXT 系统字、NOMI_CANVAS_BIG 120 像素大数字（只有 0-9 和冒号）；
+// align：NOMI_ALIGN_LEFT / CENTER / RIGHT（x 是字的左边、中间、右边）。返回字宽，好接着排
+int32_t canvas_text(int32_t id, int32_t x, int32_t y, const char *text, int32_t size, int32_t color, int32_t align);
+void    canvas_show(int32_t id);
 ```
 
-  画布能拖动时，右划返回只认从左边缘开始的（和 Wear OS 一样），其他方向的拖动交给应用（`NOMI_EV_CHANGE` 带拖动距离，待细化）。
+  - 一份清单最多 800 样，一条折线、一个多边形最多 1000 个点，多的不画。
+  - 点一下画布来 `NOMI_EV_CLICK`（id 是画布）。不能拖动、缩放（地图跟着定位走，用不上）；左边缘右划照常返回。
 
 ## 5. 系统接口
 
@@ -269,7 +276,8 @@ void    voice_reply(const char *text, int32_t end); // 回话；end = 1 时这�
 int64_t time_now(void);                                     // 当前时间（Unix 毫秒），没对上时间时为 0
 void    timer_start(int32_t id, int32_t ms, int32_t repeat);
 void    timer_stop(int32_t id);
-void    keep_awake(int32_t on);                             // 要权限 keep_awake：看书时不息屏
+int32_t screen_keep_on(int32_t on);                         // （api 4，权限 keep_awake）界面在前台时屏幕不睡：
+                                                            // 导航、计时这类；退到后台、退出时系统自动放开
 void    nomi_log(const char *text);                         // 打到串口日志，调试用
 ```
 
@@ -286,6 +294,24 @@ int32_t net_get_until(const char *url, char *buf, int32_t size, const char *unti
 - 会卡住几秒，但跑在应用自己的线程里，不影响界面。
 - 设备内部 RAM 只够同时开一条 https 连接：如果正在放的是 https 的流，系统先暂停它，取完再接着放。
 - 拿回来的 JSON、XML、网页用 `tools/app-sdk/nomi_text.h` 里的小工具拆，见第 10 节。
+
+### 手机连接（api 4，权限 `phone`）
+
+不用自己写手机 App：设备用蓝牙装成一块 Bangle.js 手表，手机上装开源的 [Gadgetbridge](https://gadgetbridge.org/)，导航（OsmAnd、CoMaps）、手机定位、通知这些就会一条条发过来。系统只做最薄的一层：蓝牙、按行切消息、认出每条的类型（JSON 里的 `"t"`）、交给要这一类的应用，自己只处理对时；字段是什么意思归应用。
+
+```c
+int32_t phone_listen(const char *types);      // 要收哪几类（"nav,gps"；空字符串 = 不收了）；返回手机连着没有（1 / 0）
+int32_t phone_read(char *buf, int32_t size);  // 取一条（整条 JSON，UTF-8）：返回长度，取完了返回 0；放不下 NOMI_E_TOO_BIG（这条丢掉）
+int32_t phone_send(const char *json);         // 发一条 JSON 给手机；没连上 NOMI_E_NO_PHONE
+int32_t phone_connected(void);                // 1 连着
+```
+
+- 来了要收的消息发 `NOMI_EV_PHONE`（value `NOMI_PHONE_MESSAGE`），一次取到 `phone_read` 返回 0 为止；手机连上 / 断开也发（`NOMI_PHONE_CONNECTED` / `DISCONNECTED`，调过 `phone_listen` 的才收）。
+- 只在进程跑着时收：消息来时应用没在跑就丢了（不会为一条消息把应用拉起来）。每个应用最多攒 16 条没取的，多了丢最老的；一条最长 8KB。
+- 常见的两类（Gadgetbridge 给 Bangle.js 的协议，`nomi_sdk.h` 里有完整注释）：
+  - 导航 `{"t":"nav","instr":"左转进入…","distance":"80 m","action":"left","eta":"18:42"}`；只有 `"t"` = 导航结束。`action` 有 17 种（直行、左右转三档、靠左靠右、掉头、偏航、环岛四种、到达）。`distance` 按带单位的字处理，纯数字当米。
+  - 定位 `{"t":"gps","lat":…,"lon":…,"alt":…,"speed":…,"time":…}`（速度千米每小时）：先 `phone_send("{\"t\":\"gps_power\",\"status\":true}")` 让手机开始推，不用了发 `false`。
+- 手机上：Gadgetbridge 添加设备，扫到「Bangle.js Nomi」，选「不配对」；这台设备的设置里打开「使用手机的GPS数据」。
 
 ### 网页（应用自带的设置页）
 
@@ -310,8 +336,9 @@ void    web_reply(const char *text);         // 回给网页
 | `sd.write` | 读写 SD 卡上的文件（api 3；系统的 `nomi/` 碰不了） |
 | `media` | 让系统播放器放歌、控制播放 |
 | `assistant` | 给大模型加上下文、注册语音指令、让它念出来 |
-| `keep_awake` | 打开时不息屏 |
+| `keep_awake` | 界面在前台时屏幕不睡（`screen_keep_on`，api 4） |
 | `net` | 联网（`net_get` `net_get_until`） |
+| `phone` | 手机连接（api 4）：收发 Gadgetbridge 的消息 |
 
 没写在 `permissions` 里的接口，调了返回 `NOMI_E_DENIED`。
 
@@ -440,7 +467,7 @@ int32_t nomi_event(int32_t type, int32_t id, int32_t value)
 
 ## 12. 待定 / 待验证
 
-- 运行时占多少固件空间：固件现在还剩 9%，不够的话就把两个 OTA 程序槽合成一个。
+- 运行时占多少固件空间：2026-11-04 开蓝牙后程序槽不够，从资源分区匀了 1MB 给两个程序槽（各 4.44MB，还能 OTA），现在剩 10%；再不够就把两个 OTA 程序槽合成一个（见 [flash-partitions.md](flash-partitions.md)）。
 - 机器内部应用区的大小和文件系统（LittleFS 还是 FAT），以及资源分区能不能安全缩小。
 - 解释执行的速度够不够：主要看列表很长时的滚动、阅读器翻页。不够的话试 fast-interp 或 AOT。
 - ~~小说要完整的中文字体~~：已做（2026-11-04）。系统字为主，缺的字用 SD 卡 `fonts/` 里的 `.ttf` 补（LVGL tiny_ttf，按需从卡上读字形，缓存 256 个）。系统字（资源分区的 Noto Sans SC 20 像素子集）只有 5258 个汉字，GB2312 的 6763 个里缺 2501 个，繁体缺得更多。
@@ -448,20 +475,21 @@ int32_t nomi_event(int32_t type, int32_t id, int32_t value)
 - 网页设置页的「应用」页：列表、上传安装、卸载。（v0.1 已有：设备 → 应用，还能「打开」）
 - ~~没插 SD 卡时，装在卡上的应用不出现在桌面上~~：已做（2026-11-04）。机器内部分区里记着卡上每个应用的 manifest（`/int/nomi/sdapps/<id>.json`），卡不在时照样登记、灰着；没有插卡检测脚，桌面翻到眼前（3 秒内最多一次、有卡上的应用才看）和点了灰着的应用时去挂一下卡看看。卡在但卡上没有它的也灰着（提示重新装）；卡不在时不让删卡上的应用（卡上的文件删不掉，下次插卡又冒出来）。
 
-## 13. 实现进度（v0.3）
+## 13. 实现进度（v0.4）
 
 | 部分 | 状态 |
 |---|---|
 | 运行时 | ✓ wasm-micro-runtime 2.4 解释执行（fast-interp），关了 AOT、WASI、pthread 库、它自带的应用框架；固件增加约 90KB |
 | 进程 | ✓ 每个应用一个进程、界面挂上 / 拿下、后台常驻（有卡片、在放歌）、闲置后结束、有事时在后台拉起；✗ 2 秒无响应自动关 |
-| 界面 | ✓ `ui_page` `ui_page_close` `ui_text` `ui_item` `ui_button` `ui_set_text` `ui_set_hidden` `ui_remove` `ui_toast` `ui_player` `ui_tile` `ui_target` `ui_open`、阅读器 `ui_reader` `reader_goto` `reader_set_flags` `reader_text`、拖条 `ui_slider` `ui_set_value`（api 2，label 里的 `{}` 换成当前值，松手发 `NOMI_EV_CHANGE`）；✗ 开关、进度条、图片、画布 |
+| 界面 | ✓ `ui_page` `ui_page_close` `ui_text` `ui_item` `ui_button` `ui_set_text` `ui_set_hidden` `ui_remove` `ui_toast` `ui_player` `ui_tile` `ui_target` `ui_open`、阅读器 `ui_reader` `reader_goto` `reader_set_flags` `reader_text`、拖条 `ui_slider` `ui_set_value`（api 2，label 里的 `{}` 换成当前值，松手发 `NOMI_EV_CHANGE`）、画布 `ui_canvas` `canvas_*`（api 4）；✗ 开关、进度条、图片 |
 | 存储 | ✓ `fs_list` `fs_size` `fs_read` `kv_get` `kv_set`（`data/kv.json`）、`fs_find`（整张卡按扩展名找文件）、`text_chapters` `text_chapter_at`（章节，缓存在卡上 `nomi/cache/chapters/`）（api 2）；`fs_write` `fs_remove` `fs_rename` `fs_mkdir`（`sd.write`）、`library_list`（媒体库）（api 3） |
 | 文件 | ✓（api 3）manifest `opens` + `NOMI_EV_OPEN` `open_path`（打开方式：记住默认、弹出来选、应用管理里清除）、`ui_files` `files_picked`（系统文件列表）；系统应用「文件」（浏览、点了交给应用、长按删除 / 打开方式 / 大小时间）；网页文件管理（浏览、新建文件夹、上传、改名、删除、下载、看大图、设备上打开） |
 | 播放 | ✓ `media_play`（本地 / 网上的歌 / 节目 / 直播，能指定从第几秒放；网上的先探格式）`media_meta` `media_control` `media_seek` `media_state` `media_position` `media_duration` `media_mine` `media_info`；放完、上一首、下一首、放都会通知应用 |
 | 联网 | ✓ `net_get` `net_get_until` |
 | 网页 | ✓ 应用自带设置页（`assets/web/`、`/app/<id>/`、`call` → `NOMI_EV_WEB`、`web_body` `web_reply`） |
 | 大模型 | ✓ manifest 的 `voice` + `self.app.command`、`voice_arg` `voice_reply` `assistant_context`；✗ `assistant_say` |
-| 其他 | ✓ `time_now` `timer_start` `timer_stop` `nomi_log`；✗ `keep_awake` |
+| 手机 | ✓（api 4）蓝牙连 Gadgetbridge（装成 Bangle.js）：`phone_listen` `phone_read` `phone_send` `phone_connected`、`NOMI_EV_PHONE`；系统自己对时 |
+| 其他 | ✓ `time_now` `timer_start` `timer_stop` `nomi_log`、`screen_keep_on`（api 4） |
 | 事件 | ✓ 点击、返回、关闭、定时器、语音、网页、播放、SHOW / HIDE；✗ 暂停 / 恢复（浮层、睡眠） |
 | 安装 | ✓ 网页上传 `.npk`、开机扫描、更新保留数据、应用管理和网页删除、机器内部的应用分区、预装应用（开机装、从 SD 卡搬数据）；✗ 自己选装在哪、挪位置、预装应用删了能恢复、从 SD 卡上的安装包装、权限确认界面 |
 | 工具 | ✓ `tools/app-sdk/`：`nomi_sdk.h`、`nomi_text.h`、`build.py`（编译 + 打包，去掉调试信息）、`wasm_info.py`（看导入导出）、`examples/counter` |

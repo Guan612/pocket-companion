@@ -40,6 +40,8 @@ public:
     static bool aec_supported;                          // 有没有喇叭回采（焊了 ES7210）
     static std::function<void()> on_user_activity;      // 触摸时，用来重置休眠计时
     static std::function<void()> on_power_timing_changed;  // 设置页里改了调暗 / 息屏时间
+    // 前台应用要不要屏幕一直亮着（应用的 screen_keep_on；应用退到后台、退出时自动放开）
+    static std::function<void(bool on)> on_keep_awake;
 
     // 设置页里选的调暗 / 息屏时间（秒），-1 表示从不
     static void GetIdleSeconds(int& dim_seconds, int& off_seconds);

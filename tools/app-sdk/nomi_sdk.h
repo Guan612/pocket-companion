@@ -14,10 +14,11 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define NOMI_API 3  // 用到的最高版本写进 manifest 的 "api"。
+#define NOMI_API 4  // 用到的最高版本写进 manifest 的 "api"。
 // 2：阅读器（ui_reader 等）、text_chapters、fs_find。
 // 3：图片（ui_photo 等）、写卡（fs_write 等，权限 sd.write）、打开文件（manifest 的 opens、NOMI_EV_OPEN）、
 //    选文件（ui_files）、媒体库（library_list）
+// 4：手机连接（phone_*，权限 phone）、画布（ui_canvas、canvas_*）、屏幕常亮（screen_keep_on）
 
 #define NOMI_IMPORT(name) __attribute__((import_module("env"), import_name(#name)))
 #define NOMI_EXPORT(name) __attribute__((export_name(#name)))
@@ -44,6 +45,7 @@ enum {
     NOMI_EV_PHOTO,      // （api 3）全屏看图：id 是看图控件，value 是 NOMI_PHOTO_NEXT / PREV / MENU
     NOMI_EV_OPEN,       // （api 3）打开一个文件：用 open_path 取路径（见「打开文件」）
     NOMI_EV_FILE,       // （api 3）文件列表里选了：id 是 ui_files 的控件，value 0 文件、1 文件夹，files_picked 取路径
+    NOMI_EV_PHONE,      // （api 4）手机连接：value 是 NOMI_PHONE_MESSAGE（用 phone_read 取）/ CONNECTED / DISCONNECTED
 };
 
 enum { NOMI_TEXT_TITLE = 0, NOMI_TEXT_BODY = 1, NOMI_TEXT_MUTED = 2 };
@@ -56,6 +58,7 @@ enum { NOMI_TEXT_TITLE = 0, NOMI_TEXT_BODY = 1, NOMI_TEXT_MUTED = 2 };
 #define NOMI_E_TOO_BIG (-5)
 #define NOMI_E_NO_UI (-6)    // 界面没挂着（在后台）
 #define NOMI_E_NO_NET (-7)   // 没联网（net_get 别的失败：连不上、不是 200，都是 NOMI_E_FAIL）
+#define NOMI_E_NO_PHONE (-8) // 手机没连上（phone_send）
 
 /* ---------- 界面：页面一层层往里压，应用里只上下滚，左边缘右划退一层 ---------- */
 
@@ -175,6 +178,53 @@ NOMI_IMPORT(open_path) int32_t open_path(char *buf, int32_t size);
 NOMI_IMPORT(ui_files) int32_t ui_files(const char *dir, const char *exts, int32_t flags);
 NOMI_IMPORT(files_picked) int32_t files_picked(char *buf, int32_t size);
 
+/* ---------- 手机连接（api 4，权限 phone）：蓝牙连手机上的 Gadgetbridge ---------- */
+
+// 设备用蓝牙兼容 Gadgetbridge（开源的安卓手表伴侣 App）跟 Bangle.js 说的那套协议：手机上装 Gadgetbridge、添加设备
+// 「Bangle.js Nomi」，导航（OsmAnd / CoMaps）、手机定位、通知这些就会一条条发过来。系统只按类型转交，字段归应用：
+//   {"t":"nav","instr":"…","distance":…,"action":"left","eta":"08:39"}   导航（只有 "t" 时 = 导航结束）
+//     action：continue left left_slight left_sharp right right_slight right_sharp keep_left keep_right
+//             uturn_left uturn_right offroute roundabout_right roundabout_left roundabout_straight
+//             roundabout_uturn finish
+//   {"t":"gps","lat":…,"lon":…,"alt":…,"speed":千米每小时,"time":…}   手机定位（要先发 gps_power，见下）
+// 应用发给手机的也是一条 JSON：{"t":"gps_power","status":true} 让手机开始推定位（Gadgetbridge 里这台设备要允许
+// 分享定位），不用了发 false。对时系统自己处理。
+#define NOMI_PHONE_MESSAGE 1       // NOMI_EV_PHONE 的 value：有消息了（一次取完，可能不止一条）
+#define NOMI_PHONE_CONNECTED 2     // 手机连上了
+#define NOMI_PHONE_DISCONNECTED 3  // 手机断开了
+// 要收哪几类消息（逗号分开，比如 "nav,gps"；空字符串 = 不收了）。只在进程跑着时收，消息来时进程不在就丢了。
+// 返回手机现在连着没有（1 / 0）
+NOMI_IMPORT(phone_listen) int32_t phone_listen(const char *types);
+// 取一条（整条 JSON，UTF-8）：返回长度，取完了返回 0；buf 放不下返回 NOMI_E_TOO_BIG（这条丢掉）
+NOMI_IMPORT(phone_read) int32_t phone_read(char *buf, int32_t size);
+NOMI_IMPORT(phone_send) int32_t phone_send(const char *json);  // 没连上返回 NOMI_E_NO_PHONE
+NOMI_IMPORT(phone_connected) int32_t phone_connected(void);    // 1 连着
+
+/* ---------- 画布（api 4）：应用自己画（导航箭头、轨迹、指南针、仪表） ---------- */
+
+// 系统存一份「画什么」的清单，屏幕刷新时照着画（抗锯齿）：canvas_clear 清空，一样样加，canvas_show 一次换上屏
+// （画到一半不会被刷出来）。坐标以画布左上角为原点，像素；颜色 0xRRGGBB
+#define NOMI_CANVAS_TEXT 0  // canvas_text 的 size：系统字
+#define NOMI_CANVAS_BIG 1   // 大数字（120 像素，只有 0-9 和冒号，别的字不画）
+#define NOMI_ALIGN_LEFT 0   // canvas_text 的 align：x 是文字左边、中间、右边
+#define NOMI_ALIGN_CENTER 1
+#define NOMI_ALIGN_RIGHT 2
+// 在当前页建一块画布：height 0 = 占满整页（这页别放别的控件，标题给空字符串），否则宽占满、高 height。
+// 点一下画布来 NOMI_EV_CLICK（id 是画布）
+NOMI_IMPORT(ui_canvas) int32_t ui_canvas(int32_t height);
+NOMI_IMPORT(canvas_size) int32_t canvas_size(int32_t id);  // 宽 << 16 | 高
+NOMI_IMPORT(canvas_clear) void canvas_clear(int32_t id);
+// 折线（两头圆的）：xy 是 x0,y0,x1,y1…，bytes = 点数 * 8
+NOMI_IMPORT(canvas_line) void canvas_line(int32_t id, const int32_t *xy, int32_t bytes, int32_t width, int32_t color);
+// 实心凸多边形（箭头、三角）
+NOMI_IMPORT(canvas_fill) void canvas_fill(int32_t id, const int32_t *xy, int32_t bytes, int32_t color);
+NOMI_IMPORT(canvas_circle) void canvas_circle(int32_t id, int32_t x, int32_t y, int32_t r, int32_t width,
+                                              int32_t color);  // width 0 = 实心
+// y 是文字的顶；返回文字宽度（像素），好接着排
+NOMI_IMPORT(canvas_text) int32_t canvas_text(int32_t id, int32_t x, int32_t y, const char *text, int32_t size,
+                                             int32_t color, int32_t align);
+NOMI_IMPORT(canvas_show) void canvas_show(int32_t id);
+
 /* ---------- 播放（权限 media）：系统只管放"这一首"，放哪首、下一首放什么（队列）是应用的事 ---------- */
 
 enum { NOMI_MEDIA_PAUSE = 1, NOMI_MEDIA_RESUME = 2, NOMI_MEDIA_STOP = 5, NOMI_MEDIA_TOGGLE = 6 };  // media_control
@@ -240,6 +290,9 @@ NOMI_IMPORT(time_now) int64_t time_now(void);  // Unix 毫秒，没对上时间�
 NOMI_IMPORT(timer_start) void timer_start(int32_t id, int32_t ms, int32_t repeat);  // 最多 8 个
 NOMI_IMPORT(timer_stop) void timer_stop(int32_t id);
 NOMI_IMPORT(nomi_log) void nomi_log(const char *text);  // 打到串口日志
+// （api 4，权限 keep_awake）界面在前台时不让屏幕睡：1 开、0 关（导航、计时这类要一直看的）。
+// 应用退到后台、退出时系统自动放开；不需要了记得关，省电
+NOMI_IMPORT(screen_keep_on) int32_t screen_keep_on(int32_t on);
 
 /* ---------- 小工具（没有 C 库，自带几个常用的） ---------- */
 
