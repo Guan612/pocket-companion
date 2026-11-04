@@ -17,7 +17,7 @@
 #define NOMI_API 3  // 用到的最高版本写进 manifest 的 "api"。
 // 2：阅读器（ui_reader 等）、text_chapters、fs_find。
 // 3：图片（ui_photo 等）、写卡（fs_write 等，权限 sd.write）、打开文件（manifest 的 opens、NOMI_EV_OPEN）、
-//    选文件（ui_files）
+//    选文件（ui_files）、媒体库（library_list）
 
 #define NOMI_IMPORT(name) __attribute__((import_module("env"), import_name(#name)))
 #define NOMI_EXPORT(name) __attribute__((export_name(#name)))
@@ -146,6 +146,16 @@ NOMI_IMPORT(fs_remove) int32_t fs_remove(const char *path);  // （api 3）删�
 // （api 3）改名 / 挪地方：只能在同一处挪（都在 data:/、或者都在卡上），目标已经有了不覆盖
 NOMI_IMPORT(fs_rename) int32_t fs_rename(const char *from, const char *to);
 NOMI_IMPORT(fs_mkdir) int32_t fs_mkdir(const char *path);  // （api 3）一层层建，已经有了也算成功
+// （api 3）媒体库：系统把整张卡扫一遍，记下歌（mp3 flac wav aac m4a）、书（txt）、图片（jpg jpeg png），应用按类型查，
+// 不用自己整卡找。返回这一类一共几个；buf 里从第 first 个（从 0 起）开始一行一个「sd:/路径 TAB 大小」，放不下的
+// 不放（分几次取）。按文件夹排：一个文件夹里的挨在一起、按名字排。要 sd.read。
+// 第一次（开机后卡变了、系统改过卡上的东西）要扫一遍，几秒；之后直接给。在电脑上只改名、没增删文件的系统发现
+// 不了：kind 加上 NOMI_LIB_RESCAN 不管记着的、重扫一遍（给个「重新找」）
+#define NOMI_LIB_AUDIO 1
+#define NOMI_LIB_BOOK 2
+#define NOMI_LIB_IMAGE 3
+#define NOMI_LIB_RESCAN 0x100
+NOMI_IMPORT(library_list) int32_t library_list(int32_t kind, int32_t first, char *buf, int32_t size);
 NOMI_IMPORT(kv_get) int32_t kv_get(const char *key, char *buf, int32_t size);  // 没有返回 NOMI_E_NOT_FOUND
 NOMI_IMPORT(kv_set) int32_t kv_set(const char *key, const char *value);
 

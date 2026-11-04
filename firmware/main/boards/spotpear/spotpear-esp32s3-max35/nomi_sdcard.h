@@ -58,12 +58,18 @@ public:
     // FatFs 底层读写出错重试都失败时调（在 FatFs 的锁里，不能当场卸载）：下次 Release 时卸载
     void MarkBroken() { broken_ = true; }
 
+    // 卡可能被拔过的次数：挂不上、或者闲着时问了不应答就加一（拔下来可能在电脑上改过，媒体库要重扫）
+    uint32_t Epoch() const { return epoch_; }
+    // 挂着的卡的序列号（CID）：换了卡就不一样。没挂着为 0（调用方先 Use）
+    uint32_t Serial();
+
 private:
     std::mutex mutex_;
     sdmmc_card_t* card_ = nullptr;
     bool bus_ready_ = false;
     int users_ = 0;
     std::atomic<bool> broken_{false};
+    std::atomic<uint32_t> epoch_{0};
     State state_ = kUnknown;
     esp_timer_handle_t idle_timer_ = nullptr;
 

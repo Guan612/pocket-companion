@@ -148,6 +148,7 @@ bool NomiSdCard::MountLocked() {
     }
     if (err != ESP_OK) {
         state_ = err == ESP_FAIL ? kUnsupported : kNoCard;
+        epoch_++;
         ESP_LOGW(TAG, "Mount failed: %s (%s)", esp_err_to_name(err),
                  state_ == kUnsupported ? "card answered, not FAT" : "no card");
         ReleaseBusLocked();
@@ -188,6 +189,11 @@ void NomiSdCard::UnmountIfIdle() {
     if (users_ == 0) UnmountLocked();
 }
 
+uint32_t NomiSdCard::Serial() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return card_ ? static_cast<uint32_t>(card_->cid.serial) : 0;
+}
+
 bool NomiSdCard::Acquire() {
     std::lock_guard<std::mutex> lock(mutex_);
     if (idle_timer_) esp_timer_stop(idle_timer_);
@@ -195,6 +201,7 @@ bool NomiSdCard::Acquire() {
     if (card_ && users_ == 0 && (broken_ || sdmmc_get_status(card_) != ESP_OK)) {
         ESP_LOGI(TAG, "Card gone or broken, remounting");
         UnmountLocked();
+        epoch_++;
     }
     if (!MountLocked()) return false;
     users_++;
@@ -208,6 +215,7 @@ void NomiSdCard::Release() {
     if (broken_) {
         state_ = kNoCard;
         UnmountLocked();
+        epoch_++;
         return;
     }
     if (!idle_timer_) {

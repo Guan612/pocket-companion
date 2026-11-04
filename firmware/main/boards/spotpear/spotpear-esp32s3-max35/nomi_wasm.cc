@@ -4,6 +4,7 @@
 #include "nomi_book.h"
 #include "nomi_filelist.h"
 #include "nomi_files.h"
+#include "nomi_media.h"
 #include "nomi_flash_io.h"
 #include "nomi_music.h"
 #include "nomi_photo.h"
@@ -1266,6 +1267,27 @@ int32_t fs_mkdir(wasm_exec_env_t env, const char* path) {
     return ok ? 0 : E_FAIL;
 }
 
+/* ---------- 媒体库：卡上的歌、书、图片（系统扫一遍记着，应用按类型查） ---------- */
+
+constexpr int32_t LIB_RESCAN = 0x100;
+
+// kind 1 歌、2 书、3 图片（加 LIB_RESCAN 不用记着的、重扫一遍）。返回这一类一共几个；buf 里从第 first 个起
+// 一行一个「sd:/路径 TAB 大小」，放不下的不放。第一次（换了卡、卡上东西变了）要扫一遍整张卡，几秒
+int32_t library_list(wasm_exec_env_t env, int32_t kind, int32_t first, char* buf, uint32_t size) {
+    Proc* p = Ctx(env);
+    if (!p->pkg->Has("sd.read") && !p->pkg->Has("sd.write")) return E_DENIED;
+    if (size == 0) return E_FAIL;
+    NomiSdCard::Use sd;
+    if (!sd) return E_NO_SD;
+    std::string out;
+    int32_t n = NomiMedia::List(static_cast<NomiMedia::Kind>(kind & 0xff), std::max<int32_t>(first, 0),
+                                (kind & LIB_RESCAN) != 0, out, size);
+    if (n < 0) return E_FAIL;
+    memcpy(buf, out.data(), out.size());
+    buf[out.size()] = '\0';
+    return n;
+}
+
 /* ---------- 选文件：系统的文件列表控件（和「文件」应用同一个） ---------- */
 
 constexpr int32_t FILES_PICK_DIR = 1;
@@ -1636,6 +1658,7 @@ NativeSymbol kNatives[] = {
     {"fs_size", (void*)fs_size, "($)i", nullptr},
     {"fs_read", (void*)fs_read, "($i*~)i", nullptr},
     {"fs_find", (void*)fs_find, "($$i*~)i", nullptr},
+    {"library_list", (void*)library_list, "(ii*~)i", nullptr},
     {"fs_write", (void*)fs_write, "($*~i)i", nullptr},
     {"fs_remove", (void*)fs_remove, "($)i", nullptr},
     {"fs_rename", (void*)fs_rename, "($$)i", nullptr},
