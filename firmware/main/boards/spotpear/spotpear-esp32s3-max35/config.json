@@ -31,7 +31,8 @@
                 "CONFIG_LV_FS_STDIO_PATH=\"\"",
                 "CONFIG_LV_FS_STDIO_CACHE_SIZE=4096",
                 "CONFIG_JD_USE_ROM=n",
-                "CONFIG_JD_FASTDECODE_TABLE=y"
+                "CONFIG_JD_FASTDECODE_TABLE=y",
+                "CONFIG_CAMERA_PSRAM_DMA=y"
             ]
         }
     ]

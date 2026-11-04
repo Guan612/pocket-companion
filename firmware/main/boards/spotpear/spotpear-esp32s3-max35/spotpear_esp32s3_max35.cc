@@ -6,7 +6,7 @@
 #include "config.h"
 #include "mcp_server.h"
 #include "esp32_camera.h"
-#include "image_to_jpeg.h"
+#include "esp_jpeg_enc.h"
 #if CONFIG_DIRECT_API
 #include "direct_api_config_server.h"
 #include "direct_api_protocol.h"
@@ -276,17 +276,20 @@ private:
         config.fb_location = CAMERA_FB_IN_PSRAM;
         config.grab_mode = CAMERA_GRAB_LATEST;  // 总是拿到最新的画面
         camera_ = new Esp32Camera(config);
-        // esp_camera_init 一结束就开始连续采集：VGA RGB565 每秒十几帧，驱动的采集任务（优先级 23）
-        // 用 CPU 把每帧 600KB 拷进 PSRAM（板上不支持 PSRAM DMA）。一直这么跑，抢走大量 CPU 和 PSRAM 带宽：
+        // esp_camera_init 一结束就开始连续采集：VGA RGB565 每秒十几帧，每帧 600KB 写进 PSRAM。
+        // 原来驱动的采集任务（优先级 23）用 CPU 从内部内存的 DMA 缓冲往 PSRAM 拷，抢走大量 CPU 和 PSRAM 带宽：
         // 音频编码掉帧（Encode queue is full）、AFE 喂不进（Ringbuffer full）、界面滑动也跟着卡。
-        // 只有大模型要看一眼时才需要画面，平时停着
+        // 2026-11-04 起 DMA 直接写 PSRAM（CONFIG_CAMERA_PSRAM_DMA，省下内部内存里 30KB 的 DMA 缓冲），
+        // 但一直采集还是占 PSRAM 带宽。只有大模型要看一眼时才需要画面，平时停着
         if (esp_camera_sensor_get() != nullptr) {
             cam_stop();
             camera_ready_ = true;
         }
     }
 
-    // 拍一张 JPEG 给看图模型。摄像头输出 RGB565 是大端，编码器要小端，先换字节
+    // 拍一张 JPEG 给看图模型。整帧大小（VGA RGB565 600KB）的临时缓冲一块都不要：PSRAM 平时只剩 1MB 左右，
+    // 原来先拷一份换字节、image_to_jpeg 里又拷一份转格式，第二份就要不到了（拍照失败）。
+    // 现在直接在摄像头这一帧上原地换算成 YUYV（大小一样），交给 JPEG 编码器；额外只要放 JPEG 结果的那块
     std::string CaptureJpeg() {
         std::lock_guard<std::mutex> lock(camera_mutex_);
         if (!camera_ready_) return "";
@@ -299,30 +302,64 @@ private:
             fb = esp_camera_fb_get();
             if (fb == nullptr) break;
         }
-        if (fb == nullptr) {
-            cam_stop();
-            return "";
-        }
+        cam_stop();  // 拿到这一帧就停：编码时别再占着 CPU 和 PSRAM 带宽
+        if (fb == nullptr) return "";
         std::string out;
-        if (fb->format == PIXFORMAT_RGB565) {
-            size_t pixels = fb->width * fb->height;
-            auto* buf = static_cast<uint16_t*>(heap_caps_malloc(pixels * 2, MALLOC_CAP_SPIRAM));
-            if (buf != nullptr) {
-                auto* src = reinterpret_cast<const uint16_t*>(fb->buf);
-                for (size_t i = 0; i < pixels; i++) buf[i] = __builtin_bswap16(src[i]);
-                uint8_t* jpeg = nullptr;
-                size_t jpeg_len = 0;
-                if (image_to_jpeg(reinterpret_cast<uint8_t*>(buf), pixels * 2, fb->width, fb->height,
-                                  V4L2_PIX_FMT_RGB565, 80, &jpeg, &jpeg_len)) {
-                    out.assign(reinterpret_cast<char*>(jpeg), jpeg_len);
-                    free(jpeg);
-                }
-                heap_caps_free(buf);
-            }
+        if (fb->format != PIXFORMAT_RGB565 || fb->width % 2 != 0 || (reinterpret_cast<uintptr_t>(fb->buf) & 15) != 0) {
+            ESP_LOGW(TAG, "Camera frame not usable: format %d, %ux%u, buf %p", fb->format,
+                     static_cast<unsigned>(fb->width), static_cast<unsigned>(fb->height), fb->buf);
+        } else {
+            RgbToYuyvInPlace(fb->buf, fb->width * fb->height);
+            out = EncodeYuyv(fb->buf, fb->width, fb->height);
         }
         esp_camera_fb_return(fb);
-        cam_stop();
         return out;
+    }
+
+    // 摄像头的 RGB565 是大端：两个像素（4 字节）一组换成 Y0 Cb Y1 Cr（也是 4 字节）写回原处（BT.601 全范围）
+    static void RgbToYuyvInPlace(uint8_t* p, size_t pixels) {
+        auto clamp = [](int v) { return static_cast<uint8_t>(v < 0 ? 0 : v > 255 ? 255 : v); };
+        for (size_t i = 0; i + 1 < pixels; i += 2, p += 4) {
+            int r[2], g[2], b[2];
+            for (int k = 0; k < 2; k++) {
+                int v = (p[k * 2] << 8) | p[k * 2 + 1];
+                int r5 = v >> 11, g6 = (v >> 5) & 0x3f, b5 = v & 0x1f;
+                r[k] = (r5 << 3) | (r5 >> 2);
+                g[k] = (g6 << 2) | (g6 >> 4);
+                b[k] = (b5 << 3) | (b5 >> 2);
+            }
+            int rs = r[0] + r[1], gs = g[0] + g[1], bs = b[0] + b[1];  // 两个像素合用一份色度
+            p[0] = clamp((77 * r[0] + 150 * g[0] + 29 * b[0]) >> 8);
+            p[1] = clamp(((-43 * rs - 85 * gs + 128 * bs) >> 9) + 128);
+            p[2] = clamp((77 * r[1] + 150 * g[1] + 29 * b[1]) >> 8);
+            p[3] = clamp(((128 * rs - 107 * gs - 21 * bs) >> 9) + 128);
+        }
+    }
+
+    static std::string EncodeYuyv(const uint8_t* yuyv, int width, int height) {
+        jpeg_enc_config_t cfg = DEFAULT_JPEG_ENC_CONFIG();
+        cfg.width = width;
+        cfg.height = height;
+        cfg.src_type = JPEG_PIXEL_FORMAT_YCbYCr;
+        cfg.subsampling = JPEG_SUBSAMPLE_420;
+        cfg.quality = 80;
+        cfg.rotate = JPEG_ROTATE_0D;
+        cfg.task_enable = false;
+        jpeg_enc_handle_t enc = nullptr;
+        if (jpeg_enc_open(&cfg, &enc) != JPEG_ERR_OK) {
+            ESP_LOGW(TAG, "jpeg_enc_open failed");
+            return "";
+        }
+        constexpr int kCap = 256 * 1024;  // VGA、质量 80 一般几十 KB
+        auto* buf = static_cast<uint8_t*>(heap_caps_malloc(kCap, MALLOC_CAP_SPIRAM));
+        std::string jpeg;
+        int len = 0;
+        jpeg_error_t err = buf ? jpeg_enc_process(enc, yuyv, width * height * 2, buf, kCap, &len) : JPEG_ERR_NO_MEM;
+        if (err == JPEG_ERR_OK) jpeg.assign(reinterpret_cast<char*>(buf), len);
+        else ESP_LOGW(TAG, "JPEG encode failed: %d", static_cast<int>(err));
+        heap_caps_free(buf);
+        jpeg_enc_close(enc);
+        return jpeg;
     }
 
     // BOOT 键说话：默认按住说话（像对讲机），设置里可改成点一下开始、说完自动结束
