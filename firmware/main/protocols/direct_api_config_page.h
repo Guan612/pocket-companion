@@ -133,6 +133,13 @@ body.has-save{padding-bottom:88px}
   <div class="row"><span id="sdState" style="flex:1">检测中…</span><button id="sdRescan">重新检测</button></div>
   <p class="hint">要 FAT32 格式。64GB 以上的卡出厂多是 exFAT，先在电脑上格式化成 FAT32 再插。没有插卡检测，插拔后点「重新检测」。</p>
 </div>
+<div class="card">
+  <p class="hint">往卡上传文件，不用拔卡。书（.txt）放哪都行，小说应用会整张卡找；补字用的字体（.ttf）放 fonts。走的是 Wi-Fi，信号弱时很慢（10MB 要几分钟到十几分钟），传完之前别关这一页。同名的文件会被换掉。</p>
+  <label>放到卡上的哪个文件夹<input id="sdDir" value="小说" autocomplete="off" placeholder="空着就放卡的根上"></label>
+  <div class="row" id="sdDirs"><span class="hint">常用：</span><button class="mini" data-dir="小说">小说</button><button class="mini" data-dir="fonts">fonts（字体）</button><button class="mini" data-dir="">卡的根上</button></div>
+  <label>文件（可以一次选好几个）<input id="sdFiles" type="file" multiple></label>
+  <div class="row"><button id="sdUpload">上传</button><span id="sdMsg" class="hint"></span></div>
+</div>
 </div>
 
 <div id="appsCard" hidden>
@@ -511,6 +518,44 @@ async function loadSd() {
   else if (r.state === 'unsupported') { el.textContent = '卡的格式不支持，要格式化成 FAT32'; el.className = 'err'; }
   else { el.textContent = '没检测到卡（没插，或者没插到底）'; el.className = 'hint'; }
 }
+// 往卡上传文件：一个个传，请求体第一行是卡上的路径，后面是文件内容（用 XHR 才看得到上传进度）
+const sdMsg = (text, cls) => { $('#sdMsg').textContent = text; $('#sdMsg').className = 'hint ' + (cls || ''); };
+for (const b of document.querySelectorAll('#sdDirs button')) b.onclick = () => { $('#sdDir').value = b.dataset.dir; };
+function sdUploadOne(path, file, progress) {
+  return new Promise(resolve => {
+    const xhr = new XMLHttpRequest();
+    xhr.open('POST', '/sd/upload');
+    xhr.upload.onprogress = e => { if (e.lengthComputable) progress(e.loaded, e.total); };
+    xhr.onload = () => {
+      try { resolve(JSON.parse(xhr.responseText)); } catch (e) { resolve({ok: false, error: '设备回的不对（HTTP ' + xhr.status + '）'}); }
+    };
+    xhr.onerror = () => resolve({ok: false, error: '连接断了（设备重启了，或者 Wi-Fi 掉了）'});
+    xhr.send(new Blob([path + '\n', file]));
+  });
+}
+$('#sdUpload').onclick = async () => {
+  const files = [...$('#sdFiles').files];
+  if (!files.length) return sdMsg('先选文件', 'err');
+  const dir = $('#sdDir').value.trim().replace(/\\/g, '/').replace(/^\/+|\/+$/g, '');
+  if (/^nomi(\/|$)/i.test(dir)) return sdMsg('nomi 文件夹是系统自己用的，换一个', 'err');
+  $('#sdUpload').disabled = true;
+  let done = 0;
+  for (const f of files) {
+    const which = files.length > 1 ? `（第 ${done + 1} / ${files.length} 个）` : '';
+    const r = await sdUploadOne((dir ? dir + '/' : '') + f.name, f,
+      (a, b) => sdMsg(`${f.name}${which}：${Math.floor(a * 100 / b)}%，${kb(a)} / ${kb(b)}`));
+    if (!r.ok) {
+      sdMsg(`${f.name} 没传上：${r.error}` + (done ? `（前面 ${done} 个传好了）` : ''), 'err');
+      $('#sdUpload').disabled = false;
+      return;
+    }
+    done++;
+  }
+  sdMsg(`传好了 ${done} 个文件，在卡上的${dir ? ' ' + dir + '/' : '根上'}`, 'ok');
+  $('#sdFiles').value = '';
+  $('#sdUpload').disabled = false;
+  loadSd();
+};
 $('#sdRescan').onclick = async () => {
   $('#sdRescan').disabled = true;
   $('#sdState').textContent = '检测中…'; $('#sdState').className = '';

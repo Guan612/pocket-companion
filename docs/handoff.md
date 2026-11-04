@@ -116,7 +116,7 @@ python tools/app-sdk/wasm_info.py apps/music/build/app.wasm   # 看导入导出�
 - **应用**（`apps/novel`）：书架（`fs_find` 整张卡找大于 16KB 的 .txt，上次的记在 kv、打开先显示再后台重找）、看书（点中间或长按出快速跳转：`ui_slider` 拖进度、上一章 / 下一章、目录、翻页方式五选一（滑 + 点上下 / 滑 + 点左右 / 只滑 / 只点上下 / 只点左右）、回书架；左边缘右划回书架；第一次打开弹一句「点屏幕中间」的提示）、书签（每本书一个 kv，翻页后 10 秒内存）、目录（一批 40 章，上一批 / 下一批）、语音 `open` `next_chapter` `prev_chapter` `chapter`、当前页给大模型当上下文。
 - **字体文件**：卡上 `fonts/` 放静态 TrueType。用的 Noto Sans SC：Google Fonts 的是可变字体、默认字重 100（太细），用 fontTools 转成字重 400 的静态版、去掉排版表：`instancer.instantiateVariableFont(vf, {"wght": 400})`，再 subset 掉 GSUB/GPOS 等，10MB、3 万多字。
 - 电脑上测过 `nomi_book.cc`：繁体《西遊記》UTF-8 / GBK 两份，任意位置切开一页页往后读和整本一次读完全一致，两份都找到 100 回，章名判断（含「第三回合他赢了。」这种不算）都对。
-- **往卡上传文件**：`POST /sd/upload`，请求体第一行是卡上的路径（`fonts/x.ttf`），后面是文件内容；写到 `.part` 收完再改名，`nomi/` 下不让写。现在只有接口，网页上没做按钮，用 curl：`{ printf 'fonts/x.ttf\n'; cat x.ttf; } > body; curl --noproxy '*' --data-binary @body http://设备/sd/upload`（这台电脑有代理，要 `--noproxy`）。Wi-Fi 弱时很慢：10MB 字体传了 881 秒；收得快的时候 Wi-Fi 任务占满核 0，报过一次任务看门狗警告（没重启）。
+- **往卡上传文件**：`POST /sd/upload`，请求体第一行是卡上的路径（`fonts/x.ttf`），后面是文件内容；写到 `.part` 收完再改名，`nomi/` 下不让写。网页设置页「设备 → SD 卡」里能上传：填卡上的文件夹（有小说 / fonts / 根上三个快捷按钮），一次多选文件，一个个传、带进度，nomi 开头的文件夹网页上先拦下（浏览器实测过）。也能用 curl：`{ printf 'fonts/x.ttf\n'; cat x.ttf; } > body; curl --noproxy '*' --data-binary @body http://设备/sd/upload`（这台电脑有代理，要 `--noproxy`）。Wi-Fi 弱时很慢：10MB 字体传了 881 秒；收得快的时候 Wi-Fi 任务占满核 0，报过一次任务看门狗警告（没重启）。
 - 2026-11-04 上机：书架整张卡找书 59ms；补字字体加载 20ms，行高和系统字一样（31）；每页 7 行 × 416 像素；第一次扫《西遊記》100 回用了 5.1 秒（之后用卡上缓存）。主人看过、说行。GBK 那本、拖进度、点左右还没在日志里看到。
 - 上机验证：卡上放字体和书；书架找得到书；翻页（滑、点、长按菜单）；繁体字补得上、和系统字一样大、基线对齐；GBK 的书；往回翻；目录跳章；退出再进接着上次的页；语音「打开西游记」「下一章」「跳到第十回」；补字时翻页快不快（字形从卡上读）。
 
