@@ -38,7 +38,7 @@ assets/         应用自带的只读文件（可选），程序里用 pkg:/ 开
   "id": "nomi.novel",
   "name": "小说",
   "version": "1.0.0",
-  "api": 2,
+  "api": 3,
   "description": "看 SD 卡里的 TXT 小说，记住读到哪",
   "icon": {
     "lines": [[[17, 10], [4, 7], [4, 28], [17, 31], [17, 10]],
@@ -46,6 +46,7 @@ assets/         应用自带的只读文件（可选），程序里用 pkg:/ 开
     "circles": []
   },
   "permissions": ["sd.read", "assistant"],
+  "opens": ["txt"],
   "memory_kb": 512,
   "voice": [
     {"name": "next_chapter", "description": "翻到下一章"}
@@ -63,6 +64,7 @@ assets/         应用自带的只读文件（可选），程序里用 pkg:/ 开
 | `permissions` | 要用的权限，见第 6 节。装的时候列给用户看 |
 | `memory_kb` | 运行时最多用多少内存（放 PSRAM），默认 256，最大 1024 |
 | `tile` | `true`：这个应用占首页的收听卡片（现在只有这一个卡片位，给音乐应用用）。开机、装好后系统在后台把它跑起来，它在 `nomi_main` 里用 `ui_tile` 画卡片 |
+| `opens` | 能打开卡上哪些文件：小写扩展名、不带点，最多 16 个（要 `sd.read`）。「文件」里点了这种文件、网页文件管理里点了「设备上打开」时交给它（见第 5 节「打开文件、选文件、媒体库」） |
 | `voice` | 大模型能调的指令，最多 8 个。每个指令有 `name`（小写字母、数字、下划线）和 `description`（写给大模型看：什么时候用、`arg` 怎么填）。要 `assistant` 权限，见第 5 节 |
 
 ## 3. 生命周期
@@ -172,14 +174,19 @@ void canvas_image(int32_t id, const char *path, int32_t x, int32_t y);  // 贴�
 |---|---|---|---|
 | `data:/` | 应用自己的数据目录（和应用装在一起） | ✓ | ✓ |
 | `pkg:/` | 应用包里的 `assets/` | ✓ | ✗ |
-| `sd:/` | SD 卡（要 `sd.read` 权限） | ✓ | ✗ |
+| `sd:/` | SD 卡（读要 `sd.read`，写要 `sd.write`） | ✓ | ✓（api 3） |
+
+卡上系统自己的 `nomi/`（应用、缓存）读写都不行；`..`、反斜杠不行。规矩和网页文件管理是同一份（`nomi_files.cc`）。
 
 ```c
 int32_t fs_list(const char *dir, char *buf, int32_t size);   // 名字一行一个，目录后面带 '/'；返回字节数，出错 <0
 int32_t fs_size(const char *path);
 int32_t fs_read(const char *path, int32_t offset, void *buf, int32_t size);         // 一次最多 32KB
-int32_t fs_write(const char *path, int32_t offset, const void *buf, int32_t size);  // 只能写 data:/
-int32_t fs_remove(const char *path);                                                 // 只能删 data:/ 里的
+// 下面四个是 api 3。sd:/ 的要 sd.write；改了卡上的东西系统记一笔（媒体库下次重扫）
+int32_t fs_write(const char *path, const void *buf, int32_t size, int32_t append);  // append 0 从头写、1 接在后面；上一级没有就建
+int32_t fs_remove(const char *path);                  // 文件或整个文件夹
+int32_t fs_rename(const char *from, const char *to);  // 只能在同一处挪（都在 data:/ 或都在卡上），目标已有不覆盖
+int32_t fs_mkdir(const char *path);                   // 一层层建，已经有了也算成功
 
 // 小设置和进度：存成 data:/ 里的一个小文件（不占设备那 16KB 的 NVS）
 int32_t kv_get(const char *key, char *buf, int32_t size);
@@ -189,6 +196,14 @@ int32_t kv_set_int(const char *key, int32_t value);
 ```
 
 SD 卡由系统按需挂载（见 `nomi_sdcard.h`）：没插卡时 `sd:/` 的调用返回错误码 `NOMI_E_NO_SD`，应用要给出「没插 SD 卡」的提示。
+
+### 打开文件、选文件、媒体库（api 3）
+
+卡上的文件由系统统一管：设备上的系统应用「文件」、网页设置页的文件管理、应用的接口走同一套规矩。
+
+- **打开文件**：manifest 的 `opens` 声明能开哪些扩展名。在「文件」里点了文件（或网页上点「设备上打开」）时，系统找能开的应用：记住了默认的用默认的；只有一个就用它；好几个就弹出来选，能勾「以后 .xxx 都用它」（应用管理里能清掉，应用删了也清掉）。选中的应用界面挂上之后收到 `NOMI_EV_OPEN`（新起的进程先来 `NOMI_EV_SHOW`），用 `open_path(buf, size)` 取路径（`sd:/` 开头），直接显示这个文件。
+- **选文件**：`ui_files(dir, exts, flags)` 在当前页放一个系统的文件列表（和「文件」一个样子）：从 `dir` 往下一层层点，顶上有路径和「上一级」，只列 `exts` 里的扩展名（`"mp3,flac"`，空 = 都列）。点了文件来 `NOMI_EV_FILE`（value 0）；`flags` 有 `NOMI_FILES_PICK_DIR` 时每层多一行「选这个文件夹」（value 1）。`files_picked(buf, size)` 取路径。
+- **媒体库**：`library_list(kind, first, buf, size)`：系统把整张卡扫一遍，记下歌（`NOMI_LIB_AUDIO`：mp3 flac wav aac m4a）、书（`NOMI_LIB_BOOK`：txt）、图片（`NOMI_LIB_IMAGE`：jpg jpeg png）。返回这一类一共几个，`buf` 里从第 `first` 个起一行一个「`sd:/路径` TAB 大小」，按文件夹排。结果存在卡上 `nomi/cache/media/`：换了卡、剩余空间变了（关机期间在电脑上改过）、系统自己改过卡上的东西才重扫；kind 加 `NOMI_LIB_RESCAN` 强制重扫（给用户一个「重新找」）。应用别再自己整卡找（`fs_find` 留着兼容）。
 
 ### 播放（权限 `media`）
 
@@ -292,6 +307,7 @@ void    web_reply(const char *text);         // 回给网页
 | 权限 | 能做什么 |
 |---|---|
 | `sd.read` | 读 SD 卡上的文件（只读） |
+| `sd.write` | 读写 SD 卡上的文件（api 3；系统的 `nomi/` 碰不了） |
 | `media` | 让系统播放器放歌、控制播放 |
 | `assistant` | 给大模型加上下文、注册语音指令、让它念出来 |
 | `keep_awake` | 打开时不息屏 |
@@ -432,14 +448,15 @@ int32_t nomi_event(int32_t type, int32_t id, int32_t value)
 - 网页设置页的「应用」页：列表、上传安装、卸载。（v0.1 已有：设备 → 应用，还能「打开」）
 - ~~没插 SD 卡时，装在卡上的应用不出现在桌面上~~：已做（2026-11-04）。机器内部分区里记着卡上每个应用的 manifest（`/int/nomi/sdapps/<id>.json`），卡不在时照样登记、灰着；没有插卡检测脚，桌面翻到眼前（3 秒内最多一次、有卡上的应用才看）和点了灰着的应用时去挂一下卡看看。卡在但卡上没有它的也灰着（提示重新装）；卡不在时不让删卡上的应用（卡上的文件删不掉，下次插卡又冒出来）。
 
-## 13. 实现进度（v0.2）
+## 13. 实现进度（v0.3）
 
 | 部分 | 状态 |
 |---|---|
 | 运行时 | ✓ wasm-micro-runtime 2.4 解释执行（fast-interp），关了 AOT、WASI、pthread 库、它自带的应用框架；固件增加约 90KB |
 | 进程 | ✓ 每个应用一个进程、界面挂上 / 拿下、后台常驻（有卡片、在放歌）、闲置后结束、有事时在后台拉起；✗ 2 秒无响应自动关 |
 | 界面 | ✓ `ui_page` `ui_page_close` `ui_text` `ui_item` `ui_button` `ui_set_text` `ui_set_hidden` `ui_remove` `ui_toast` `ui_player` `ui_tile` `ui_target` `ui_open`、阅读器 `ui_reader` `reader_goto` `reader_set_flags` `reader_text`、拖条 `ui_slider` `ui_set_value`（api 2，label 里的 `{}` 换成当前值，松手发 `NOMI_EV_CHANGE`）；✗ 开关、进度条、图片、画布 |
-| 存储 | ✓ `fs_list` `fs_size` `fs_read` `kv_get` `kv_set`（`data/kv.json`）、`fs_find`（整张卡按扩展名找文件）、`text_chapters` `text_chapter_at`（章节，缓存在卡上 `nomi/cache/chapters/`）（api 2）；✗ `fs_write` `fs_remove` |
+| 存储 | ✓ `fs_list` `fs_size` `fs_read` `kv_get` `kv_set`（`data/kv.json`）、`fs_find`（整张卡按扩展名找文件）、`text_chapters` `text_chapter_at`（章节，缓存在卡上 `nomi/cache/chapters/`）（api 2）；`fs_write` `fs_remove` `fs_rename` `fs_mkdir`（`sd.write`）、`library_list`（媒体库）（api 3） |
+| 文件 | ✓（api 3）manifest `opens` + `NOMI_EV_OPEN` `open_path`（打开方式：记住默认、弹出来选、应用管理里清除）、`ui_files` `files_picked`（系统文件列表）；系统应用「文件」（浏览、点了交给应用、长按删除 / 打开方式 / 大小时间）；网页文件管理（浏览、新建文件夹、上传、改名、删除、下载、看大图、设备上打开） |
 | 播放 | ✓ `media_play`（本地 / 网上的歌 / 节目 / 直播，能指定从第几秒放；网上的先探格式）`media_meta` `media_control` `media_seek` `media_state` `media_position` `media_duration` `media_mine` `media_info`；放完、上一首、下一首、放都会通知应用 |
 | 联网 | ✓ `net_get` `net_get_until` |
 | 网页 | ✓ 应用自带设置页（`assets/web/`、`/app/<id>/`、`call` → `NOMI_EV_WEB`、`web_body` `web_reply`） |
