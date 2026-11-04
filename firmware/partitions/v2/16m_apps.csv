@@ -1,11 +1,13 @@
 # ESP-IDF Partition Table
 # 16m.csv 的基础上从资源分区（8MB，实际用 4MB 多）匀出 2MB 做应用分区：预装应用、装在机器里的应用和它们的数据
 # （FAT，挂在 /int）。nvs 的位置和大小不变，换分区表不丢设置。
+# 2026-11-04 开蓝牙（控制器代码放闪存）后程序槽不够：资源分区 6MB → 5MB，两个程序槽各 3.94MB → 4.44MB，
+# 还能 A/B 升级。应用分区、nvs 没动。
 # Name,   Type, SubType, Offset,  Size, Flags
 nvs,      data, nvs,     0x9000,    0x4000,
 otadata,  data, ota,     0xd000,    0x2000,
 phy_init, data, phy,     0xf000,    0x1000,
-ota_0,    app,  ota_0,   0x20000,   0x3f0000,
-ota_1,    app,  ota_1,   ,          0x3f0000,
-assets,   data, spiffs,  0x800000,  6M,
+ota_0,    app,  ota_0,   0x20000,   0x470000,
+ota_1,    app,  ota_1,   0x490000,  0x470000,
+assets,   data, spiffs,  0x900000,  5M,
 apps,     data, fat,     0xE00000,  2M,

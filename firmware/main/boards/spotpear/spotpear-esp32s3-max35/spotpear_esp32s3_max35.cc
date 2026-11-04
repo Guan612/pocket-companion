@@ -17,6 +17,7 @@
 #include "nomi_open.h"
 #include "nomi_files.h"
 #include "nomi_filesapp.h"
+#include "nomi_phone.h"
 #include "nomi_photo.h"
 #include "nomi_pkg.h"
 #include "nomi_radio.h"
@@ -557,6 +558,7 @@ public:
         }
         NomiOpen::Start();                 // 记住的「用什么打开」
         NomiPkg::GetInstance().Start();    // 预装应用、迁老数据、扫装好的应用包，登记到桌面
+        NomiPhone::Start();                // 蓝牙连手机（Gadgetbridge）
         GetBacklight()->RestoreBrightness();
     }
 
