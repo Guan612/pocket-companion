@@ -1,0 +1,13 @@
+{
+  "id": "nomi.map",
+  "name": "地图",
+  "version": "0.1.0",
+  "api": 4,
+  "description": "车头朝上的道路图（SD 卡上的离线地图，tools/map 用 OpenStreetMap 做），手机导航（Gadgetbridge + OsmAnd / CoMaps）的转向、距离、路名；步行、骑车、开车能切换",
+  "icon": {
+    "lines": [[[11, 16], [18, 32], [25, 16]]],
+    "circles": [[9, 3, 18], [15, 9, 6]]
+  },
+  "permissions": ["phone", "sd.read", "assistant", "keep_awake"],
+  "memory_kb": 192
+}
