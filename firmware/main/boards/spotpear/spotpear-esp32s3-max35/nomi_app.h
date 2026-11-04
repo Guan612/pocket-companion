@@ -50,7 +50,7 @@ struct nomi_app {
     // 可选：对话时告诉大模型用户在这个应用里看什么（比如小说的当前页）；没有返回 NULL
     const char *(*context)(const nomi_app_t *app);
     void *user;               // 应用自己的数据（应用包：它的安装信息）
-    bool dimmed;              // 桌面上灰着、点了只弹提示（比如装在 SD 卡上但卡没插）
+    bool dimmed;              // 桌面上灰着、点了只弹提示（比如装在 SD 卡上但卡没插）；改了要 nomi_apps_refresh
     const char *dimmed_hint;  // 灰着时点了弹什么
 };
 
@@ -86,6 +86,10 @@ typedef struct {
     bool (*can_uninstall)(const nomi_app_t *app);
     void (*uninstall)(const nomi_app_t *app);  // 已经确认过
     const char *(*summary)(void);              // 顶上那段说明：怎么装、存储用了多少
+    // 下面两个可以不给。桌面翻到眼前时（设备去看一眼 SD 卡还在不在，卡上的应用跟着灰掉 / 恢复）
+    void (*launcher_shown)(void);
+    // 点了灰着的应用，dimmed_hint 已经弹过了（设备再去看一眼卡，插回来了就恢复并打开它）
+    void (*dimmed_tap)(const nomi_app_t *app);
 } nomi_appmgr_hooks_t;
 void nomi_appmgr_set_hooks(const nomi_appmgr_hooks_t *hooks);
 

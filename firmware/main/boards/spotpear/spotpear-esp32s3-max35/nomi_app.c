@@ -213,6 +213,10 @@ static void appmgr_build(void)
         lv_obj_t *name = lv_label_create(row);
         lv_label_set_text(name, app->name);
         lv_obj_set_flex_grow(name, 1);
+        if (app->dimmed) {  // 和桌面上一样灰着
+            icon_set_color(icon, C_DIMMED);
+            lv_obj_set_style_text_color(name, lv_color_hex(C_DIMMED), 0);
+        }
         if (s_hooks.can_uninstall && s_hooks.can_uninstall(app)) {
             lv_obj_t *btn = lv_button_create(row);
             lv_obj_set_style_bg_color(btn, lv_color_hex(C_CONTROL), 0);
@@ -358,6 +362,7 @@ bool nomi_app_open(const char *id)
     if (app == s_app) return true;
     if (app->dimmed) {
         toast(app->dimmed_hint ? app->dimmed_hint : "现在打不开");
+        if (s_hooks.dimmed_tap) s_hooks.dimmed_tap(app);
         return false;
     }
     close_app(false);
@@ -451,9 +456,10 @@ static void add_cell(const nomi_app_t *app)
     lv_label_set_long_mode(name, LV_LABEL_LONG_MODE_DOTS);
     lv_obj_set_width(name, CELL_W - 8);
     lv_obj_set_style_text_align(name, LV_TEXT_ALIGN_CENTER, 0);
-    if (app->dimmed) {  // 比如装在 SD 卡上但卡没插：灰着
-        icon_set_color(icon, C_CONTROL);
-        lv_obj_set_style_text_color(name, lv_color_hex(C_MUTED), 0);
+    if (app->dimmed) {  // 比如装在 SD 卡上但卡没插：底块淡下去、图标和名字都灰掉，一眼看得出用不了
+        lv_obj_set_style_bg_opa(tile, LV_OPA_40, 0);
+        icon_set_color(icon, C_DIMMED);
+        lv_obj_set_style_text_color(name, lv_color_hex(C_DIMMED), 0);
     }
 }
 
@@ -527,7 +533,10 @@ static void build_launcher(lv_obj_t *tile)
     add_edge(tile, on_launcher_edge);
 }
 
-void nomi_launcher_shown(void) {}
+void nomi_launcher_shown(void)
+{
+    if (s_hooks.launcher_shown) s_hooks.launcher_shown();
+}
 
 void nomi_apps_set_font(const lv_font_t *font)
 {

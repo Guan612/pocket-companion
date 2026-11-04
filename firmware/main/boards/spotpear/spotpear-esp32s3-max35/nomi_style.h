@@ -5,6 +5,7 @@
 #define C_MUTED 0x8b90a0
 #define C_PANEL 0x1b1e26
 #define C_CONTROL 0x2c3040
+#define C_DIMMED 0x4a4f5e  // 用不了的东西（装在 SD 卡上、卡没插的应用）
 #define C_ACCENT 0x6aa6ff
 #define C_DANGER 0xff6b6b
 #define C_PAGE 0x111318

@@ -13,6 +13,7 @@
 #include <esp_vfs_fat.h>
 #include <esp_heap_caps.h>
 #include <esp_log.h>
+#include <esp_timer.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <sys/stat.h>
@@ -215,6 +216,13 @@ void FinishApp(NomiPackage& pkg) {
     pkg.app.close = NomiWasm::Close;
     pkg.app.back = NomiWasm::Back;
     pkg.app.user = &pkg;
+    pkg.app.dimmed = pkg.absent;
+    pkg.app.dimmed_hint = pkg.hint.c_str();
+}
+
+// 装在 SD 卡上、现在用不了的应用，点了弹什么
+std::string SdHint(const NomiPackage& pkg, bool card_present) {
+    return card_present ? "SD 卡上没有找到「" + pkg.name + "」，重新装一下" : "插上 SD 卡才能打开「" + pkg.name + "」";
 }
 
 std::string ReadSmallFile(const std::string& path, size_t max) {
@@ -274,8 +282,18 @@ bool CanUninstall(const nomi_app_t* app) {
 }
 
 void Uninstall(const nomi_app_t* app) {
-    std::string id = app->id;
-    NomiPkg::GetInstance().Remove(id);
+    const auto* pkg = static_cast<const NomiPackage*>(app->user);
+    // 灰着的（卡不在）直接说，别在界面任务里再去挂一次卡（没卡时挂载要等超时）
+    std::string problem = pkg->absent && !pkg->internal
+                              ? "SD 卡没插：「" + pkg->name + "」装在卡上，插上卡再删"
+                              : NomiPkg::GetInstance().Remove(app->id);
+    if (!problem.empty()) nomi_ui_notify(problem.c_str(), 3500);
+}
+
+void LauncherShown() { NomiPkg::GetInstance().CheckSd("", true); }
+
+void DimmedTap(const nomi_app_t* app) {
+    if (app->open == NomiWasm::Open) NomiPkg::GetInstance().CheckSd(app->id);
 }
 
 const char* Summary() {
@@ -320,7 +338,7 @@ const NomiPackage* NomiPkg::Register(std::unique_ptr<NomiPackage> pkg) {
         nomi_apps_add(&pkg->app);
         packages_.push_back(std::move(pkg));
     }
-    if (added->tile) NomiWasm::StartBackground(added);  // 首页卡片：开机、装好就画出来
+    if (added->tile && !added->absent) NomiWasm::StartBackground(added);  // 首页卡片：开机、装好就画出来
     return added;
 }
 
@@ -357,7 +375,8 @@ std::vector<std::unique_ptr<NomiPackage>> NomiPkg::CollectDir(const std::string&
     for (const auto& name : dirs) {
         std::string dir = base + "/" + name;
         auto pkg = std::make_unique<NomiPackage>();
-        std::string problem = ParseManifest(ReadSmallFile(dir + "/manifest.json", kMaxManifest), *pkg);
+        std::string text = ReadSmallFile(dir + "/manifest.json", kMaxManifest);
+        std::string problem = ParseManifest(text, *pkg);
         struct stat st;
         if (problem.empty() && stat((dir + "/app.wasm").c_str(), &st) != 0) problem = "没有 app.wasm";
         if (problem.empty() && pkg->id != name) problem = "目录名和 id 不一致";
@@ -367,6 +386,7 @@ std::vector<std::unique_ptr<NomiPackage>> NomiPkg::CollectDir(const std::string&
         }
         pkg->dir = dir;
         pkg->internal = internal;
+        if (!internal) pkg->manifest = std::move(text);
         for (const char* npk : kPreinstalled) {
             pkg->builtin |= internal && pkg->id + ".npk" == npk;
         }
@@ -378,18 +398,162 @@ std::vector<std::unique_ptr<NomiPackage>> NomiPkg::CollectDir(const std::string&
 
 void NomiPkg::Scan() {
     // 机器里的先登记：卡上有同一个的不再要
-    std::vector<std::unique_ptr<NomiPackage>> found;
-    if (internal_ok_) NomiFlashIo::Run([&] { found = CollectDir(kInternalAppsDir, true); });
+    std::vector<std::unique_ptr<NomiPackage>> found, cached;
+    if (internal_ok_) {
+        NomiFlashIo::Run([&] {
+            found = CollectDir(kInternalAppsDir, true);
+            cached = ReadSdCache();
+        });
+    }
     for (auto& p : found) Register(std::move(p));
-    NomiSdCard::Use sd;
-    if (!sd) {
-        ESP_LOGI(TAG, "No SD card: only apps in internal flash");
-        return;
+    bool present;
+    {
+        NomiSdCard::Use sd;
+        present = static_cast<bool>(sd);
+        std::vector<std::unique_ptr<NomiPackage>> on_card;
+        if (present) on_card = CollectDir(kAppsDir, false);
+        for (auto& p : on_card) {
+            if (Find(p->id)) {
+                ESP_LOGW(TAG, "Skip %s on SD card: already installed in internal flash", p->id.c_str());
+                continue;
+            }
+            CacheSd(*Register(std::move(p)));
+        }
     }
-    for (auto& p : CollectDir(kAppsDir, false)) {
-        if (Find(p->id)) ESP_LOGW(TAG, "Skip %s on SD card: already installed in internal flash", p->id.c_str());
-        else Register(std::move(p));
+    // 机器里记着、这次没登记上的卡上应用：灰着放在桌面上
+    int dimmed = 0;
+    for (auto& p : cached) {
+        if (const NomiPackage* have = Find(p->id)) {
+            if (have->internal) UncacheSd(p->id);  // 后来装进了机器里（预装）：卡上那份不算了
+            continue;
+        }
+        p->absent = true;
+        p->hint = SdHint(*p, present);
+        Register(std::move(p));
+        dimmed++;
     }
+    if (!present) ESP_LOGI(TAG, "No SD card: %d app(s) on the card shown dimmed", dimmed);
+    else if (dimmed) ESP_LOGW(TAG, "%d app(s) not found on this SD card, shown dimmed", dimmed);
+}
+
+void NomiPkg::CheckSd(const std::string& open_id, bool throttled) {
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (throttled) {
+            bool any = std::any_of(packages_.begin(), packages_.end(), [](const auto& p) { return !p->internal; });
+            if (!any || esp_timer_get_time() - last_sd_check_us_ < 3 * 1000000LL) return;
+        }
+        if (!open_id.empty()) sd_open_id_ = open_id;
+        if (sd_check_queued_) return;  // 排着的那次会顺便打开 sd_open_id_
+        sd_check_queued_ = true;
+    }
+    NomiWasm::RunInWorker([](void*) { NomiPkg::GetInstance().DoCheckSd(); }, nullptr);
+}
+
+void NomiPkg::DoCheckSd() {
+    std::string open_id;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        sd_check_queued_ = false;
+        open_id.swap(sd_open_id_);
+    }
+    std::vector<std::unique_ptr<NomiPackage>> on_card;
+    bool present;
+    {
+        NomiSdCard::Use sd;
+        present = static_cast<bool>(sd);
+        if (present) on_card = CollectDir(kAppsDir, false);
+    }
+    std::vector<const NomiPackage*> restored;
+    {
+        DisplayLockGuard ui(display());
+        std::lock_guard<std::mutex> lock(mutex_);
+        last_sd_check_us_ = esp_timer_get_time();
+        bool changed = false;
+        for (auto& p : packages_) {
+            if (p->internal) continue;
+            auto it = std::find_if(on_card.begin(), on_card.end(), [&](const auto& c) { return c->id == p->id; });
+            if (it != on_card.end() && (*it)->manifest == p->manifest) {  // 卡上的就是登记着的这个
+                if (p->absent) {
+                    p->absent = false;
+                    p->app.dimmed = false;
+                    restored.push_back(p.get());
+                    changed = true;
+                }
+                on_card.erase(it);
+            } else if (it == on_card.end()) {  // 卡不在，或者卡上没有它：灰掉
+                std::string hint = SdHint(*p, present);
+                if (!p->absent || p->hint != hint) {
+                    p->absent = true;
+                    p->hint = hint;
+                    p->app.dimmed = true;
+                    p->app.dimmed_hint = p->hint.c_str();
+                    changed = true;
+                }
+            }
+            // 卡上是别的版本：留在 on_card 里，下面重新登记换掉它
+        }
+        if (changed) nomi_apps_refresh();
+    }
+    // 卡上新装的、换了版本的：登记（同一个 id 的旧的会被换下来），机器里记一份
+    for (auto& p : on_card) {
+        const NomiPackage* have = Find(p->id);
+        if (have && have->internal) continue;  // 机器里装着同一个：用机器里的
+        ESP_LOGI(TAG, "Found %s %s on SD card", p->id.c_str(), p->version.c_str());
+        CacheSd(*Register(std::move(p)));
+    }
+    for (const NomiPackage* p : restored) {
+        ESP_LOGI(TAG, "SD card back: %s", p->id.c_str());
+        if (p->tile) NomiWasm::StartBackground(p);
+    }
+    if (!open_id.empty()) {
+        const NomiPackage* p = Find(open_id);
+        if (p && !p->absent) {
+            DisplayLockGuard ui(display());
+            nomi_app_open(open_id.c_str());
+        }
+    }
+}
+
+std::vector<std::unique_ptr<NomiPackage>> NomiPkg::ReadSdCache() {
+    std::vector<std::unique_ptr<NomiPackage>> out;
+    DIR* d = opendir(kSdCacheDir);
+    if (!d) return out;
+    std::vector<std::string> names;
+    while (dirent* e = readdir(d)) {
+        std::string n = e->d_name;
+        if (e->d_type != DT_DIR && n.size() > 5 && n.compare(n.size() - 5, 5, ".json") == 0) names.push_back(n);
+    }
+    closedir(d);
+    std::sort(names.begin(), names.end());
+    for (const auto& n : names) {
+        auto pkg = std::make_unique<NomiPackage>();
+        std::string text = ReadSmallFile(std::string(kSdCacheDir) + "/" + n, kMaxManifest);
+        if (!ParseManifest(text, *pkg).empty() || pkg->id + ".json" != n) continue;
+        pkg->dir = std::string(kAppsDir) + "/" + pkg->id;
+        pkg->manifest = std::move(text);
+        out.push_back(std::move(pkg));
+    }
+    return out;
+}
+
+void NomiPkg::CacheSd(const NomiPackage& pkg) {
+    if (!internal_ok_ || pkg.internal || pkg.manifest.empty()) return;
+    std::string path = std::string(kSdCacheDir) + "/" + pkg.id + ".json";
+    NomiFlashIo::Run([&] {
+        if (ReadSmallFile(path, kMaxManifest + 1) == pkg.manifest) return;
+        MakeDirs(kSdCacheDir);
+        if (FILE* f = fopen(path.c_str(), "wb")) {
+            fwrite(pkg.manifest.data(), 1, pkg.manifest.size(), f);
+            fclose(f);
+        }
+    });
+}
+
+void NomiPkg::UncacheSd(const std::string& id) {
+    if (!internal_ok_) return;
+    std::string path = std::string(kSdCacheDir) + "/" + id + ".json";
+    NomiFlashIo::Run([&] { unlink(path.c_str()); });
 }
 
 // 内部应用分区：闪存里 2MB 的 FAT（带磨损均衡），第一次用时格式化。缓冲走 PSRAM（大于 1KB 的分配默认放 PSRAM）
@@ -463,7 +627,7 @@ void NomiPkg::Preinstall() {
 void NomiPkg::Start() {
     {
         DisplayLockGuard ui(display());
-        static const nomi_appmgr_hooks_t hooks = {CanUninstall, Uninstall, Summary};
+        static const nomi_appmgr_hooks_t hooks = {CanUninstall, Uninstall, Summary, LauncherShown, DimmedTap};
         nomi_appmgr_set_hooks(&hooks);
     }
     NomiFlashIo::Start();
@@ -558,6 +722,7 @@ std::string NomiPkg::Install(const std::string& forced_base, size_t length,
             }
             problem = ParseManifest(text, *pkg);
             if (!problem.empty()) break;
+            pkg->manifest = text;
             base = forced_base;
             if (base.empty()) {
                 const NomiPackage* old = Find(pkg->id);
@@ -627,6 +792,7 @@ std::string NomiPkg::Install(const std::string& forced_base, size_t length,
     if (rename(tmp_dir.c_str(), dir.c_str()) != 0) return fail("装不上：改目录名失败");
     pkg->dir = dir;
     pkg->internal = base == kInternalAppsDir;
+    if (pkg->internal) pkg->manifest.clear();  // 只有卡上的要在机器里记一份
     for (const char* npk : kPreinstalled) {
         pkg->builtin |= pkg->internal && pkg->id + ".npk" == npk;
     }
@@ -635,7 +801,7 @@ std::string NomiPkg::Install(const std::string& forced_base, size_t length,
              pkg->internal ? "internal" : "sd");
     bool internal = pkg->internal;
     if (web) {
-        Register(std::move(pkg));
+        CacheSd(*Register(std::move(pkg)));
         DisplayLockGuard ui(display());
         std::string msg = (updated ? "已更新「" : "已安装「") + name + "」，在桌面上";
         nomi_ui_notify(msg.c_str(), 3000);
@@ -700,31 +866,40 @@ std::string NomiPkg::ListJson() {
     return result;
 }
 
-bool NomiPkg::Remove(const std::string& id) {
+std::string NomiPkg::Remove(const std::string& id) {
+    const NomiPackage* pkg = Find(id);
+    if (!pkg) return "没有装这个应用";
+    if (pkg->builtin) return "预装应用不能删";
+    // 装在卡上的：卡不在就删不掉卡上的文件，下次插卡又冒出来，所以先不删
+    std::unique_ptr<NomiSdCard::Use> sd;
+    if (!pkg->internal) {
+        sd = std::make_unique<NomiSdCard::Use>();
+        if (!*sd) return "SD 卡没插：「" + pkg->name + "」装在卡上，插上卡再删";
+    }
     std::unique_ptr<NomiPackage> victim;
     {
         DisplayLockGuard ui(display());
         std::lock_guard<std::mutex> lock(mutex_);
         for (auto it = packages_.begin(); it != packages_.end(); ++it) {
-            if ((*it)->id != id || (*it)->builtin) continue;  // 预装的不能删
+            if ((*it)->id != id || (*it)->builtin) continue;
             nomi_apps_remove(&(*it)->app);  // 开着的话先关掉
             victim = std::move(*it);
             packages_.erase(it);
             break;
         }
     }
-    if (!victim) return false;
+    if (!victim) return "没有装这个应用";
     NomiWasm::Kill(id);
     if (victim->internal) {
         NomiFlashIo::Run([&] { RemoveTree(victim->dir); });
     } else {
-        NomiSdCard::Use sd;
-        if (sd) RemoveTree(victim->dir);
+        RemoveTree(victim->dir);
+        UncacheSd(id);
     }
     ESP_LOGI(TAG, "Removed %s", id.c_str());
     std::lock_guard<std::mutex> lock(mutex_);
     retired_.push_back(std::move(victim));
-    return true;
+    return "";
 }
 
 std::string NomiPkg::OpenJson(const std::string& body) {
@@ -777,8 +952,7 @@ std::string NomiPkg::RemoveJson(const std::string& body) {
     cJSON* id = cJSON_GetObjectItem(root, "id");
     std::string s = cJSON_IsString(id) ? id->valuestring : "";
     cJSON_Delete(root);
-    const NomiPackage* pkg = Find(s);
-    if (pkg && pkg->builtin) return Error("预装应用不能删");
-    if (!Remove(s)) return Error("没有装这个应用");
+    std::string problem = Remove(s);
+    if (!problem.empty()) return Error(problem);
     return "{\"ok\":true}";
 }

@@ -1085,7 +1085,10 @@ void RunProc(Proc* p) {
     std::unique_ptr<NomiSdCard::Use> sd;
     if (!pkg->internal) {
         sd = std::make_unique<NomiSdCard::Use>();
-        if (!*sd) return Fail(p, "SD 卡没插，打不开「" + pkg->name + "」");
+        if (!*sd) {
+            NomiPkg::GetInstance().CheckSd();  // 卡不在了：桌面上把卡上的应用灰掉
+            return Fail(p, "插上 SD 卡才能打开「" + pkg->name + "」");
+        }
     }
 
     std::string path = pkg->dir + "/app.wasm";
