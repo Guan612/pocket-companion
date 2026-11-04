@@ -106,6 +106,20 @@ python tools/app-sdk/wasm_info.py apps/music/build/app.wasm   # 看导入导出�
 - 桌面、应用查过没有同类死锁：返回走全高左边缘（`nomi_app.c` 的 `add_edge`），浮层只盖底部 120px，上段照常能划。
 - 上机验证：开着设置页说话、说话中退出设置、对话中下拉进设置再退出、翻到收听页/时钟页再说话，都不卡；说话中点 × 立刻闭嘴（一问一答回待机、连续对话回听）；× 收起后本轮不再升、下一轮对话照常升；浮层收起后设置页恢复锁住；半透明下对话文字读得清、下面内容隐约可见。
 
+## 小说应用 v0.2（2026-11-04，上机打开过，细节待验证）
+
+分层照旧：系统给能力，应用管业务。
+
+- **系统**（板子目录）：`nomi_book.cc`（认 UTF-8 / GBK、按文件位置读一段转 UTF-8、找章节，不依赖设备，电脑上 zig c++ 能编）、`nomi_reader.cc`（阅读器控件：LVGL 断行排版、分页、往回翻、手势）、`nomi_font.cc`（看书的字：系统字 + 卡上 `fonts/*.ttf` 补字，tiny_ttf）。`nomi_wasm.cc` 加了 `ui_reader` `reader_goto` `reader_set_flags` `reader_text` `text_chapters` `text_chapter_at` `fs_find`，接口版本升到 2（`nomi_pkg.cc` 的 `kApi`、`nomi_sdk.h` 的 `NOMI_API`、`build.py` 的 `API`）。
+- **配置**：板子 `config.json` 开了 `LV_USE_TINY_TTF`（带文件读）和 LVGL 的 stdio 文件驱动（盘符 `S`，`S:/sd/...`），改了要用 `scripts/build.py` 重新生成 sdkconfig。SD 卡同时开的文件数 4 → 6。固件剩 6%。
+- **资源分区**：`preinstall/gbk.tab`（GBK 对照表 48KB，`tools/gen_gbk_table.py` 生成）、`preinstall/nomi.novel.npk`（改了应用要重打）。桌面上原来的「小说」占位应用删了。
+- **应用**（`apps/novel`）：书架（`fs_find` 整张卡找大于 16KB 的 .txt，上次的记在 kv、打开先显示再后台重找）、看书（点中间或长按出快速跳转：`ui_slider` 拖进度、上一章 / 下一章、目录、翻页方式五选一（滑 + 点上下 / 滑 + 点左右 / 只滑 / 只点上下 / 只点左右）、回书架；左边缘右划回书架；第一次打开弹一句「点屏幕中间」的提示）、书签（每本书一个 kv，翻页后 10 秒内存）、目录（一批 40 章，上一批 / 下一批）、语音 `open` `next_chapter` `prev_chapter` `chapter`、当前页给大模型当上下文。
+- **字体文件**：卡上 `fonts/` 放静态 TrueType。用的 Noto Sans SC：Google Fonts 的是可变字体、默认字重 100（太细），用 fontTools 转成字重 400 的静态版、去掉排版表：`instancer.instantiateVariableFont(vf, {"wght": 400})`，再 subset 掉 GSUB/GPOS 等，10MB、3 万多字。
+- 电脑上测过 `nomi_book.cc`：繁体《西遊記》UTF-8 / GBK 两份，任意位置切开一页页往后读和整本一次读完全一致，两份都找到 100 回，章名判断（含「第三回合他赢了。」这种不算）都对。
+- **往卡上传文件**：`POST /sd/upload`，请求体第一行是卡上的路径（`fonts/x.ttf`），后面是文件内容；写到 `.part` 收完再改名，`nomi/` 下不让写。现在只有接口，网页上没做按钮，用 curl：`{ printf 'fonts/x.ttf\n'; cat x.ttf; } > body; curl --noproxy '*' --data-binary @body http://设备/sd/upload`（这台电脑有代理，要 `--noproxy`）。Wi-Fi 弱时很慢：10MB 字体传了 881 秒；收得快的时候 Wi-Fi 任务占满核 0，报过一次任务看门狗警告（没重启）。
+- 2026-11-04 上机：书架整张卡找书 59ms；补字字体加载 20ms，行高和系统字一样（31）；每页 7 行 × 416 像素；第一次扫《西遊記》100 回用了 5.1 秒（之后用卡上缓存）。主人看过、说行。GBK 那本、拖进度、点左右还没在日志里看到。
+- 上机验证：卡上放字体和书；书架找得到书；翻页（滑、点、长按菜单）；繁体字补得上、和系统字一样大、基线对齐；GBK 的书；往回翻；目录跳章；退出再进接着上次的页；语音「打开西游记」「下一章」「跳到第十回」；补字时翻页快不快（字形从卡上读）。
+
 ## 已修：m4a 目录按需读（2026-11-04，电脑上测过，待上机验证）
 
 - **原来**：m4a 节目要把整个 moov 读进 PSRAM 一整块，1 个半小时的节目约 1MB，更长的、或者 PSRAM 碎了就放不了。

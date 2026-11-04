@@ -38,7 +38,7 @@ assets/         应用自带的只读文件（可选），程序里用 pkg:/ 开
   "id": "nomi.novel",
   "name": "小说",
   "version": "1.0.0",
-  "api": 1,
+  "api": 2,
   "description": "看 SD 卡里的 TXT 小说，记住读到哪",
   "icon": {
     "lines": [[[17, 10], [4, 7], [4, 28], [17, 31], [17, 10]],
@@ -96,7 +96,7 @@ int32_t nomi_event(int32_t type, int32_t id, int32_t value);   // 其他所有�
 | `NOMI_EV_CLOSE` | 进程要结束了：退出后没理由留着、在后台闲太久、装了新版本、被删 | — 。趁这时候把进度存好，界面已经没了 |
 | `NOMI_EV_TIMER` | 定时器到点 | 定时器 id |
 | `NOMI_EV_VOICE` | 大模型调了 manifest 里的语音指令 | 第几个指令（从 1 起）/ 0。用 `voice_arg` 取参数，用 `voice_reply` 回话 |
-| `NOMI_EV_READER` | 阅读器翻页 | 阅读器 id / 当前读到的字节位置 |
+| `NOMI_EV_READER` | 阅读器：翻到新的一页、长按、在最后一页还往后翻 | 阅读器 id / 这页开头的字节位置（≥ 0，就是书签），或 `NOMI_READER_MENU`（长按）、`NOMI_READER_END` |
 | `NOMI_EV_MEDIA` | 你放的歌放完了，或主人在系统的播放控件上点了上一首 / 下一首 / 放 | 0 / `NOMI_MEDIA_FINISHED`、`NEXT`、`PREV`、`PLAY`，见第 5 节 |
 | `NOMI_EV_SHOW` / `NOMI_EV_HIDE` | 界面挂上 / 拿下 | — |
 
@@ -122,7 +122,7 @@ int32_t ui_switch(const char *label, int32_t on);
 int32_t ui_slider(const char *label, int32_t min, int32_t max, int32_t value);
 int32_t ui_progress(int32_t value, int32_t max);
 int32_t ui_image(const char *path, int32_t w, int32_t h);  // 系统解码 JPEG / PNG，按大小缩放
-int32_t ui_reader(const char *path, int32_t offset);       // 阅读器：系统排版、分页，上下翻页
+int32_t ui_reader(const char *path, int32_t offset, int32_t flags);  // 阅读器（api 2）：系统排版、分页、翻页
 int32_t ui_canvas(int32_t w, int32_t h);                   // 自己画（地图之类），见下
 
 void ui_set_text(int32_t id, const char *text);
@@ -142,7 +142,14 @@ void    ui_open(void);           // 打开自己的界面（卡片上点了"打�
   - 没装这样的应用、或者它的进程结束了，卡片位置显示系统自己的收听页。
 
 - 控件按建的先后从上往下排，超出一屏自动可以上下滚。
-- **阅读器**（`ui_reader`）是给小说准备的：一大段文字的排版、分页、翻页都由系统做（原生代码，快）。应用只给文件和起始位置，翻页时收到 `NOMI_EV_READER` 和当前位置，存下来就是书签。
+- **阅读器**（`ui_reader`，api 2）是给小说准备的：一大段文字的排版、分页、翻页都由系统做（原生代码，快）。应用只给文件和起始位置，翻页时收到 `NOMI_EV_READER` 和当前位置，存下来就是书签。
+  - 占满当前页（这页别放别的控件，标题给空字符串）；`ui_set_text(阅读器, 字)` 改左下角那行（比如章名），右下角百分比系统自己写。
+  - 认编码：UTF-8（有没有 BOM 都行）、GBK（对照表在资源分区 `gbk.tab`，`tools/gen_gbk_table.py` 生成）。空行去掉、段首缩进两格（章名不缩进）。
+  - 字：系统字为主，系统字里没有的字用 SD 卡 `fonts/` 里第一个 `.ttf` 补（要静态的 TrueType；可变字体、`.otf` 画不对）。卡上放 Noto Sans SC 的 TrueType 版，补出来的和系统字看不出区别。
+  - `flags`：`NOMI_READER_SWIPE` 上滑下一页、下滑上一页；`NOMI_READER_TAP` 点上三分之一上一页、下三分之一下一页；`NOMI_READER_TAP_LR` 换成点左三分之一上一页、右三分之一下一页。不管哪种，点中间那三分之一、长按都发 `NOMI_READER_MENU`（应用弹自己的菜单，比如快速跳转）。
+  - `reader_goto` 给的位置对齐到那一段的开头（拖进度条、跳章不会从半句话开始）；`ui_reader` 的 offset 是书签，原样用。
+  - 往回翻：刚往后翻过的原样退回去；从书签、目录跳进来的，就从前面的段落开头排到这页开头，取最后一整页。
+  - 还有 `reader_goto`（跳到某个位置）、`reader_set_flags`（换翻页方式）、`reader_text`（这一页的字，给大模型当上下文）、`text_chapters` / `text_chapter_at`（章节，见第 5 节）。
 - **画布**（`ui_canvas`）给地图这种要自己画的：
 
 ```c
@@ -420,7 +427,7 @@ int32_t nomi_event(int32_t type, int32_t id, int32_t value)
 - 运行时占多少固件空间：固件现在还剩 9%，不够的话就把两个 OTA 程序槽合成一个。
 - 机器内部应用区的大小和文件系统（LittleFS 还是 FAT），以及资源分区能不能安全缩小。
 - 解释执行的速度够不够：主要看列表很长时的滚动、阅读器翻页。不够的话试 fast-interp 或 AOT。
-- 小说要完整的中文字体：系统字体只是常用字子集，生僻字会缺，打算从 SD 卡加载完整字体文件。
+- ~~小说要完整的中文字体~~：已做（2026-11-04）。系统字为主，缺的字用 SD 卡 `fonts/` 里的 `.ttf` 补（LVGL tiny_ttf，按需从卡上读字形，缓存 256 个）。系统字（资源分区的 Noto Sans SC 20 像素子集）只有 5258 个汉字，GB2312 的 6763 个里缺 2501 个，繁体缺得更多。
 - 应用包要不要签名：现在默认信任用户自己装的包。
 - 网页设置页的「应用」页：列表、上传安装、卸载。（v0.1 已有：设备 → 应用，还能「打开」）
 - ~~没插 SD 卡时，装在卡上的应用不出现在桌面上~~：已做（2026-11-04）。机器内部分区里记着卡上每个应用的 manifest（`/int/nomi/sdapps/<id>.json`），卡不在时照样登记、灰着；没有插卡检测脚，桌面翻到眼前（3 秒内最多一次、有卡上的应用才看）和点了灰着的应用时去挂一下卡看看。卡在但卡上没有它的也灰着（提示重新装）；卡不在时不让删卡上的应用（卡上的文件删不掉，下次插卡又冒出来）。
@@ -431,8 +438,8 @@ int32_t nomi_event(int32_t type, int32_t id, int32_t value)
 |---|---|
 | 运行时 | ✓ wasm-micro-runtime 2.4 解释执行（fast-interp），关了 AOT、WASI、pthread 库、它自带的应用框架；固件增加约 90KB |
 | 进程 | ✓ 每个应用一个进程、界面挂上 / 拿下、后台常驻（有卡片、在放歌）、闲置后结束、有事时在后台拉起；✗ 2 秒无响应自动关 |
-| 界面 | ✓ `ui_page` `ui_page_close` `ui_text` `ui_item` `ui_button` `ui_set_text` `ui_set_hidden` `ui_remove` `ui_toast` `ui_player` `ui_tile` `ui_target` `ui_open`；✗ 开关、滑杆、进度条、图片、阅读器、画布 |
-| 存储 | ✓ `fs_list` `fs_size` `fs_read` `kv_get` `kv_set`（`data/kv.json`）；✗ `fs_write` `fs_remove` |
+| 界面 | ✓ `ui_page` `ui_page_close` `ui_text` `ui_item` `ui_button` `ui_set_text` `ui_set_hidden` `ui_remove` `ui_toast` `ui_player` `ui_tile` `ui_target` `ui_open`、阅读器 `ui_reader` `reader_goto` `reader_set_flags` `reader_text`、拖条 `ui_slider` `ui_set_value`（api 2，label 里的 `{}` 换成当前值，松手发 `NOMI_EV_CHANGE`）；✗ 开关、进度条、图片、画布 |
+| 存储 | ✓ `fs_list` `fs_size` `fs_read` `kv_get` `kv_set`（`data/kv.json`）、`fs_find`（整张卡按扩展名找文件）、`text_chapters` `text_chapter_at`（章节，缓存在卡上 `nomi/cache/chapters/`）（api 2）；✗ `fs_write` `fs_remove` |
 | 播放 | ✓ `media_play`（本地 / 网上的歌 / 节目 / 直播，能指定从第几秒放；网上的先探格式）`media_meta` `media_control` `media_seek` `media_state` `media_position` `media_duration` `media_mine` `media_info`；放完、上一首、下一首、放都会通知应用 |
 | 联网 | ✓ `net_get` `net_get_until` |
 | 网页 | ✓ 应用自带设置页（`assets/web/`、`/app/<id>/`、`call` → `NOMI_EV_WEB`、`web_body` `web_reply`） |
@@ -442,7 +449,7 @@ int32_t nomi_event(int32_t type, int32_t id, int32_t value)
 | 安装 | ✓ 网页上传 `.npk`、开机扫描、更新保留数据、应用管理和网页删除、机器内部的应用分区、预装应用（开机装、从 SD 卡搬数据）；✗ 自己选装在哪、挪位置、预装应用删了能恢复、从 SD 卡上的安装包装、权限确认界面 |
 | 工具 | ✓ `tools/app-sdk/`：`nomi_sdk.h`、`nomi_text.h`、`build.py`（编译 + 打包，去掉调试信息）、`wasm_info.py`（看导入导出）、`examples/counter` |
 
-| 自带应用 | ✓ `apps/music` v0.4：本地（按文件夹排队列、三种播放模式）、电台（台单在 kv 里、自带网页上增删排序、radio-browser 搜台）、播客（订阅、最新 10 期、每个播客记听到哪）、在线点歌（搜、歌词、封面）、首页卡片、自带网页（台单、订阅、音乐网站）、`play` `skip` `mode` `podcast` `subscribe` `online` `radio` 七个指令。固件里的台单 / 播客 / 在线业务已删（2026-11-03 第 ④ 步），老固件留在 NVS 里的数据不迁移（要腾地方用 `tools/erase_legacy_nvs.py` 清一次） |
+| 自带应用 | ✓ `apps/music` v0.4：本地（按文件夹排队列、三种播放模式）、电台（台单在 kv 里、自带网页上增删排序、radio-browser 搜台）、播客（订阅、最新 10 期、每个播客记听到哪）、在线点歌（搜、歌词、封面）、首页卡片、自带网页（台单、订阅、音乐网站）、`play` `skip` `mode` `podcast` `subscribe` `online` `radio` 七个指令。固件里的台单 / 播客 / 在线业务已删（2026-11-03 第 ④ 步），老固件留在 NVS 里的数据不迁移（要腾地方用 `tools/erase_legacy_nvs.py` 清一次）；`apps/novel` v0.2（预装）：整张卡找 .txt 的书架（最近看的在前、读到百分之几）、阅读器、书签、目录（一批 40 章）、点中间出快速跳转（拖进度、上一章 / 下一章、目录、翻页方式五选一、回书架）、`open` `next_chapter` `prev_chapter` `chapter` 四个指令、当前页给大模型当上下文 |
 
 源码和安装包放在哪：
 
