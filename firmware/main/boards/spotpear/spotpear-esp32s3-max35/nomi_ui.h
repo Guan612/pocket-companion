@@ -37,7 +37,7 @@ typedef enum {
 #define NOMI_KEY_VOICE "voice"            // voices 列表里的下标，-1 为自定义
 #define NOMI_KEY_DIM "dim"                // NOMI_DIM_SECONDS 的下标
 #define NOMI_KEY_OFF "off"                // NOMI_OFF_SECONDS 的下标
-#define NOMI_KEY_SLEEP_SHOW "sleep_show"  // 睡着时显示：0 时钟页，1 表情（还没对上时间时总是表情）
+#define NOMI_KEY_SLEEP_SHOW "sleep_show"  // 睡着时显示：0 时钟页，1 表情（还没对上时间时总是表情），2 相册（电子相框）
 #define NOMI_KEY_ONE_SHOT "one_shot"      // 一问一答：1 = 回答完一句就回待机，0 = 连续对话（默认）
 
 // 多久后调暗 / 息屏，-1 表示从不；设置页的选项和这里一一对应
@@ -76,6 +76,9 @@ typedef struct {
     // 可选：图片（RGB565，size 见方），"pod_cover" 是正在放的播客的封面，"music_cover" 是正在放的歌的专辑封面；
     // 没有返回 NULL。缓冲要一直有效（换图时换一块新的、version 加一）
     const uint16_t *(*get_image)(const char *key, int *size, int *version);
+    // 可选：电子相框。睡着时选了「相册」：on 为 true 时盖上相框轮播（没设相册、放不出来返回 false，就照旧显示时钟），
+    // 醒来时 on 为 false 撤掉。在显示锁里调
+    bool (*frame)(bool on);
 } nomi_ui_callbacks_t;
 
 // face_buf：480×320 RGB565 画布缓冲，由调用方分配；font：中文字体

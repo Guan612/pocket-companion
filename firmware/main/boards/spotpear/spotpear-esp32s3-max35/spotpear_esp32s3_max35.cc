@@ -14,6 +14,7 @@
 #include "nomi_clock.h"
 #include "nomi_display.h"
 #include "nomi_music.h"
+#include "nomi_photo.h"
 #include "nomi_pkg.h"
 #include "nomi_radio.h"
 #include "nomi_sdcard.h"
@@ -222,7 +223,8 @@ private:
         const esp_timer_create_args_t dim_args = {
             .callback = [](void* arg) {
                 auto* self = static_cast<SpotpearMax35Board*>(arg);
-                if (self->sleeping_) self->GetBacklight()->SetBrightness(DIM_BRIGHTNESS);
+                // 电子相框在放就不调暗（当相框用就是要亮着看），到息屏时间照样关
+                if (self->sleeping_ && !NomiPhoto::FrameActive()) self->GetBacklight()->SetBrightness(DIM_BRIGHTNESS);
             },
             .arg = this,
             .dispatch_method = ESP_TIMER_TASK,
@@ -443,6 +445,11 @@ private:
         // 网页设置页的「SD 卡」卡片：每次读都当场检测
         DirectApiConfigServer::AddJsonHandler("/sd.json", false,
                                               [](const std::string&) { return NomiSdCard::GetInstance().StatusJson(); });
+        // 卡上的图片当场解成 BMP（网页预览用）：/sd/preview/<宽>x<高>/<路径>
+        DirectApiConfigServer::AddPrefixHandler(
+            "/sd/preview/", [](const std::string& uri, bool, const std::string&, std::string& type, std::string& out) {
+                return NomiPhoto::PreviewBmp(uri, type, out);
+            });
         // 往卡上传文件（字体、书）：请求体第一行是卡上的路径
         DirectApiConfigServer::AddUploadHandler(
             "/sd/upload", [](size_t length, const std::function<int(char*, size_t)>& read) {
@@ -492,6 +499,7 @@ public:
         NomiRadio::GetInstance().Start();  // 收流 / 解码任务（平时睡着）；放什么由应用决定
         NomiMusic::GetInstance().Start();  // 下封面的后台任务
         NomiWasm::Init(display_);          // 应用包的运行时（docs/app-sdk.md）
+        NomiPhoto::Start(display_);        // 后台解图（缩略图、看图、电子相框）
         NomiPkg::GetInstance().Start();    // 预装应用、迁老数据、扫装好的应用包，登记到桌面
         GetBacklight()->RestoreBrightness();
     }

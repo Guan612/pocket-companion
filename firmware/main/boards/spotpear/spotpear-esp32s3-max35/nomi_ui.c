@@ -577,15 +577,18 @@ void nomi_ui_set_battery(int level, bool charging)
 void nomi_ui_set_sleep(bool sleeping)
 {
     s_sleeping = sleeping;
+    if (!sleeping && s_cb.frame) s_cb.frame(false);  // 醒了：撤掉相框
     face_set_sleep(sleeping);
     nomi_apps_set_hidden(sleeping);
     if (sleeping) {
         lv_obj_add_flag(s_subtitle, LV_OBJ_FLAG_HIDDEN);
         show_main(false);
         s_page_before_sleep = current_page();
-        bool clock = get_int(NOMI_KEY_SLEEP_SHOW, 0) == 0 && get_text("clock_time")[0];
+        int show = get_int(NOMI_KEY_SLEEP_SHOW, 0);
+        bool clock = show != 1 && get_text("clock_time")[0];  // 相册放不出来时也是时钟
         show_page(clock ? PAGE_CLOCK : PAGE_FACE, false);
         if (clock) clock_refresh(true);
+        if (show == 2 && s_cb.frame) s_cb.frame(true);  // 相框盖在最上面，时钟垫在下面
     } else if (s_page_before_sleep >= 0) {
         int page = s_page_before_sleep;
         s_page_before_sleep = -1;
@@ -974,10 +977,10 @@ static void build_display_page(lv_obj_t *page)
 {
     static const char *const dim[] = {"30 秒", "1 分", "2 分", "5 分", "从不", ""};
     static const char *const off[] = {"2 分", "5 分", "10 分", "30 分", "从不", ""};
-    static const char *const sleep_show[] = {"时钟", "表情", ""};
+    static const char *const sleep_show[] = {"时钟", "表情", "相册", ""};
     add_slider(page, "亮度", NOMI_KEY_BRIGHTNESS, MIN_BRIGHTNESS, 80);
     add_choice(page, "多久后睡着", "睡着 30 秒后调暗", NOMI_KEY_DIM, dim, 1);
-    add_choice(page, "睡着时显示", NULL, NOMI_KEY_SLEEP_SHOW, sleep_show, 1);
+    add_choice(page, "睡着时显示", "相册：轮播图片应用里设的相框相册，不调暗", NOMI_KEY_SLEEP_SHOW, sleep_show, 1);
     add_choice(page, "多久后息屏", NULL, NOMI_KEY_OFF, off, 1);
     const char *city = get_text("weather_city");
     lv_obj_t *item = add_item(page, "天气城市", "跟它说「我在深圳」也能改");

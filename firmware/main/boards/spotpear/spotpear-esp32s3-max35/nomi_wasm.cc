@@ -4,6 +4,7 @@
 #include "nomi_book.h"
 #include "nomi_flash_io.h"
 #include "nomi_music.h"
+#include "nomi_photo.h"
 #include "nomi_pkg.h"
 #include "nomi_radio.h"
 #include "nomi_reader.h"
@@ -56,7 +57,7 @@ constexpr int kWebWaitMs = 60000;                // 网页请求等应用回话�
 // 和 tools/app-sdk/nomi_sdk.h 一致
 enum {
     EV_CLICK = 1, EV_CHANGE, EV_BACK, EV_PAUSE, EV_RESUME, EV_CLOSE, EV_TIMER, EV_VOICE, EV_READER, EV_MEDIA,
-    EV_SHOW, EV_HIDE, EV_WEB
+    EV_SHOW, EV_HIDE, EV_WEB, EV_PHOTO
 };
 enum { TEXT_TITLE = 0, TEXT_BODY, TEXT_MUTED };
 enum { MEDIA_FINISHED = 1, MEDIA_NEXT = 2, MEDIA_PREV = 3, MEDIA_PLAY = 4 };
@@ -1074,6 +1075,101 @@ int32_t fs_find(wasm_exec_env_t env, const char* dir, const char* exts, int32_t 
     return count;
 }
 
+/* ---------- 图片：ui_grid、ui_thumb、ui_photo、photo_frame ---------- */
+
+constexpr int kThumbSize = 88;  // 一行 4 个（页面去掉两边留白 408 像素宽）
+enum { PHOTO_NEXT = 1, PHOTO_PREV = 2, PHOTO_MENU = 3 };  // NOMI_EV_PHOTO 的 value
+
+// 网格：控件一排排往右放、放满换行（缩略图墙）；ui_target 能指它
+int32_t ui_grid(wasm_exec_env_t env) {
+    Proc* p = Ctx(env);
+    UiScope ui(p);
+    lv_obj_t* parent = ui.target();
+    if (!parent) return E_NO_UI;
+    lv_obj_t* g = lv_obj_create(parent);
+    lv_obj_remove_style_all(g);
+    lv_obj_set_size(g, LV_PCT(100), LV_SIZE_CONTENT);
+    lv_obj_set_flex_flow(g, LV_FLEX_FLOW_ROW_WRAP);
+    lv_obj_set_style_pad_gap(g, 10, 0);
+    lv_obj_remove_flag(g, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(g, kContainer);
+    return AddObj(p, g);
+}
+
+// 一张缩略图（方块、铺满裁切），点了来 NOMI_EV_CLICK。系统在后台解，解好的存在卡上，下次秒开
+int32_t ui_thumb(wasm_exec_env_t env, const char* path) {
+    Proc* p = Ctx(env);
+    int32_t err;
+    std::string dev = Resolve(p, path, false, &err);
+    if (dev.empty()) return err;
+    UiScope ui(p);
+    lv_obj_t* parent = ui.target();
+    if (!parent) return E_NO_UI;
+    lv_obj_t* t = NomiPhoto::CreateThumb(parent, dev, kThumbSize);
+    int32_t id = AddObj(p, t);
+    BindClick(t, p, id);
+    return id;
+}
+
+// 全屏看图：占满当前页；翻图手势、点中间要菜单都发 NOMI_EV_PHOTO（换哪张由应用定，photo_show）
+int32_t ui_photo(wasm_exec_env_t env, const char* path, int32_t flags) {
+    Proc* p = Ctx(env);
+    int32_t err;
+    std::string dev = Resolve(p, path, false, &err);
+    if (dev.empty()) return err;
+    UiScope ui(p);
+    lv_obj_t* parent = ui.target();
+    if (!parent) return E_NO_UI;
+    lv_obj_set_style_pad_all(parent, 0, 0);
+    lv_obj_remove_flag(parent, LV_OBJ_FLAG_SCROLLABLE);
+    int32_t id = static_cast<int32_t>(p->objs.size()) + 1;  // AddObj 给的就是这个
+    std::weak_ptr<Proc> weak = p->weak_from_this();
+    lv_obj_t* v = NomiPhoto::CreateViewer(parent, dev, flags, [weak, id](NomiPhoto::Event ev) {
+        if (ProcPtr proc = weak.lock()) {
+            Post(proc.get(), EV_PHOTO, id,
+                 ev == NomiPhoto::kNext ? PHOTO_NEXT : ev == NomiPhoto::kPrev ? PHOTO_PREV : PHOTO_MENU);
+        }
+    });
+    return AddObj(p, v);
+}
+
+void photo_show(wasm_exec_env_t env, int32_t id, const char* path) {
+    Proc* p = Ctx(env);
+    int32_t err;
+    std::string dev = Resolve(p, path, false, &err);
+    if (dev.empty()) return;
+    UiScope ui(p);
+    if (ui.ok()) NomiPhoto::ViewerShow(Obj(p, id), dev);
+}
+
+// 预读：后台把这张解成全屏图存进缓存（排在别的后面），翻过去就快
+void photo_preload(wasm_exec_env_t env, const char* path) {
+    int32_t err;
+    std::string dev = Resolve(Ctx(env), path, false, &err);
+    if (!dev.empty()) NomiPhoto::Preload(dev);
+}
+
+void photo_set_flags(wasm_exec_env_t env, int32_t id, int32_t flags) {
+    Proc* p = Ctx(env);
+    UiScope ui(p);
+    if (ui.ok()) NomiPhoto::ViewerSetFlags(Obj(p, id), flags);
+}
+
+// 电子相框：睡着时轮播 dir 这个文件夹里的图，每 seconds 秒换一张；dir 空 = 不设了
+int32_t photo_frame(wasm_exec_env_t env, const char* dir, int32_t seconds) {
+    if (!dir || !*dir) {
+        NomiPhoto::SetFrame("", 0);
+        return 0;
+    }
+    int32_t err;
+    std::string dev = Resolve(Ctx(env), dir, false, &err);
+    if (dev.empty()) return err;
+    while (dev.size() > 4 && dev.back() == '/') dev.pop_back();
+    if (dev.rfind("/sd/", 0) != 0) return E_DENIED;
+    NomiPhoto::SetFrame(dev, seconds);
+    return 0;
+}
+
 // 小设置和进度：data/kv.json，一个 JSON 对象，改一次写一次（不占设备那 16KB 的 NVS）
 void LoadKv(Proc* p) {
     std::string text, path = p->pkg->dir + "/data/kv.json";
@@ -1380,6 +1476,13 @@ NativeSymbol kNatives[] = {
     {"fs_read", (void*)fs_read, "($i*~)i", nullptr},
     {"fs_find", (void*)fs_find, "($$i*~)i", nullptr},
     {"ui_reader", (void*)ui_reader, "($ii)i", nullptr},
+    {"ui_grid", (void*)ui_grid, "()i", nullptr},
+    {"ui_thumb", (void*)ui_thumb, "($)i", nullptr},
+    {"ui_photo", (void*)ui_photo, "($i)i", nullptr},
+    {"photo_show", (void*)photo_show, "(i$)", nullptr},
+    {"photo_set_flags", (void*)photo_set_flags, "(ii)", nullptr},
+    {"photo_preload", (void*)photo_preload, "($)", nullptr},
+    {"photo_frame", (void*)photo_frame, "($i)i", nullptr},
     {"reader_goto", (void*)reader_goto, "(ii)", nullptr},
     {"reader_set_flags", (void*)reader_set_flags, "(ii)", nullptr},
     {"reader_text", (void*)reader_text, "(i*~)i", nullptr},

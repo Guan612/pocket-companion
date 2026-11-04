@@ -1,4 +1,4 @@
-// Pocket Companion 应用 SDK（接口版本 1）。规范见 docs/app-sdk.md。
+// Pocket Companion 应用 SDK（接口版本见 NOMI_API）。规范见 docs/app-sdk.md。
 //
 // 应用用 C 写，编译成 WebAssembly（python tools/app-sdk/build.py 应用目录）。应用要定义两个函数：
 //   void    nomi_main(void);                                       进程起来时调一次：读设置、建卡片
@@ -14,7 +14,9 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define NOMI_API 2  // 2：阅读器（ui_reader 等）、text_chapters、fs_find。用到这些的应用 manifest 里 "api": 2
+#define NOMI_API 3  // 用到的最高版本写进 manifest 的 "api"。
+// 2：阅读器（ui_reader 等）、text_chapters、fs_find。
+// 3：图片（ui_photo 等）
 
 #define NOMI_IMPORT(name) __attribute__((import_module("env"), import_name(#name)))
 #define NOMI_EXPORT(name) __attribute__((export_name(#name)))
@@ -38,6 +40,7 @@ enum {
     NOMI_EV_SHOW,       // 界面挂上了：建页面
     NOMI_EV_HIDE,       // 界面拿下了：进程留在后台
     NOMI_EV_WEB,        // 应用自带的网页发来请求：用 web_body 取请求体，web_reply 回话（见「网页」）
+    NOMI_EV_PHOTO,      // （api 3）全屏看图：id 是看图控件，value 是 NOMI_PHOTO_NEXT / PREV / MENU
 };
 
 enum { NOMI_TEXT_TITLE = 0, NOMI_TEXT_BODY = 1, NOMI_TEXT_MUTED = 2 };
@@ -76,6 +79,29 @@ NOMI_IMPORT(ui_now_playing) int32_t ui_now_playing(const char *hint);
 NOMI_IMPORT(ui_target) int32_t ui_target(int32_t id);
 // 打开自己的界面（卡片上点了"打开"时用），之后来 SHOW；已经开着就什么都不做
 NOMI_IMPORT(ui_open) void ui_open(void);
+
+/* ---------- 图片（api 3）：系统解码（JPEG 边读边解、按 EXIF 转正；PNG 只认 640×640 以内的） ---------- */
+
+#define NOMI_PHOTO_SWIPE_LR 1  // ui_photo 的 flags：左滑下一张、右滑上一张
+#define NOMI_PHOTO_SWIPE_UD 2  // 上滑下一张、下滑上一张
+#define NOMI_PHOTO_TAP_LR 4    // 点左三分之一上一张、右三分之一下一张（点中间、长按都是 NOMI_PHOTO_MENU）
+enum { NOMI_PHOTO_NEXT = 1, NOMI_PHOTO_PREV = 2, NOMI_PHOTO_MENU = 3 };  // NOMI_EV_PHOTO 的 value
+// 网格容器：控件一排排往右放、放满换行（一行 4 张缩略图）；返回 id 给 ui_target
+NOMI_IMPORT(ui_grid) int32_t ui_grid(void);
+// 一张缩略图（方块、铺满裁切，88 像素），点了来 NOMI_EV_CLICK。系统在后台解（手机照片先用自带的小图），
+// 解好的存在卡上 nomi/cache/thumbs/，下次秒开。一页别放太多（每张占 15KB 内存），多了分页
+NOMI_IMPORT(ui_thumb) int32_t ui_thumb(const char *path);
+// 全屏看图：占满当前页（这页别放别的控件，标题给空字符串），整张放进屏幕、四周留黑。翻图手势、点中间要菜单
+// 都来 NOMI_EV_PHOTO；下一张放哪张由应用定，用 photo_show 换
+NOMI_IMPORT(ui_photo) int32_t ui_photo(const char *path, int32_t flags);
+NOMI_IMPORT(photo_show) void photo_show(int32_t id, const char *path);
+NOMI_IMPORT(photo_set_flags) void photo_set_flags(int32_t id, int32_t flags);
+// 预读：后台把这张解成全屏图存进卡上的缓存（排在别的后面），翻过去就快。看一张时预读前后两张。
+// 全屏图解过一次都有缓存（每张约 300KB），第二次看秒开；没缓存时系统先把照片自带的小图放大当预览
+NOMI_IMPORT(photo_preload) void photo_preload(const char *path);
+// 电子相框：设备睡着时（设置里「睡着时显示」选了相册）轮播 dir 这个文件夹里的图（打乱顺序），每 seconds 秒
+// 换一张（至少 10 秒）。dir 空字符串 = 不设了。设备记着，重启还在
+NOMI_IMPORT(photo_frame) int32_t photo_frame(const char *dir, int32_t seconds);
 
 /* ---------- 阅读器（api 2）：看 TXT 小说，系统排版、分页、翻页 ---------- */
 

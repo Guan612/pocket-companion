@@ -7,6 +7,7 @@
 #include "face_script.h"
 #include "nomi_clock.h"
 #include "nomi_font.h"
+#include "nomi_photo.h"
 #include "nomi_music.h"
 #include "nomi_radio.h"
 #include "nomi_ui.h"
@@ -461,6 +462,16 @@ void NomiDisplay::SetupUI() {
         .history_get = HistoryGet,
         .history_dropped = HistoryDropped,
         .get_image = GetImage,
+        .frame = [](bool on) {
+            if (!on) {
+                NomiPhoto::FrameStop();
+                return true;
+            }
+            // 摸一下相框：和摸屏幕一样叫醒（叫醒时 nomi_ui 会再调 frame(false) 撤掉）
+            return NomiPhoto::FrameStart([]() {
+                if (NomiDisplay::on_user_activity) NomiDisplay::on_user_activity();
+            });
+        },
     };
     // 先用内置字体，资源分区里的完整中文字体加载后会经 SetTextFont 换上
     nomi_ui_create(screen, face_buf_, &BUILTIN_TEXT_FONT, &callbacks);

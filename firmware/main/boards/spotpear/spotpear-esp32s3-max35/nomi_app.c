@@ -91,12 +91,6 @@ static void icon_set_color(lv_obj_t *icon, uint32_t color)
 }
 
 
-static const lv_point_precise_t kPhotoFrame[] = {{3, 6}, {33, 6}, {33, 30}, {3, 30}, {3, 6}};
-static const lv_point_precise_t kPhotoHill[] = {{6, 27}, {14, 17}, {20, 23}, {24, 19}, {30, 27}};
-static const nomi_icon_line_t kPhotoLines[] = {{kPhotoFrame, 5}, {kPhotoHill, 5}};
-static const nomi_icon_circle_t kPhotoCircles[] = {{22, 10, 6}};
-static const nomi_icon_t kPhotoIcon = {kPhotoLines, 2, kPhotoCircles, 1};
-
 static const lv_point_precise_t kMapTip[] = {{11, 16}, {18, 32}, {25, 16}};
 static const nomi_icon_line_t kMapLines[] = {{kMapTip, 3}};
 static const nomi_icon_circle_t kMapCircles[] = {{9, 3, 18}, {15, 9, 6}};
@@ -141,7 +135,6 @@ static void placeholder_open(const nomi_app_t *app, lv_obj_t *root)
     }
 }
 
-static const nomi_app_t kPhoto = {"photo", "图片", &kPhotoIcon, placeholder_open, NULL, NULL, NULL, "看 SD 卡里的照片"};
 static const nomi_app_t kMap = {"map", "地图", &kMapIcon, placeholder_open, NULL, NULL, NULL, "地图"};
 
 /* ---------- 系统应用「应用管理」：看装了哪些、删掉不要的 ---------- */
@@ -522,8 +515,7 @@ static void build_launcher(lv_obj_t *tile)
     lv_obj_set_style_pad_row(s_grid, 14, 0);
     lv_obj_set_scroll_dir(s_grid, LV_DIR_VER);  // 应用多了往下滚
     lv_obj_set_scrollbar_mode(s_grid, LV_SCROLLBAR_MODE_OFF);
-    // 音乐、小说已经是应用包（apps/music、apps/novel，预装），装上后自己登记
-    nomi_apps_add(&kPhoto);
+    // 音乐、小说、图片已经是应用包（apps/music、apps/novel、apps/photo，预装），装上后自己登记
     nomi_apps_add(&kMap);
     add_edge(tile, on_launcher_edge);
 }
