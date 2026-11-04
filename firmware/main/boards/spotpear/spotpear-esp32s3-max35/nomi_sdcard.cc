@@ -2,6 +2,7 @@
 
 #include "application.h"
 #include "config.h"
+#include "nomi_files.h"
 
 #include <cJSON.h>
 #include <diskio_impl.h>
@@ -331,6 +332,7 @@ std::string NomiSdCard::UploadJson(size_t length, const std::function<int(char*,
         ESP_LOGW(TAG, "Upload %s failed: %s", path.c_str(), error.c_str());
         return "!" + error;
     }
+    NomiFiles::Changed();  // 媒体库要重扫
     int64_t ms = (esp_timer_get_time() - t0) / 1000;
     ESP_LOGI(TAG, "Uploaded %s: %u bytes in %lld ms", full.c_str(), static_cast<unsigned>(written), ms);
     cJSON* root = cJSON_CreateObject();

@@ -54,6 +54,19 @@ body.has-save{padding-bottom:88px}
 .save button{flex:none;padding:10px 22px}
 #msg{flex:1;font-size:14px}
 .ok{color:var(--ok)}.err{color:var(--err)}
+.crumbs{display:flex;flex-wrap:wrap;gap:4px;align-items:center;font-size:14px;color:var(--muted)}
+.crumbs a{color:var(--accent);cursor:pointer}
+.fm-list{margin-top:8px;border:1px solid var(--line);border-radius:8px;max-height:440px;overflow:auto}
+.fm-row{display:flex;gap:8px;align-items:center;padding:7px 10px;border-bottom:1px solid var(--line)}
+.fm-row:last-child{border-bottom:0}
+.fm-name{flex:1;min-width:0;overflow-wrap:anywhere;cursor:pointer}
+.fm-name.dir{font-weight:600;color:var(--accent)}
+.fm-row .hint{white-space:nowrap}
+.fm-row button{padding:3px 8px;font-size:13px}
+.modal{position:fixed;inset:0;background:rgba(0,0,0,.85);display:flex;align-items:center;justify-content:center;z-index:9;padding:16px}
+.modal[hidden]{display:none}
+.modal>div{max-width:520px;width:100%}
+.modal img{width:100%;border-radius:8px;display:block;background:#000;min-height:120px}
 .menu{display:block;background:var(--card);border:1px solid var(--line);border-radius:12px;overflow:hidden;margin-top:14px}
 .menu a{display:flex;align-items:center;gap:10px;padding:15px 12px;color:var(--fg);text-decoration:none;border-top:1px solid var(--line)}
 .menu a:first-child{border-top:0}
@@ -133,13 +146,18 @@ body.has-save{padding-bottom:88px}
   <div class="row"><span id="sdState" style="flex:1">检测中…</span><button id="sdRescan">重新检测</button></div>
   <p class="hint">要 FAT32 格式。64GB 以上的卡出厂多是 exFAT，先在电脑上格式化成 FAT32 再插。没有插卡检测，插拔后点「重新检测」。</p>
 </div>
-<div class="card">
-  <p class="hint">往卡上传文件，不用拔卡。书（.txt）放哪都行，小说应用会整张卡找；补字用的字体（.ttf）放 fonts。走的是 Wi-Fi，信号弱时很慢（10MB 要几分钟到十几分钟），传完之前别关这一页。同名的文件会被换掉。</p>
-  <label>放到卡上的哪个文件夹<input id="sdDir" value="小说" autocomplete="off" placeholder="空着就放卡的根上"></label>
-  <div class="row" id="sdDirs"><span class="hint">常用：</span><button class="mini" data-dir="小说">小说</button><button class="mini" data-dir="fonts">fonts（字体）</button><button class="mini" data-dir="">卡的根上</button></div>
-  <label>文件（可以一次选好几个）<input id="sdFiles" type="file" multiple></label>
+<div class="card" id="fm" hidden>
+  <div class="crumbs" id="fmPath"></div>
+  <div class="fm-list" id="fmList"></div>
+  <div class="row"><button class="mini" id="fmMkdir">新建文件夹</button><button class="mini" id="fmRefresh">刷新</button><span id="fmInfo" class="hint"></span></div>
+  <label>上传到这个文件夹（可以一次选好几个）<input id="sdFiles" type="file" multiple></label>
   <div class="row"><button id="sdUpload">上传</button><span id="sdMsg" class="hint"></span></div>
+  <p class="hint">点文件夹进去；点图片看大图，点别的文件下载。书（.txt）放哪都行，小说应用会整张卡找；补字用的字体（.ttf）放 fonts。走的是 Wi-Fi，信号弱时很慢（10MB 要几分钟到十几分钟），传完之前别关这一页；同名的文件会被换掉。系统自己的 nomi 文件夹不在这里显示。</p>
 </div>
+<div class="modal" id="fmPreview" hidden><div>
+  <img id="fmImg" alt="">
+  <div class="row"><span id="fmImgName" class="hint" style="flex:1;overflow-wrap:anywhere"></span><a class="btn" id="fmDl">下载</a><button id="fmClose">关掉</button></div>
+</div></div>
 </div>
 
 <div id="appsCard" hidden>
@@ -515,12 +533,81 @@ async function loadSd() {
   sum.sd = r; drawMenu();
   const el = $('#sdState');
   if (r.state === 'ready') { el.textContent = `已插卡：共 ${gb(r.total)}，剩余 ${gb(r.free)}`; el.className = 'ok'; }
+  $('#fm').hidden = r.state !== 'ready';
+  if (r.state === 'ready' && !fmLoaded) { fmLoaded = true; fmLoad(fmPath); }
   else if (r.state === 'unsupported') { el.textContent = '卡的格式不支持，要格式化成 FAT32'; el.className = 'err'; }
   else { el.textContent = '没检测到卡（没插，或者没插到底）'; el.className = 'hint'; }
 }
 // 往卡上传文件：一个个传，请求体第一行是卡上的路径，后面是文件内容（用 XHR 才看得到上传进度）
 const sdMsg = (text, cls) => { $('#sdMsg').textContent = text; $('#sdMsg').className = 'hint ' + (cls || ''); };
-for (const b of document.querySelectorAll('#sdDirs button')) b.onclick = () => { $('#sdDir').value = b.dataset.dir; };
+// 文件管理：一层层点进去；改名、删除、新建文件夹、上传到当前文件夹、下载、看大图
+let fmPath = '', fmLoaded = false;
+const fmEnc = p => p.split('/').map(encodeURIComponent).join('/');
+const fmJoin = n => (fmPath ? fmPath + '/' : '') + n;
+const fmImgName = n => /\.(jpe?g|png)$/i.test(n);
+const two = n => String(n).padStart(2, '0');
+const when = t => { if (!t) return ''; const d = new Date(t * 1000); return `${d.getFullYear()}-${two(d.getMonth() + 1)}-${two(d.getDate())} ${two(d.getHours())}:${two(d.getMinutes())}`; };
+async function fmPost(url, body) {
+  try { return await (await fetch(url, {method: 'POST', body: JSON.stringify(body)})).json(); }
+  catch (e) { return {ok: false, error: '请求失败：' + e.message}; }
+}
+const fmBadName = n => !n || /[\/\\]/.test(n) || n === '.' || n === '..';
+async function fmLoad(path) {
+  const r = await fmPost('/sd/list', {path});
+  if (!r.ok) { sdMsg(r.error, 'err'); if (path) fmLoad(''); return; }
+  fmPath = path;
+  const crumbs = $('#fmPath');
+  crumbs.innerHTML = '';
+  const parts = path ? path.split('/') : [];
+  const add = (label, p) => { const a = document.createElement('a'); a.textContent = label; a.onclick = () => fmLoad(p); crumbs.appendChild(a); };
+  add('SD 卡', '');
+  parts.forEach((x, i) => { crumbs.append(' / '); add(x, parts.slice(0, i + 1).join('/')); });
+  const box = $('#fmList');
+  box.innerHTML = r.entries.length ? '' : '<p class="hint" style="padding:8px 10px;margin:0">空的</p>';
+  for (const e of r.entries) {
+    const p = fmJoin(e.name);
+    const row = document.createElement('div');
+    row.className = 'fm-row';
+    row.innerHTML = `<span class="fm-name${e.dir ? ' dir' : ''}">${esc(e.name)}${e.dir ? ' /' : ''}</span>` +
+      `<span class="hint">${e.dir ? '' : kb(e.size) + ' · '}${when(e.time)}</span><button>改名</button><button class="danger">删除</button>`;
+    const [ren, del] = row.querySelectorAll('button');
+    row.querySelector('.fm-name').onclick = () => e.dir ? fmLoad(p) : fmImgName(e.name) ? fmShow(p, e.name) : (location.href = '/sd/file/' + fmEnc(p));
+    ren.onclick = async () => {
+      const n = (prompt('改成什么名字？', e.name) || '').trim();
+      if (!n || n === e.name) return;
+      if (fmBadName(n)) return sdMsg('名字里不能有 / 和 \\', 'err');
+      const res = await fmPost('/sd/rename', {from: p, to: fmJoin(n)});
+      sdMsg(res.ok ? `改成了「${n}」` : res.error, res.ok ? 'ok' : 'err');
+      fmLoad(fmPath);
+    };
+    del.onclick = async () => {
+      if (!confirm(e.dir ? `删除文件夹「${e.name}」，连里面所有的东西？删了找不回来。` : `删除「${e.name}」？删了找不回来。`)) return;
+      const res = await fmPost('/sd/delete', {path: p});
+      sdMsg(res.ok ? `删好了（${res.removed} 个文件）` : res.error, res.ok ? 'ok' : 'err');
+      fmLoad(fmPath);
+      loadSd();
+    };
+    box.appendChild(row);
+  }
+  $('#fmInfo').textContent = r.truncated ? '太多了，只列了前 1000 个' : `${r.entries.length} 项 · 卡上剩 ${gb(r.free)}`;
+}
+function fmShow(p, name) {
+  $('#fmImg').src = '/sd/preview/480x480/' + fmEnc(p);  // 设备当场解，大照片要几秒
+  $('#fmImgName').textContent = name + '（大照片要等几秒）';
+  $('#fmDl').href = '/sd/file/' + fmEnc(p);
+  $('#fmPreview').hidden = false;
+}
+$('#fmClose').onclick = () => { $('#fmPreview').hidden = true; $('#fmImg').removeAttribute('src'); };
+$('#fmPreview').onclick = e => { if (e.target.id === 'fmPreview') $('#fmClose').onclick(); };
+$('#fmMkdir').onclick = async () => {
+  const n = (prompt('新文件夹叫什么？') || '').trim();
+  if (!n) return;
+  if (fmBadName(n)) return sdMsg('名字里不能有 / 和 \\', 'err');
+  const res = await fmPost('/sd/mkdir', {path: fmJoin(n)});
+  sdMsg(res.ok ? `建好了「${n}」` : res.error, res.ok ? 'ok' : 'err');
+  fmLoad(fmPath);
+};
+$('#fmRefresh').onclick = () => fmLoad(fmPath);
 function sdUploadOne(path, file, progress) {
   return new Promise(resolve => {
     const xhr = new XMLHttpRequest();
@@ -536,8 +623,7 @@ function sdUploadOne(path, file, progress) {
 $('#sdUpload').onclick = async () => {
   const files = [...$('#sdFiles').files];
   if (!files.length) return sdMsg('先选文件', 'err');
-  const dir = $('#sdDir').value.trim().replace(/\\/g, '/').replace(/^\/+|\/+$/g, '');
-  if (/^nomi(\/|$)/i.test(dir)) return sdMsg('nomi 文件夹是系统自己用的，换一个', 'err');
+  const dir = fmPath;
   $('#sdUpload').disabled = true;
   let done = 0;
   for (const f of files) {
@@ -555,6 +641,7 @@ $('#sdUpload').onclick = async () => {
   $('#sdFiles').value = '';
   $('#sdUpload').disabled = false;
   loadSd();
+  fmLoad(fmPath);
 };
 $('#sdRescan').onclick = async () => {
   $('#sdRescan').disabled = true;

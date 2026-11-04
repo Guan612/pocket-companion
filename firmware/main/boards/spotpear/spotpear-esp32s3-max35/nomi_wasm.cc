@@ -2,6 +2,7 @@
 
 #include "display/display.h"
 #include "nomi_book.h"
+#include "nomi_files.h"
 #include "nomi_flash_io.h"
 #include "nomi_music.h"
 #include "nomi_photo.h"
@@ -745,7 +746,7 @@ int32_t ui_player(wasm_exec_env_t env) {
 struct SdIfNeeded {
     std::unique_ptr<NomiSdCard::Use> use;
     explicit SdIfNeeded(const std::string& path) {
-        if (path.rfind("/sd/", 0) == 0) use = std::make_unique<NomiSdCard::Use>();
+        if (path == "/sd" || path.rfind("/sd/", 0) == 0) use = std::make_unique<NomiSdCard::Use>();
     }
 };
 
@@ -757,11 +758,14 @@ std::string Resolve(Proc* p, const char* path, bool write, int32_t* err) {
     if (s.rfind("data:/", 0) == 0) return p->pkg->dir + "/data/" + s.substr(6);
     if (s.rfind("pkg:/", 0) == 0) return write ? "" : p->pkg->dir + "/assets/" + s.substr(5);
     if (s.rfind("sd:/", 0) == 0) {
-        if (write || !p->pkg->Has("sd.read")) {
+        bool allowed = write ? p->pkg->Has("sd.write") : p->pkg->Has("sd.read") || p->pkg->Has("sd.write");
+        std::string full;
+        // 卡上的系统文件夹 nomi/（应用、别的应用的数据、缓存）读写都不行
+        if (!allowed || !NomiFiles::Resolve(s.substr(4), write, full).empty()) {
             *err = E_DENIED;
             return "";
         }
-        return std::string("/sd/") + s.substr(4);
+        return full;
     }
     return "";
 }
@@ -1170,6 +1174,95 @@ int32_t photo_frame(wasm_exec_env_t env, const char* dir, int32_t seconds) {
     return 0;
 }
 
+/* ---------- 写文件：data:/ 随便写；sd:/ 要 sd.write（系统的 nomi/ 下面不让碰） ---------- */
+
+bool OnSd(const std::string& dev) { return dev == "/sd" || dev.rfind("/sd/", 0) == 0; }
+
+void RemoveLocal(const std::string& path) {
+    if (DIR* d = opendir(path.c_str())) {
+        while (dirent* e = readdir(d)) {
+            if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, "..")) continue;
+            std::string child = path + "/" + e->d_name;
+            if (e->d_type == DT_DIR) RemoveLocal(child);
+            else unlink(child.c_str());
+        }
+        closedir(d);
+        rmdir(path.c_str());
+    } else {
+        unlink(path.c_str());
+    }
+}
+
+// 写文件：append 为 0 从头写（原来的内容不要了），1 接在后面。上一级文件夹没有就建。返回写了几个字节
+int32_t fs_write(wasm_exec_env_t env, const char* path, const void* buf, uint32_t size, int32_t append) {
+    int32_t err;
+    std::string dev = Resolve(Ctx(env), path, true, &err);
+    if (dev.empty()) return err;
+    SdIfNeeded sd(dev);
+    if (sd.use && !*sd.use) return E_NO_SD;
+    int32_t result = E_FAIL;
+    NomiFlashIo::ForPath(dev, [&] {
+        MakeDirs(dev.substr(0, dev.rfind('/')));
+        if (FILE* f = fopen(dev.c_str(), append ? "ab" : "wb")) {
+            result = fwrite(buf, 1, size, f) == size ? static_cast<int32_t>(size) : E_FAIL;
+            fclose(f);
+        }
+    });
+    if (OnSd(dev)) NomiFiles::Changed();
+    return result;
+}
+
+// 删文件或整个文件夹
+int32_t fs_remove(wasm_exec_env_t env, const char* path) {
+    int32_t err;
+    std::string dev = Resolve(Ctx(env), path, true, &err);
+    if (dev.empty()) return err;
+    SdIfNeeded sd(dev);
+    if (sd.use && !*sd.use) return E_NO_SD;
+    if (OnSd(dev)) return NomiFiles::Remove(dev.substr(4)).empty() ? 0 : E_FAIL;
+    int32_t result = E_NOT_FOUND;
+    NomiFlashIo::ForPath(dev, [&] {
+        struct stat st;
+        if (stat(dev.c_str(), &st) != 0) return;
+        RemoveLocal(dev);
+        result = stat(dev.c_str(), &st) == 0 ? E_FAIL : 0;
+    });
+    return result;
+}
+
+// 改名 / 挪地方（只能在同一处：都在 data:/、或者都在卡上）；目标已经有了不覆盖
+int32_t fs_rename(wasm_exec_env_t env, const char* from, const char* to) {
+    int32_t err;
+    std::string a = Resolve(Ctx(env), from, true, &err);
+    if (a.empty()) return err;
+    std::string b = Resolve(Ctx(env), to, true, &err);
+    if (b.empty()) return err;
+    if (OnSd(a) != OnSd(b)) return E_FAIL;
+    SdIfNeeded sd(a);
+    if (sd.use && !*sd.use) return E_NO_SD;
+    if (OnSd(a)) return NomiFiles::Rename(a.substr(4), b.substr(4)).empty() ? 0 : E_FAIL;
+    int32_t result = E_FAIL;
+    NomiFlashIo::ForPath(a, [&] {
+        struct stat st;
+        if (stat(a.c_str(), &st) != 0) result = E_NOT_FOUND;
+        else if (stat(b.c_str(), &st) != 0 && rename(a.c_str(), b.c_str()) == 0) result = 0;
+    });
+    return result;
+}
+
+// 新建文件夹（一层层建，已经有了也算成功）
+int32_t fs_mkdir(wasm_exec_env_t env, const char* path) {
+    int32_t err;
+    std::string dev = Resolve(Ctx(env), path, true, &err);
+    if (dev.empty()) return err;
+    SdIfNeeded sd(dev);
+    if (sd.use && !*sd.use) return E_NO_SD;
+    bool ok = false;
+    NomiFlashIo::ForPath(dev, [&] { ok = MakeDirs(dev); });
+    if (OnSd(dev)) NomiFiles::Changed();
+    return ok ? 0 : E_FAIL;
+}
+
 // 小设置和进度：data/kv.json，一个 JSON 对象，改一次写一次（不占设备那 16KB 的 NVS）
 void LoadKv(Proc* p) {
     std::string text, path = p->pkg->dir + "/data/kv.json";
@@ -1475,6 +1568,10 @@ NativeSymbol kNatives[] = {
     {"fs_size", (void*)fs_size, "($)i", nullptr},
     {"fs_read", (void*)fs_read, "($i*~)i", nullptr},
     {"fs_find", (void*)fs_find, "($$i*~)i", nullptr},
+    {"fs_write", (void*)fs_write, "($*~i)i", nullptr},
+    {"fs_remove", (void*)fs_remove, "($)i", nullptr},
+    {"fs_rename", (void*)fs_rename, "($$)i", nullptr},
+    {"fs_mkdir", (void*)fs_mkdir, "($)i", nullptr},
     {"ui_reader", (void*)ui_reader, "($ii)i", nullptr},
     {"ui_grid", (void*)ui_grid, "()i", nullptr},
     {"ui_thumb", (void*)ui_thumb, "($)i", nullptr},

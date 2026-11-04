@@ -16,7 +16,7 @@
 
 #define NOMI_API 3  // 用到的最高版本写进 manifest 的 "api"。
 // 2：阅读器（ui_reader 等）、text_chapters、fs_find。
-// 3：图片（ui_photo 等）
+// 3：图片（ui_photo 等）、写卡（fs_write 等，权限 sd.write）
 
 #define NOMI_IMPORT(name) __attribute__((import_module("env"), import_name(#name)))
 #define NOMI_EXPORT(name) __attribute__((export_name(#name)))
@@ -126,7 +126,8 @@ NOMI_IMPORT(text_chapters) int32_t text_chapters(const char *path, int32_t first
 // offset 在第几章（从 0 起）；在第一章之前、或者这本书没分章，返回 -1
 NOMI_IMPORT(text_chapter_at) int32_t text_chapter_at(const char *path, int32_t offset);
 
-/* ---------- 存储：data:/ 应用自己的数据，pkg:/ 应用包里的 assets，sd:/ SD 卡（只读，要 sd.read） ---------- */
+/* ---------- 存储：data:/ 应用自己的数据，pkg:/ 应用包里的 assets（只读），sd:/ SD 卡 ---------- */
+// sd:/ 读要 sd.read，写要 sd.write（有 sd.write 也能读）。卡上系统自己的 nomi/ 文件夹（应用、缓存）读写都不行。
 
 NOMI_IMPORT(fs_list) int32_t fs_list(const char *dir, char *buf, int32_t size);  // 一行一个，目录带 '/'
 NOMI_IMPORT(fs_size) int32_t fs_size(const char *path);
@@ -135,6 +136,13 @@ NOMI_IMPORT(fs_read) int32_t fs_read(const char *path, int32_t offset, void *buf
 // 不小于 min_size 字节。一行一个「路径 TAB 大小」（路径是 sd:/ 开头的），放不下的不放；返回放了几个。
 // 跳过 . 开头的、系统的文件夹（nomi/、System Volume Information）。卡上东西多的话要几秒
 NOMI_IMPORT(fs_find) int32_t fs_find(const char *dir, const char *exts, int32_t min_size, char *buf, int32_t size);
+// （api 3）写：data:/ 随便写，sd:/ 要 sd.write。append 为 0 从头写（原来的内容不要了），1 接在后面；
+// 上一级文件夹没有就建。返回写了几个字节
+NOMI_IMPORT(fs_write) int32_t fs_write(const char *path, const void *buf, int32_t size, int32_t append);
+NOMI_IMPORT(fs_remove) int32_t fs_remove(const char *path);  // （api 3）删文件或整个文件夹
+// （api 3）改名 / 挪地方：只能在同一处挪（都在 data:/、或者都在卡上），目标已经有了不覆盖
+NOMI_IMPORT(fs_rename) int32_t fs_rename(const char *from, const char *to);
+NOMI_IMPORT(fs_mkdir) int32_t fs_mkdir(const char *path);  // （api 3）一层层建，已经有了也算成功
 NOMI_IMPORT(kv_get) int32_t kv_get(const char *key, char *buf, int32_t size);  // 没有返回 NOMI_E_NOT_FOUND
 NOMI_IMPORT(kv_set) int32_t kv_set(const char *key, const char *value);
 

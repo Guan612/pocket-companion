@@ -432,11 +432,65 @@ esp_err_t HandlePrefix(httpd_req_t* req) {
     return httpd_resp_send(req, out.data(), out.size());
 }
 
+struct StreamEntry {
+    std::string uri;  // 前缀 + "*"
+    DirectApiConfigServer::StreamHandler handler;
+};
+
+std::vector<StreamEntry>& StreamHandlers() {
+    static std::vector<StreamEntry> handlers;
+    return handlers;
+}
+
+// 下载文件名放进 Content-Disposition：中文要按 RFC 5987 百分号编码
+std::string Disposition(const std::string& filename) {
+    static const char* hex = "0123456789ABCDEF";
+    std::string out = "attachment; filename*=UTF-8''";
+    for (unsigned char c : filename) {
+        if (isalnum(c) || c == '.' || c == '-' || c == '_') out += static_cast<char>(c);
+        else out += '%', out += hex[c >> 4], out += hex[c & 15];
+    }
+    return out;
+}
+
+esp_err_t HandleStream(httpd_req_t* req) {
+    auto* entry = static_cast<StreamEntry*>(req->user_ctx);
+    std::string uri = req->uri;
+    uri = uri.substr(0, uri.find('?'));
+    std::string type, disposition;  // 响应头只存指针：要活到发完
+    bool begun = false, alive = true;
+    auto begin = [&](const std::string& t, const std::string& filename) {
+        type = t;
+        httpd_resp_set_type(req, type.c_str());
+        httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+        if (!filename.empty()) {
+            disposition = Disposition(filename);
+            httpd_resp_set_hdr(req, "Content-Disposition", disposition.c_str());
+        }
+        begun = true;
+    };
+    auto write = [&](const char* data, size_t len) {
+        alive = alive && httpd_resp_send_chunk(req, data, len) == ESP_OK;
+        return alive;
+    };
+    entry->handler(uri, begin, write);
+    if (!begun) {
+        httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "Not found");
+        return ESP_OK;
+    }
+    if (alive) httpd_resp_send_chunk(req, nullptr, 0);
+    return alive ? ESP_OK : ESP_FAIL;
+}
+
 }  // namespace
 
 namespace DirectApiConfigServer {
 
 std::function<void()> on_city_changed;
+
+void AddStreamHandler(const char* prefix, StreamHandler handler) {
+    StreamHandlers().push_back({std::string(prefix) + "*", std::move(handler)});
+}
 
 void AddPrefixHandler(const char* prefix, PrefixHandler handler) {
     PrefixHandlers().push_back({std::string(prefix) + "*", std::move(handler)});
@@ -478,6 +532,10 @@ std::string Start() {
         for (auto& upload : UploadHandlers()) {
             httpd_uri_t u = {.uri = upload.uri.c_str(), .method = HTTP_POST, .handler = HandleUpload,
                              .user_ctx = &upload};
+            httpd_register_uri_handler(s_server, &u);
+        }
+        for (auto& stream : StreamHandlers()) {
+            httpd_uri_t u = {.uri = stream.uri.c_str(), .method = HTTP_GET, .handler = HandleStream, .user_ctx = &stream};
             httpd_register_uri_handler(s_server, &u);
         }
         // 前缀的放最后：先让整个对得上的接口匹配

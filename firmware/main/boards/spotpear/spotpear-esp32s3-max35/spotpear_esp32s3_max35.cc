@@ -14,6 +14,7 @@
 #include "nomi_clock.h"
 #include "nomi_display.h"
 #include "nomi_music.h"
+#include "nomi_files.h"
 #include "nomi_photo.h"
 #include "nomi_pkg.h"
 #include "nomi_radio.h"
@@ -449,6 +450,16 @@ private:
         DirectApiConfigServer::AddPrefixHandler(
             "/sd/preview/", [](const std::string& uri, bool, const std::string&, std::string& type, std::string& out) {
                 return NomiPhoto::PreviewBmp(uri, type, out);
+            });
+        // 网页的文件管理：列、新建文件夹、改名、删除、下载（边读边发）
+        DirectApiConfigServer::AddJsonHandler("/sd/list", true, NomiFiles::ListJson);
+        DirectApiConfigServer::AddJsonHandler("/sd/mkdir", true, NomiFiles::MkdirJson);
+        DirectApiConfigServer::AddJsonHandler("/sd/rename", true, NomiFiles::RenameJson);
+        DirectApiConfigServer::AddJsonHandler("/sd/delete", true, NomiFiles::DeleteJson);
+        DirectApiConfigServer::AddStreamHandler(
+            "/sd/file/", [](const std::string& uri, const DirectApiConfigServer::StreamBegin& begin,
+                            const DirectApiConfigServer::StreamWrite& write) {
+                return NomiFiles::Download(uri, begin, write);
             });
         // 往卡上传文件（字体、书）：请求体第一行是卡上的路径
         DirectApiConfigServer::AddUploadHandler(

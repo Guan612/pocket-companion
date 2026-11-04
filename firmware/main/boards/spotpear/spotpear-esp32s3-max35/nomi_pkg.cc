@@ -26,11 +26,11 @@
 
 namespace {
 
-constexpr int kApi = 3;                       // 固件支持的接口版本（docs/app-sdk.md）：2 阅读器、fs_find；3 图片
+constexpr int kApi = 3;                       // 固件支持的接口版本（docs/app-sdk.md）：2 阅读器、fs_find；3 图片、写卡
 constexpr size_t kMaxPackage = 4 * 1024 * 1024;
 constexpr size_t kMaxWasm = 1024 * 1024;
 constexpr size_t kMaxManifest = 16 * 1024;
-const char* const kPermissions[] = {"sd.read", "media", "assistant", "keep_awake", "net"};
+const char* const kPermissions[] = {"sd.read", "sd.write", "media", "assistant", "keep_awake", "net"};
 // 预装的应用包：资源分区里的文件名（板子目录 preinstall/ 下，tools/app-sdk/build.py 打的）
 const char* const kPreinstalled[] = {"nomi.music.npk", "nomi.novel.npk", "nomi.photo.npk"};
 

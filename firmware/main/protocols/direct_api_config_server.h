@@ -37,6 +37,14 @@ using PrefixHandler = std::function<bool(const std::string& uri, bool post, cons
                                          std::string& type, std::string& out)>;
 void AddPrefixHandler(const char* prefix, PrefixHandler handler);
 
+// 一个前缀下的大文件下载（比如 "/sd/file/"）：不整个读进内存，边读边发。handler 收地址（不带 ?），
+// 先查好、调 begin(类型, 下载文件名) 发响应头（文件名空 = 浏览器里直接打开），再一块块 write（返回 false =
+// 对方断了，别再发）。没调 begin 就返回 false 回 404。要在 Start() 之前加
+using StreamBegin = std::function<void(const std::string& type, const std::string& filename)>;
+using StreamWrite = std::function<bool(const char* data, size_t len)>;
+using StreamHandler = std::function<bool(const std::string& uri, const StreamBegin& begin, const StreamWrite& write)>;
+void AddStreamHandler(const char* prefix, StreamHandler handler);
+
 }  // namespace DirectApiConfigServer
 
 #endif  // DIRECT_API_CONFIG_SERVER_H
