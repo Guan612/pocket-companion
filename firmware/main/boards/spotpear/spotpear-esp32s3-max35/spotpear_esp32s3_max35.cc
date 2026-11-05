@@ -33,6 +33,7 @@
 #include <esp_lcd_panel_io.h>
 #include <esp_lcd_panel_ops.h>
 #include <esp_lcd_st7796.h>
+#include <esp_cache.h>
 #include <esp_camera.h>
 #include <esp_heap_caps.h>
 #include <esp_lcd_touch_gt911.h>
@@ -283,9 +284,11 @@ private:
         config.pixel_format = PIXFORMAT_RGB565;
         config.frame_size = FRAMESIZE_VGA;  // 640×480，识图够清楚，JPEG 约几十 KB
         config.jpeg_quality = 12;
-        config.fb_count = 2;  // 双缓冲：拍的那帧 DMA 不会正在被覆写（单缓冲会拍到写一半的帧）
+        // 单缓冲：拿着这一帧时驱动没地方写，DMA 一定是停着的；每一帧都经过 CaptureJpeg 的手、帧尾都打得上记号
+        // （双缓冲时驱动自己丢掉的帧不过手，记号没法保证）。也省下 600KB PSRAM
+        config.fb_count = 1;
         config.fb_location = CAMERA_FB_IN_PSRAM;
-        config.grab_mode = CAMERA_GRAB_LATEST;  // 总是拿到最新的画面
+        config.grab_mode = CAMERA_GRAB_LATEST;
         camera_ = new Esp32Camera(config);
         // esp_camera_init 一结束就开始连续采集：VGA RGB565 每秒十几帧，每帧 600KB 写进 PSRAM。
         // 原来驱动的采集任务（优先级 23）用 CPU 从内部内存的 DMA 缓冲往 PSRAM 拷，抢走大量 CPU 和 PSRAM 带宽：
@@ -301,30 +304,87 @@ private:
     // 拍一张 JPEG 给看图模型。整帧大小（VGA RGB565 600KB）的临时缓冲一块都不要：PSRAM 平时只剩 1MB 左右，
     // 原来先拷一份换字节、image_to_jpeg 里又拷一份转格式，第二份就要不到了（拍照失败）。
     // 现在直接在摄像头这一帧上原地换算成 YUYV（大小一样），交给 JPEG 编码器；额外只要放 JPEG 结果的那块
+    //
+    // 花屏（2026-11-05 上机查清）：DMA 直接写 PSRAM（CONFIG_CAMERA_PSRAM_DMA）时，界面刷新（LVGL 画进 PSRAM、
+    // 屏幕 DMA 从 PSRAM 读出去）和摄像头 DMA 抢 PSRAM，摄像头接口的小 FIFO 等不及就整段丢数据（一丢几十上百行），
+    // 驱动在这个模式下不数字节，照样当整帧交出来：画面错位成几段、字节错一位的那段满屏彩色噪点，JPEG 从二十几 KB
+    // 涨到一百多 KB——大模型说"花了"，再大一点拼请求时内存不够就 abort 重启。
+    // 办法：拍照这半秒停住界面刷新（拿着显示锁），拿到帧就放开。连拍对比过：停住刷新就干净。
+    // 别用"把摄像头 DMA 通道优先级提到最高"：也能拍干净，但表情在动时屏幕那条 DMA 被饿住，一次刷屏再也完不成，
+    // LVGL 卡死在 wait_for_flushing，屏幕留一块蓝的（上机踩过）
     std::string CaptureJpeg() {
         std::lock_guard<std::mutex> lock(camera_mutex_);
         if (!camera_ready_) return "";
-        // 平时采集是停着的：开起来，先丢掉几帧——队列里压着停之前的旧帧，停的那一刻收到一半的帧也作废。
-        // 传感器一直在出图，曝光早就稳了，丢三帧就是当下的画面
-        cam_start();
+        int64_t t0 = esp_timer_get_time();
         camera_fb_t* fb = nullptr;
-        for (int i = 0; i < 4; i++) {
-            if (fb != nullptr) esp_camera_fb_return(fb);
-            fb = esp_camera_fb_get();
-            if (fb == nullptr) break;
+        int frames = 0, short_frames = 0;
+        {
+            DisplayLockGuard pause(display_);  // 停住界面刷新，见上
+            // 拿到锁时上一次刷屏的 DMA 可能还在发（整屏 60～70ms）；第一帧本来就丢掉，再等一下更稳
+            vTaskDelay(pdMS_TO_TICKS(40));
+            cam_start();
+            for (; frames < kMaxFrames; frames++) {
+                fb = esp_camera_fb_get();
+                if (fb == nullptr) break;
+                // 第一帧不信：开机后头一回帧尾还没打过记号，上次停下时收到一半的帧也会在这时交出来
+                bool usable = frames > 0 && fb->len >= sizeof(kTailMark) && !TailMarked(fb);
+                if (usable) break;
+                if (frames > 0) short_frames++;
+                ReturnFrame(fb);
+                fb = nullptr;
+            }
+            cam_stop();  // 拿着唯一的缓冲，DMA 本来就停着；关掉场同步，平时别再占 CPU 和 PSRAM 带宽
+        }  // 换算、编码不碰摄像头，界面先放开
+        if (fb == nullptr) {
+            ESP_LOGW(TAG, "Photo failed: %d frame(s), %d short", frames, short_frames);
+            return "";
         }
-        cam_stop();  // 拿到这一帧就停：编码时别再占着 CPU 和 PSRAM 带宽
-        if (fb == nullptr) return "";
         std::string out;
         if (fb->format != PIXFORMAT_RGB565 || fb->width % 2 != 0 || (reinterpret_cast<uintptr_t>(fb->buf) & 15) != 0) {
             ESP_LOGW(TAG, "Camera frame not usable: format %d, %ux%u, buf %p", fb->format,
                      static_cast<unsigned>(fb->width), static_cast<unsigned>(fb->height), fb->buf);
         } else {
-            RgbToYuyvInPlace(fb->buf, fb->width * fb->height);
-            out = EncodeYuyv(fb->buf, fb->width, fb->height);
+            // 顶上 2～3 行时不时颜色错（品红 / 绿，像字节高低位错开；2026-11-05 连拍 15 张有 6 张，暂停屏幕刷新时也有，
+            // 原因没查到，下面的行都对）：丢掉顶上一个 JPEG 块行（16 行），出 640×464，识图不受影响
+            constexpr int kSkipRows = 16;
+            uint8_t* top = fb->buf + static_cast<size_t>(fb->width) * 2 * kSkipRows;
+            int height = fb->height - kSkipRows;
+            RgbToYuyvInPlace(top, fb->width * height);
+            int quality = 80;
+            out = EncodeYuyv(top, fb->width, height, quality);
+            // 正常画面二三十 KB；太大（收坏了没拦住、细节特别多）就降质量重编：base64 后整个请求要在 PSRAM 里
+            // 拼好几份，一张 130KB 的图就可能拼不出来
+            if (out.size() > kMaxJpegBytes) {
+                quality = 50;
+                out = EncodeYuyv(top, fb->width, height, quality);
+            }
+            ESP_LOGI(TAG, "Photo %ux%d: %u bytes JPEG (q%d), %d frame(s), %d short, %d ms",
+                     static_cast<unsigned>(fb->width), height,
+                     static_cast<unsigned>(out.size()), quality, frames + 1, short_frames,
+                     static_cast<int>((esp_timer_get_time() - t0) / 1000));
+        }
+        ReturnFrame(fb);
+        return out;
+    }
+
+    static constexpr int kMaxFrames = 4;  // 正常两帧；拿着显示锁，最坏也别把界面停太久
+    static constexpr size_t kMaxJpegBytes = 96 * 1024;
+    // 帧尾记号：还帧前写在最后 16 字节，DMA 收满一整帧会把它盖掉；拿到的帧记号还在，就是收短了，丢掉再拍
+    static constexpr uint8_t kTailMark[16] = {0xA5, 0x5A, 0xC3, 0x3C, 0x96, 0x69, 0x0F, 0xF0,
+                                              0x5A, 0xA5, 0x3C, 0xC3, 0x69, 0x96, 0xF0, 0x0F};
+
+    static bool TailMarked(const camera_fb_t* fb) {
+        return memcmp(fb->buf + fb->len - sizeof(kTailMark), kTailMark, sizeof(kTailMark)) == 0;
+    }
+
+    // 还帧前打帧尾记号，并把 CPU 写过的地方（记号、原地换算的整帧）从缓存写回 PSRAM：
+    // 不写回的话，脏缓存行过后才被挤出去，会盖掉下一次 DMA 刚写进去的像素
+    static void ReturnFrame(camera_fb_t* fb) {
+        if (fb->len >= sizeof(kTailMark)) {
+            memcpy(fb->buf + fb->len - sizeof(kTailMark), kTailMark, sizeof(kTailMark));
+            esp_cache_msync(fb->buf, fb->len, ESP_CACHE_MSYNC_FLAG_DIR_C2M | ESP_CACHE_MSYNC_FLAG_UNALIGNED);
         }
         esp_camera_fb_return(fb);
-        return out;
     }
 
     // 摄像头的 RGB565 是大端：两个像素（4 字节）一组换成 Y0 Cb Y1 Cr（也是 4 字节）写回原处（BT.601 全范围）
@@ -347,13 +407,13 @@ private:
         }
     }
 
-    static std::string EncodeYuyv(const uint8_t* yuyv, int width, int height) {
+    static std::string EncodeYuyv(const uint8_t* yuyv, int width, int height, int quality) {
         jpeg_enc_config_t cfg = DEFAULT_JPEG_ENC_CONFIG();
         cfg.width = width;
         cfg.height = height;
         cfg.src_type = JPEG_PIXEL_FORMAT_YCbYCr;
         cfg.subsampling = JPEG_SUBSAMPLE_420;
-        cfg.quality = 80;
+        cfg.quality = quality;
         cfg.rotate = JPEG_ROTATE_0D;
         cfg.task_enable = false;
         jpeg_enc_handle_t enc = nullptr;

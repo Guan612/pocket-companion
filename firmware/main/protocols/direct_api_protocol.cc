@@ -57,10 +57,13 @@ bool HasPendingImage() {
     return !g_pending_image.empty();
 }
 
-std::string Base64(const std::string& data) {
+// 照片的 data URL：一次分配到位（原来 "前缀" + Base64() 要两份 base64 大小的内存）
+std::string JpegDataUrl(const std::string& data) {
     static const char kTable[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    static const char kPrefix[] = "data:image/jpeg;base64,";
     std::string out;
-    out.reserve((data.size() + 2) / 3 * 4);
+    out.reserve(sizeof(kPrefix) + (data.size() + 2) / 3 * 4);
+    out += kPrefix;
     size_t i = 0;
     for (; i + 2 < data.size(); i += 3) {
         uint32_t v = (uint8_t)data[i] << 16 | (uint8_t)data[i + 1] << 8 | (uint8_t)data[i + 2];
@@ -754,7 +757,7 @@ std::string DirectApiProtocol::Chat(const DirectApiConfig& cfg, const std::strin
             cJSON* image_part = cJSON_CreateObject();
             cJSON_AddStringToObject(image_part, "type", "image_url");
             cJSON* url = cJSON_AddObjectToObject(image_part, "image_url");
-            cJSON_AddStringToObject(url, "url", ("data:image/jpeg;base64," + Base64(image)).c_str());
+            cJSON_AddStringToObject(url, "url", JpegDataUrl(image).c_str());
             cJSON_AddItemToArray(parts, image_part);
         }
         cJSON_AddItemToArray(msgs, m);
@@ -787,7 +790,7 @@ std::string DirectApiProtocol::Chat(const DirectApiConfig& cfg, const std::strin
             cJSON* image_part = cJSON_CreateObject();
             cJSON_AddStringToObject(image_part, "type", "image_url");
             cJSON* url = cJSON_AddObjectToObject(image_part, "image_url");
-            cJSON_AddStringToObject(url, "url", ("data:image/jpeg;base64," + Base64(image)).c_str());
+            cJSON_AddStringToObject(url, "url", JpegDataUrl(image).c_str());
             cJSON_AddItemToArray(parts, image_part);
             cJSON_AddItemToArray(messages, m);
             ESP_LOGI(TAG, "Sending image (%u bytes JPEG) with question", (unsigned)image.size());
@@ -810,7 +813,20 @@ std::string DirectApiProtocol::Chat(const DirectApiConfig& cfg, const std::strin
     cJSON* req = build_request(with_tools);
     std::string reply;
     for (int round = 0; round < 4 && reply.empty(); round++) {
-        char* json = cJSON_PrintUnformatted(req);
+        // 带照片时请求有几百 KB：按估计的大小一次要够打印缓冲（cJSON 默认边打边翻倍扩，要一块两倍大的
+        // 连续内存，PSRAM 碎了就要不到）；还是要不到就报错，别拿空指针去构造 string（会 abort 重启）
+        size_t estimate = 16 * 1024 + (image.size() + 2) / 3 * 4;
+        for (const auto& h : history_) estimate += h.second.size() + 64;
+        char* json = cJSON_PrintBuffered(req, static_cast<int>(estimate), false);
+        if (json == nullptr) {
+            ESP_LOGE(TAG, "LLM request too large to print (estimate %u bytes, psram free %u, largest %u)",
+                     (unsigned)estimate, (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
+                     (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM));
+            cJSON_Delete(req);
+            history_.pop_back();
+            SetError(image.empty() ? "内存不够，请求没发出去" : "内存不够，照片没发出去");
+            return "";
+        }
         auto http = NewHttp(ep->key);
         http->SetHeader("Content-Type", "application/json");
         http->SetContent(std::string(json));
