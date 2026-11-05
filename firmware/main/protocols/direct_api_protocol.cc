@@ -46,10 +46,21 @@ constexpr const char* kDefaultImageQuestion = "你看到了什么？简单说说
 // 拍照后暂存的 JPEG，取用一次就清掉
 std::mutex g_image_mutex;
 std::string g_pending_image;
+bool g_pending_ask = false;     // 是应用「问它」挂上的（主人没开口也要问）
+std::string g_ask_question;     // 那时没开口就问这个（空 = kDefaultImageQuestion）
 
 std::string TakePendingImage() {
     std::lock_guard<std::mutex> lock(g_image_mutex);
+    g_pending_ask = false;
     return std::exchange(g_pending_image, std::string());
+}
+
+// 挂着「问它」的照片：返回 true 并给出主人没开口时要问的话
+bool PendingAsk(std::string* question) {
+    std::lock_guard<std::mutex> lock(g_image_mutex);
+    if (!g_pending_ask || g_pending_image.empty()) return false;
+    *question = g_ask_question.empty() ? std::string(kDefaultImageQuestion) : g_ask_question;
+    return true;
 }
 
 bool HasPendingImage() {
@@ -560,17 +571,20 @@ void DirectApiProtocol::RunTurn(std::string packets) {
         std::lock_guard<std::mutex> lock(mutex_);
         heard = heard_voice_;
     }
-    if (!heard && mode_ != kListeningModeManualStop) {
+    // 应用的「问它」挂着照片：主人没开口也要问（问应用给的话，或者「你看到了什么」）
+    std::string ask_question;
+    bool ask = PendingAsk(&ask_question);
+    if (!heard && mode_ != kListeningModeManualStop && !ask) {
         app.StopListening();
         return;
     }
 
     EmitJson("llm", "emotion", "thinking");
-    std::string text = Transcribe(cfg, std::move(packets));
+    std::string text = heard || mode_ == kListeningModeManualStop ? Transcribe(cfg, std::move(packets)) : "";
     if (Aborted()) return;
     // 上一轮拍的照片现在才编完、而这轮又没说话：就当在问照片的事，不然照片会一直挂着
     if (text.empty() && HasPendingImage()) {
-        text = kDefaultImageQuestion;
+        text = ask ? ask_question : kDefaultImageQuestion;
     }
     if (text.empty()) {
         EmitJson("llm", "emotion", "neutral");  // 没听清：结束"思考中"（它会一直保持到有结果）
@@ -1182,9 +1196,11 @@ std::atomic<bool> DirectApiProtocol::exit_requested_{false};
 std::function<bool(const std::string&, std::string&)> DirectApiProtocol::face_handler;
 std::function<std::string()> DirectApiProtocol::context_provider;
 
-void DirectApiProtocol::AttachImage(std::string jpeg) {
+void DirectApiProtocol::AttachImage(std::string jpeg, bool ask, std::string question) {
     std::lock_guard<std::mutex> lock(g_image_mutex);
     g_pending_image = std::move(jpeg);
+    g_pending_ask = ask;
+    g_ask_question = std::move(question);
 }
 
 std::string DirectApiProtocol::SelfTest() {

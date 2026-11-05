@@ -14,11 +14,12 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define NOMI_API 4  // 用到的最高版本写进 manifest 的 "api"。
+#define NOMI_API 5  // 用到的最高版本写进 manifest 的 "api"。
 // 2：阅读器（ui_reader 等）、text_chapters、fs_find。
 // 3：图片（ui_photo 等）、写卡（fs_write 等，权限 sd.write）、打开文件（manifest 的 opens、NOMI_EV_OPEN）、
 //    选文件（ui_files）、媒体库（library_list）
 // 4：手机连接（phone_*，权限 phone）、画布（ui_canvas、canvas_*）、屏幕常亮（screen_keep_on）
+// 5：摄像头（ui_camera、camera_shot、camera_ask，权限 camera）
 
 #define NOMI_IMPORT(name) __attribute__((import_module("env"), import_name(#name)))
 #define NOMI_EXPORT(name) __attribute__((export_name(#name)))
@@ -224,6 +225,18 @@ NOMI_IMPORT(canvas_circle) void canvas_circle(int32_t id, int32_t x, int32_t y, 
 NOMI_IMPORT(canvas_text) int32_t canvas_text(int32_t id, int32_t x, int32_t y, const char *text, int32_t size,
                                              int32_t color, int32_t align);
 NOMI_IMPORT(canvas_show) void canvas_show(int32_t id);
+
+/* ---------- 摄像头（api 5，权限 camera） ---------- */
+// 照片 640×464（横的，传感器原样）。拍照要零点几秒到一两秒
+
+// 取景器：占满当前页（这页别放别的控件，标题给空字符串），实时画面铺满整屏、由系统刷新。
+// 返回浮在画面右边那一列的 id：ui_target 它，接下来建的按钮（拍照、问它……）竖着排在那一列。页面关了预览就停
+NOMI_IMPORT(ui_camera) int32_t ui_camera(void);
+// 拍一张存成 JPEG（sd:/ 要 sd.write，上一级没有就建）。返回字节数；没插卡 NOMI_E_NO_SD，没有摄像头 NOMI_E_NOT_FOUND
+NOMI_IMPORT(camera_shot) int32_t camera_shot(const char *path);
+// 「问它」（还要 assistant）：拍一张交给大模型、叫起对话听主人问（正在对话就跟着这一轮发）；主人没开口就问
+// question（空字符串 = 「你看到了什么」）。回答在对话浮层里显示、念出来。返回照片字节数
+NOMI_IMPORT(camera_ask) int32_t camera_ask(const char *question);
 
 /* ---------- 播放（权限 media）：系统只管放"这一首"，放哪首、下一首放什么（队列）是应用的事 ---------- */
 

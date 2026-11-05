@@ -6,11 +6,11 @@
 #include "config.h"
 #include "mcp_server.h"
 #include "esp32_camera.h"
-#include "esp_jpeg_enc.h"
 #if CONFIG_DIRECT_API
 #include "direct_api_config_server.h"
 #include "direct_api_protocol.h"
 #endif
+#include "nomi_camera.h"
 #include "nomi_clock.h"
 #include "nomi_display.h"
 #include "nomi_music.h"
@@ -33,7 +33,6 @@
 #include <esp_lcd_panel_io.h>
 #include <esp_lcd_panel_ops.h>
 #include <esp_lcd_st7796.h>
-#include <esp_cache.h>
 #include <esp_camera.h>
 #include <esp_heap_caps.h>
 #include <esp_lcd_touch_gt911.h>
@@ -61,8 +60,6 @@ private:
     AdcBatteryMonitor* battery_ = nullptr;
     PowerSaveTimer* power_save_timer_ = nullptr;
     Esp32Camera* camera_ = nullptr;
-    std::mutex camera_mutex_;  // 抓拍不能和别的抓拍同时拿帧
-    bool camera_ready_ = false;  // 摄像头初始化成功（采集平时停着，抓拍时才开）
     std::atomic<bool> sleeping_{false};
     std::atomic<bool> screen_off_{false};  // 到息屏时间把背光关了（不一定在睡眠里，见 WakeScreen）
     bool keep_awake_ = false;  // 前台应用要屏幕一直亮着（导航）：休眠计时停着（只在主循环里读写）
@@ -122,6 +119,7 @@ private:
         ESP_ERROR_CHECK(esp_lcd_panel_swap_xy(panel, DISPLAY_SWAP_XY));
         ESP_ERROR_CHECK(esp_lcd_panel_mirror(panel, DISPLAY_MIRROR_X, DISPLAY_MIRROR_Y));
         ESP_ERROR_CHECK(esp_lcd_panel_disp_on_off(panel, true));
+        NomiCamera::GatePanel(panel);  // 摄像头收帧时先别刷屏（两边的 DMA 抢 PSRAM，见 nomi_camera.h）
 
         display_ = new NomiDisplay(panel_io, panel, DISPLAY_WIDTH, DISPLAY_HEIGHT,
                                    DISPLAY_OFFSET_X, DISPLAY_OFFSET_Y, DISPLAY_MIRROR_X,
@@ -284,7 +282,7 @@ private:
         config.pixel_format = PIXFORMAT_RGB565;
         config.frame_size = FRAMESIZE_VGA;  // 640×480，识图够清楚，JPEG 约几十 KB
         config.jpeg_quality = 12;
-        // 单缓冲：拿着这一帧时驱动没地方写，DMA 一定是停着的；每一帧都经过 CaptureJpeg 的手、帧尾都打得上记号
+        // 单缓冲：拿着这一帧时驱动没地方写，DMA 一定是停着的；每一帧都经过 nomi_camera 的手、帧尾都打得上记号
         // （双缓冲时驱动自己丢掉的帧不过手，记号没法保证）。也省下 600KB PSRAM
         config.fb_count = 1;
         config.fb_location = CAMERA_FB_IN_PSRAM;
@@ -294,143 +292,11 @@ private:
         // 原来驱动的采集任务（优先级 23）用 CPU 从内部内存的 DMA 缓冲往 PSRAM 拷，抢走大量 CPU 和 PSRAM 带宽：
         // 音频编码掉帧（Encode queue is full）、AFE 喂不进（Ringbuffer full）、界面滑动也跟着卡。
         // 2026-11-04 起 DMA 直接写 PSRAM（CONFIG_CAMERA_PSRAM_DMA，省下内部内存里 30KB 的 DMA 缓冲），
-        // 但一直采集还是占 PSRAM 带宽。只有大模型要看一眼时才需要画面，平时停着
+        // 但一直采集还是占 PSRAM 带宽。只有拍照、取景器开着时才需要画面，平时停着
         if (esp_camera_sensor_get() != nullptr) {
             cam_stop();
-            camera_ready_ = true;
+            NomiCamera::Init();  // 拍照、取景器都在 nomi_camera.cc
         }
-    }
-
-    // 拍一张 JPEG 给看图模型。整帧大小（VGA RGB565 600KB）的临时缓冲一块都不要：PSRAM 平时只剩 1MB 左右，
-    // 原来先拷一份换字节、image_to_jpeg 里又拷一份转格式，第二份就要不到了（拍照失败）。
-    // 现在直接在摄像头这一帧上原地换算成 YUYV（大小一样），交给 JPEG 编码器；额外只要放 JPEG 结果的那块
-    //
-    // 花屏（2026-11-05 上机查清）：DMA 直接写 PSRAM（CONFIG_CAMERA_PSRAM_DMA）时，界面刷新（LVGL 画进 PSRAM、
-    // 屏幕 DMA 从 PSRAM 读出去）和摄像头 DMA 抢 PSRAM，摄像头接口的小 FIFO 等不及就整段丢数据（一丢几十上百行），
-    // 驱动在这个模式下不数字节，照样当整帧交出来：画面错位成几段、字节错一位的那段满屏彩色噪点，JPEG 从二十几 KB
-    // 涨到一百多 KB——大模型说"花了"，再大一点拼请求时内存不够就 abort 重启。
-    // 办法：拍照这半秒停住界面刷新（拿着显示锁），拿到帧就放开。连拍对比过：停住刷新就干净。
-    // 别用"把摄像头 DMA 通道优先级提到最高"：也能拍干净，但表情在动时屏幕那条 DMA 被饿住，一次刷屏再也完不成，
-    // LVGL 卡死在 wait_for_flushing，屏幕留一块蓝的（上机踩过）
-    std::string CaptureJpeg() {
-        std::lock_guard<std::mutex> lock(camera_mutex_);
-        if (!camera_ready_) return "";
-        int64_t t0 = esp_timer_get_time();
-        camera_fb_t* fb = nullptr;
-        int frames = 0, short_frames = 0;
-        {
-            DisplayLockGuard pause(display_);  // 停住界面刷新，见上
-            // 拿到锁时上一次刷屏的 DMA 可能还在发（整屏 60～70ms）；第一帧本来就丢掉，再等一下更稳
-            vTaskDelay(pdMS_TO_TICKS(40));
-            cam_start();
-            for (; frames < kMaxFrames; frames++) {
-                fb = esp_camera_fb_get();
-                if (fb == nullptr) break;
-                // 第一帧不信：开机后头一回帧尾还没打过记号，上次停下时收到一半的帧也会在这时交出来
-                bool usable = frames > 0 && fb->len >= sizeof(kTailMark) && !TailMarked(fb);
-                if (usable) break;
-                if (frames > 0) short_frames++;
-                ReturnFrame(fb);
-                fb = nullptr;
-            }
-            cam_stop();  // 拿着唯一的缓冲，DMA 本来就停着；关掉场同步，平时别再占 CPU 和 PSRAM 带宽
-        }  // 换算、编码不碰摄像头，界面先放开
-        if (fb == nullptr) {
-            ESP_LOGW(TAG, "Photo failed: %d frame(s), %d short", frames, short_frames);
-            return "";
-        }
-        std::string out;
-        if (fb->format != PIXFORMAT_RGB565 || fb->width % 2 != 0 || (reinterpret_cast<uintptr_t>(fb->buf) & 15) != 0) {
-            ESP_LOGW(TAG, "Camera frame not usable: format %d, %ux%u, buf %p", fb->format,
-                     static_cast<unsigned>(fb->width), static_cast<unsigned>(fb->height), fb->buf);
-        } else {
-            // 顶上 2～3 行时不时颜色错（品红 / 绿，像字节高低位错开；2026-11-05 连拍 15 张有 6 张，暂停屏幕刷新时也有，
-            // 原因没查到，下面的行都对）：丢掉顶上一个 JPEG 块行（16 行），出 640×464，识图不受影响
-            constexpr int kSkipRows = 16;
-            uint8_t* top = fb->buf + static_cast<size_t>(fb->width) * 2 * kSkipRows;
-            int height = fb->height - kSkipRows;
-            RgbToYuyvInPlace(top, fb->width * height);
-            int quality = 80;
-            out = EncodeYuyv(top, fb->width, height, quality);
-            // 正常画面二三十 KB；太大（收坏了没拦住、细节特别多）就降质量重编：base64 后整个请求要在 PSRAM 里
-            // 拼好几份，一张 130KB 的图就可能拼不出来
-            if (out.size() > kMaxJpegBytes) {
-                quality = 50;
-                out = EncodeYuyv(top, fb->width, height, quality);
-            }
-            ESP_LOGI(TAG, "Photo %ux%d: %u bytes JPEG (q%d), %d frame(s), %d short, %d ms",
-                     static_cast<unsigned>(fb->width), height,
-                     static_cast<unsigned>(out.size()), quality, frames + 1, short_frames,
-                     static_cast<int>((esp_timer_get_time() - t0) / 1000));
-        }
-        ReturnFrame(fb);
-        return out;
-    }
-
-    static constexpr int kMaxFrames = 4;  // 正常两帧；拿着显示锁，最坏也别把界面停太久
-    static constexpr size_t kMaxJpegBytes = 96 * 1024;
-    // 帧尾记号：还帧前写在最后 16 字节，DMA 收满一整帧会把它盖掉；拿到的帧记号还在，就是收短了，丢掉再拍
-    static constexpr uint8_t kTailMark[16] = {0xA5, 0x5A, 0xC3, 0x3C, 0x96, 0x69, 0x0F, 0xF0,
-                                              0x5A, 0xA5, 0x3C, 0xC3, 0x69, 0x96, 0xF0, 0x0F};
-
-    static bool TailMarked(const camera_fb_t* fb) {
-        return memcmp(fb->buf + fb->len - sizeof(kTailMark), kTailMark, sizeof(kTailMark)) == 0;
-    }
-
-    // 还帧前打帧尾记号，并把 CPU 写过的地方（记号、原地换算的整帧）从缓存写回 PSRAM：
-    // 不写回的话，脏缓存行过后才被挤出去，会盖掉下一次 DMA 刚写进去的像素
-    static void ReturnFrame(camera_fb_t* fb) {
-        if (fb->len >= sizeof(kTailMark)) {
-            memcpy(fb->buf + fb->len - sizeof(kTailMark), kTailMark, sizeof(kTailMark));
-            esp_cache_msync(fb->buf, fb->len, ESP_CACHE_MSYNC_FLAG_DIR_C2M | ESP_CACHE_MSYNC_FLAG_UNALIGNED);
-        }
-        esp_camera_fb_return(fb);
-    }
-
-    // 摄像头的 RGB565 是大端：两个像素（4 字节）一组换成 Y0 Cb Y1 Cr（也是 4 字节）写回原处（BT.601 全范围）
-    static void RgbToYuyvInPlace(uint8_t* p, size_t pixels) {
-        auto clamp = [](int v) { return static_cast<uint8_t>(v < 0 ? 0 : v > 255 ? 255 : v); };
-        for (size_t i = 0; i + 1 < pixels; i += 2, p += 4) {
-            int r[2], g[2], b[2];
-            for (int k = 0; k < 2; k++) {
-                int v = (p[k * 2] << 8) | p[k * 2 + 1];
-                int r5 = v >> 11, g6 = (v >> 5) & 0x3f, b5 = v & 0x1f;
-                r[k] = (r5 << 3) | (r5 >> 2);
-                g[k] = (g6 << 2) | (g6 >> 4);
-                b[k] = (b5 << 3) | (b5 >> 2);
-            }
-            int rs = r[0] + r[1], gs = g[0] + g[1], bs = b[0] + b[1];  // 两个像素合用一份色度
-            p[0] = clamp((77 * r[0] + 150 * g[0] + 29 * b[0]) >> 8);
-            p[1] = clamp(((-43 * rs - 85 * gs + 128 * bs) >> 9) + 128);
-            p[2] = clamp((77 * r[1] + 150 * g[1] + 29 * b[1]) >> 8);
-            p[3] = clamp(((128 * rs - 107 * gs - 21 * bs) >> 9) + 128);
-        }
-    }
-
-    static std::string EncodeYuyv(const uint8_t* yuyv, int width, int height, int quality) {
-        jpeg_enc_config_t cfg = DEFAULT_JPEG_ENC_CONFIG();
-        cfg.width = width;
-        cfg.height = height;
-        cfg.src_type = JPEG_PIXEL_FORMAT_YCbYCr;
-        cfg.subsampling = JPEG_SUBSAMPLE_420;
-        cfg.quality = quality;
-        cfg.rotate = JPEG_ROTATE_0D;
-        cfg.task_enable = false;
-        jpeg_enc_handle_t enc = nullptr;
-        if (jpeg_enc_open(&cfg, &enc) != JPEG_ERR_OK) {
-            ESP_LOGW(TAG, "jpeg_enc_open failed");
-            return "";
-        }
-        constexpr int kCap = 256 * 1024;  // VGA、质量 80 一般几十 KB
-        auto* buf = static_cast<uint8_t*>(heap_caps_malloc(kCap, MALLOC_CAP_SPIRAM));
-        std::string jpeg;
-        int len = 0;
-        jpeg_error_t err = buf ? jpeg_enc_process(enc, yuyv, width * height * 2, buf, kCap, &len) : JPEG_ERR_NO_MEM;
-        if (err == JPEG_ERR_OK) jpeg.assign(reinterpret_cast<char*>(buf), len);
-        else ESP_LOGW(TAG, "JPEG encode failed: %d", static_cast<int>(err));
-        heap_caps_free(buf);
-        jpeg_enc_close(enc);
-        return jpeg;
     }
 
     // BOOT 键说话：默认按住说话（像对讲机），设置里可改成点一下开始、说完自动结束
@@ -581,6 +447,17 @@ private:
         DirectApiProtocol::face_handler = [this](const std::string& json, std::string& error) {
             return display_->PlayFace(json, error);
         };
+        // 应用的「问它」（camera_ask）：照片挂上，待机就开始对话、在说话就打断转去听、已经在听就跟着这一轮发
+        NomiCamera::ask_handler = [](std::string jpeg, const std::string& question) {
+            DirectApiProtocol::AttachImage(std::move(jpeg), true, question);
+            Application::GetInstance().Schedule([]() {
+                auto& app = Application::GetInstance();
+                auto state = app.GetDeviceState();
+                if (state == kDeviceStateIdle) app.ToggleChatState();
+                else if (state == kDeviceStateSpeaking) app.AbortSpeaking(kAbortReasonNone);
+            });
+            return true;
+        };
         // 让大模型看一眼摄像头：拍照和编码要一两秒，放到独立任务里做，别卡主循环；
         // 拍好的 JPEG 经 AttachImage 交给直连协议，由它随下一轮请求发给视觉模型（见 Chat()）
         mcp_server.AddTool("self.camera.look",
@@ -591,8 +468,8 @@ private:
                                (void)properties;
                                if (xTaskCreate(
                                        [](void* arg) {
-                                           auto* self = static_cast<SpotpearMax35Board*>(arg);
-                                           std::string jpeg = self->CaptureJpeg();
+                                           (void)arg;
+                                           std::string jpeg = NomiCamera::Capture();
                                            if (!jpeg.empty()) {
                                                DirectApiProtocol::AttachImage(std::move(jpeg));
                                            }

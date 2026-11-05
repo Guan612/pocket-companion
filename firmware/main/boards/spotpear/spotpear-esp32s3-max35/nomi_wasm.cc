@@ -4,6 +4,7 @@
 #include "nomi_book.h"
 #include "nomi_filelist.h"
 #include "nomi_files.h"
+#include "nomi_camera.h"
 #include "nomi_canvas.h"
 #include "nomi_display.h"
 #include "nomi_media.h"
@@ -1459,6 +1460,61 @@ int32_t screen_keep_on(wasm_exec_env_t env, int32_t on) {
     return 0;
 }
 
+/* ---------- 摄像头（api 5，权限 camera）：取景器、拍照存卡、问大模型 ---------- */
+
+// 取景器：占满当前页（这页别放别的控件，标题给空字符串）：实时画面铺满整屏，系统刷新。
+// 返回浮在画面右边那一列的 id：ui_target 它，接下来建的按钮竖着排在那一列
+int32_t ui_camera(wasm_exec_env_t env) {
+    Proc* p = Ctx(env);
+    if (!p->pkg->Has("camera")) return E_DENIED;
+    UiScope ui(p);
+    lv_obj_t* parent = ui.target();
+    if (!parent) return E_NO_UI;
+    lv_obj_set_style_pad_all(parent, 0, 0);
+    lv_obj_remove_flag(parent, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_t* side = nullptr;
+    AddObj(p, NomiCamera::CreateViewfinder(parent, &side));
+    lv_obj_add_flag(side, kContainer);
+    return AddObj(p, side);
+}
+
+// 拍一张存成 JPEG（640×464）：sd:/ 要 sd.write（上一级没有就建）。返回字节数；没有摄像头 NOMI_E_NOT_FOUND。
+// 要零点几秒到一两秒（开摄像头、等整帧、编码、写卡）
+int32_t camera_shot(wasm_exec_env_t env, const char* path) {
+    Proc* p = Ctx(env);
+    if (!p->pkg->Has("camera")) return E_DENIED;
+    if (!NomiCamera::Ready()) return E_NOT_FOUND;
+    int32_t err;
+    std::string dev = Resolve(p, path, true, &err);
+    if (dev.empty()) return err;
+    SdIfNeeded sd(dev);
+    if (sd.use && !*sd.use) return E_NO_SD;
+    std::string jpeg = NomiCamera::Capture();
+    if (jpeg.empty()) return E_FAIL;
+    int32_t result = E_FAIL;
+    NomiFlashIo::ForPath(dev, [&] {
+        MakeDirs(dev.substr(0, dev.rfind('/')));
+        if (FILE* f = fopen(dev.c_str(), "wb")) {
+            result = fwrite(jpeg.data(), 1, jpeg.size(), f) == jpeg.size() ? static_cast<int32_t>(jpeg.size()) : E_FAIL;
+            fclose(f);
+        }
+    });
+    if (OnSd(dev)) NomiFiles::Changed();
+    return result;
+}
+
+// 「问它」：拍一张交给大模型，叫起对话听主人问（已经在听就跟着这一轮发）；主人没开口就问 question
+// （空字符串 = 「你看到了什么」）。还要 assistant 权限。返回照片字节数
+int32_t camera_ask(wasm_exec_env_t env, const char* question) {
+    Proc* p = Ctx(env);
+    if (!p->pkg->Has("camera") || !p->pkg->Has("assistant")) return E_DENIED;
+    if (!NomiCamera::Ready() || !NomiCamera::ask_handler) return E_NOT_FOUND;
+    std::string jpeg = NomiCamera::Capture();
+    if (jpeg.empty()) return E_FAIL;
+    int32_t n = static_cast<int32_t>(jpeg.size());
+    return NomiCamera::ask_handler(std::move(jpeg), question ? question : "") ? n : E_FAIL;
+}
+
 /* ---------- 画布：应用自己画（线、实心多边形、圆、字），clear → 一样样加 → show ---------- */
 
 lv_obj_t* CanvasOf(Proc* p, int32_t id) {
@@ -1866,6 +1922,9 @@ NativeSymbol kNatives[] = {
     {"phone_connected", (void*)phone_connected, "()i", nullptr},
     {"screen_keep_on", (void*)screen_keep_on, "(i)i", nullptr},
     {"ui_canvas", (void*)ui_canvas, "(i)i", nullptr},
+    {"ui_camera", (void*)ui_camera, "()i", nullptr},
+    {"camera_shot", (void*)camera_shot, "($)i", nullptr},
+    {"camera_ask", (void*)camera_ask, "($)i", nullptr},
     {"canvas_clear", (void*)canvas_clear, "(i)", nullptr},
     {"canvas_line", (void*)canvas_line, "(i*~ii)", nullptr},
     {"canvas_fill", (void*)canvas_fill, "(i*~i)", nullptr},

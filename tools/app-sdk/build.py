@@ -16,7 +16,7 @@ import sys
 import tarfile
 
 HERE = pathlib.Path(__file__).resolve().parent
-API = 4  # 和 nomi_sdk.h 的 NOMI_API、固件 nomi_pkg.cc 的 kApi 一致
+API = 5  # 和 nomi_sdk.h 的 NOMI_API、固件 nomi_pkg.cc 的 kApi 一致
 MAX_WASM = 1024 * 1024
 
 

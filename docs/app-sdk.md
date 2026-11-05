@@ -313,6 +313,27 @@ int32_t phone_connected(void);                // 1 连着
   - 定位 `{"t":"gps","lat":…,"lon":…,"alt":…,"speed":…,"time":…}`（速度千米每小时）：先 `phone_send("{\"t\":\"gps_power\",\"status\":true}")` 让手机开始推，不用了发 `false`。
 - 手机上：Gadgetbridge 添加设备，扫到「Bangle.js Nomi」，选「不配对」；这台设备的设置里打开「使用手机的GPS数据」。
 
+### 摄像头（api 5，权限 `camera`）
+
+**系统做重活**：开关摄像头、收帧（避开屏幕刷新抢 PSRAM 造成的花屏）、缩图、编码 JPEG、交给大模型。**应用只管界面**：按钮放哪、照片存哪、什么时候问。
+
+```c
+int32_t ui_camera(void);                    // 取景器：占满当前页（标题给空字符串），实时画面铺满整屏、系统刷新；
+                                            // 返回浮在画面右边那一列的 id，ui_target 它再建按钮（竖着排）
+int32_t camera_shot(const char *path);      // 拍一张存成 JPEG（sd:/ 要 sd.write，上一级没有就建）；返回字节数
+int32_t camera_ask(const char *question);   // 「问它」（还要 assistant）：拍一张交给大模型、叫起对话听主人问；
+                                            // 主人没开口就问 question（空 = 「你看到了什么」）；返回照片字节数
+```
+
+- 照片 640×464（VGA 去掉顶上 16 行，传感器原样、横的），一张二三十到五十 KB。取景器比照片略窄（屏幕 3:2，照片略方，上下各裁约 19 行）。
+- 取景器开着时拍一张约 0.4 秒；没开时要先开摄像头、丢掉第一帧，约 0.5 秒。
+- 取景器每秒大约三四帧；页面被压在下面（开了别的页）时系统先把摄像头关掉，回来再开。同时只能有一个取景器。
+- `camera_ask`：设备待机时开始对话、在说话时打断转去听、已经在听就跟着这一轮发；回答在对话浮层里显示、念出来。
+- 没有摄像头时 `camera_shot` / `camera_ask` 返回 `NOMI_E_NOT_FOUND`，`ui_camera` 的画面处显示「没有摄像头」。
+- 大模型自己的「看一眼摄像头」（`self.camera.look`）是系统的，不经过应用、不用装相机应用。
+
+例子：`apps/camera`（相机）：取景页三个按钮（拍照、问它、照片），照片存卡上 `DCIM/`，看照片用系统的 `ui_photo`，语音指令 `shoot`。
+
 ### 网页（应用自带的设置页）
 
 有些设置在设备上不好弄：要打字（搜播客、填网址），或者要列一长串。应用可以自带一个网页：
@@ -339,6 +360,7 @@ void    web_reply(const char *text);         // 回给网页
 | `keep_awake` | 界面在前台时屏幕不睡（`screen_keep_on`，api 4） |
 | `net` | 联网（`net_get` `net_get_until`） |
 | `phone` | 手机连接（api 4）：收发 Gadgetbridge 的消息 |
+| `camera` | 摄像头（api 5）：取景器、拍照、拿照片问大模型（问还要 `assistant`） |
 
 没写在 `permissions` 里的接口，调了返回 `NOMI_E_DENIED`。
 
@@ -475,7 +497,7 @@ int32_t nomi_event(int32_t type, int32_t id, int32_t value)
 - 网页设置页的「应用」页：列表、上传安装、卸载。（v0.1 已有：设备 → 应用，还能「打开」）
 - ~~没插 SD 卡时，装在卡上的应用不出现在桌面上~~：已做（2026-11-04）。机器内部分区里记着卡上每个应用的 manifest（`/int/nomi/sdapps/<id>.json`），卡不在时照样登记、灰着；没有插卡检测脚，桌面翻到眼前（3 秒内最多一次、有卡上的应用才看）和点了灰着的应用时去挂一下卡看看。卡在但卡上没有它的也灰着（提示重新装）；卡不在时不让删卡上的应用（卡上的文件删不掉，下次插卡又冒出来）。
 
-## 13. 实现进度（v0.4）
+## 13. 实现进度（v0.5）
 
 | 部分 | 状态 |
 |---|---|
@@ -489,12 +511,13 @@ int32_t nomi_event(int32_t type, int32_t id, int32_t value)
 | 网页 | ✓ 应用自带设置页（`assets/web/`、`/app/<id>/`、`call` → `NOMI_EV_WEB`、`web_body` `web_reply`） |
 | 大模型 | ✓ manifest 的 `voice` + `self.app.command`、`voice_arg` `voice_reply` `assistant_context`；✗ `assistant_say` |
 | 手机 | ✓（api 4）蓝牙连 Gadgetbridge（装成 Bangle.js）：`phone_listen` `phone_read` `phone_send` `phone_connected`、`NOMI_EV_PHONE`；系统自己对时 |
+| 摄像头 | ✓（api 5）`ui_camera` `camera_shot` `camera_ask`（`nomi_camera.cc`：拍照、取景器、刷屏闸门） |
 | 其他 | ✓ `time_now` `timer_start` `timer_stop` `nomi_log`、`screen_keep_on`（api 4） |
 | 事件 | ✓ 点击、返回、关闭、定时器、语音、网页、播放、SHOW / HIDE；✗ 暂停 / 恢复（浮层、睡眠） |
 | 安装 | ✓ 网页上传 `.npk`、开机扫描、更新保留数据、应用管理和网页删除、机器内部的应用分区、预装应用（开机装、从 SD 卡搬数据）；✗ 自己选装在哪、挪位置、预装应用删了能恢复、从 SD 卡上的安装包装、权限确认界面 |
 | 工具 | ✓ `tools/app-sdk/`：`nomi_sdk.h`、`nomi_text.h`、`build.py`（编译 + 打包，去掉调试信息）、`wasm_info.py`（看导入导出）、`examples/counter` |
 
-| 自带应用 | ✓ `apps/music` v0.4：本地（按文件夹排队列、三种播放模式）、电台（台单在 kv 里、自带网页上增删排序、radio-browser 搜台）、播客（订阅、最新 10 期、每个播客记听到哪）、在线点歌（搜、歌词、封面）、首页卡片、自带网页（台单、订阅、音乐网站）、`play` `skip` `mode` `podcast` `subscribe` `online` `radio` 七个指令。固件里的台单 / 播客 / 在线业务已删（2026-11-03 第 ④ 步），老固件留在 NVS 里的数据不迁移（要腾地方用 `tools/erase_legacy_nvs.py` 清一次）；`apps/novel` v0.2（预装）：整张卡找 .txt 的书架（最近看的在前、读到百分之几）、阅读器、书签、目录（一批 40 章）、点中间出快速跳转（拖进度、上一章 / 下一章、目录、翻页方式五选一、回书架）、`open` `next_chapter` `prev_chapter` `chapter` 四个指令、当前页给大模型当上下文；`apps/map` v0.1（**不预装**，网页上传装在 SD 卡上）：卡上 `maps/*.nmap` 的道路（`tools/map/make_map.py` 用 OpenStreetMap 做）、车头朝上、步行 / 骑车 / 开车只画能走的路、手机导航的转向 / 距离 / 路名、手机定位的速度和轨迹 |
+| 自带应用 | ✓ `apps/music` v0.4：本地（按文件夹排队列、三种播放模式）、电台（台单在 kv 里、自带网页上增删排序、radio-browser 搜台）、播客（订阅、最新 10 期、每个播客记听到哪）、在线点歌（搜、歌词、封面）、首页卡片、自带网页（台单、订阅、音乐网站）、`play` `skip` `mode` `podcast` `subscribe` `online` `radio` 七个指令。固件里的台单 / 播客 / 在线业务已删（2026-11-03 第 ④ 步），老固件留在 NVS 里的数据不迁移（要腾地方用 `tools/erase_legacy_nvs.py` 清一次）；`apps/novel` v0.2（预装）：整张卡找 .txt 的书架（最近看的在前、读到百分之几）、阅读器、书签、目录（一批 40 章）、点中间出快速跳转（拖进度、上一章 / 下一章、目录、翻页方式五选一、回书架）、`open` `next_chapter` `prev_chapter` `chapter` 四个指令、当前页给大模型当上下文；`apps/camera` v0.1（**不预装**，网页上传装在 SD 卡上）：取景器、拍照存 `DCIM/`、看照片（删除）、问它、`shoot` 指令；`apps/map` v0.1（**不预装**，网页上传装在 SD 卡上）：卡上 `maps/*.nmap` 的道路（`tools/map/make_map.py` 用 OpenStreetMap 做）、车头朝上、步行 / 骑车 / 开车只画能走的路、手机导航的转向 / 距离 / 路名、手机定位的速度和轨迹 |
 
 源码和安装包放在哪：
 
