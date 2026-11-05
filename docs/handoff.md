@@ -71,12 +71,17 @@ python tools/app-sdk/wasm_info.py apps/music/build/app.wasm   # 看导入导出�
 `build.py` 要 zig（`pip install ziglang`，系统 Python 里有）。IDF 的 Python 环境里没有，所以固件编译时不自动打应用包。
 
 上机测试（这台电脑的环境）：
-- 串口 COM11。用 IDF venv 的 Python（有 pyserial）：`C:\Espressif\tools\python_env\idf6.1_py3.12_env\Scripts\python.exe`。打开串口前先把 DTR、RTS 设成 False，不然会复位芯片；要从开机收日志就主动拉一下 RTS。
+- 串口 COM11。用 IDF venv 的 Python（有 pyserial）：`C:\Espressif\tools\python\v6.1\venv\Scripts\python.exe`。打开串口前先把 DTR、RTS 设成 False，不然会复位芯片；要从开机收日志就主动拉一下 RTS。
 - 设备在局域网 192.168.1.40（会变，看屏幕下拉设置或串口日志 `Config page:`）。网页设置页就是这个地址。
 - 常用接口：`POST /apps/install`（请求体是 .npk）、`GET /apps.json`、`POST /app/<id>/call`（应用自己的网页请求，比如 `{"cmd":"pod_play","feed":"…"}`、`{"cmd":"station_list"}`）、`GET /app/<id>/`。固件的 `/radio/*` `/podcast/*` `/music.json` 第 ④ 步删掉了。
 - 清老固件的 NVS 数据（只做一次）：IDF 环境里 `python tools/erase_legacy_nvs.py --port COM11`（先加 `--dry-run` 看会删什么；会自动留备份，恢复 `esptool write-flash 0x9000 备份.bin`）。
 - 测 CPU：板子上临时加 `SystemInfo::PrintTaskCpuUsage(pdMS_TO_TICKS(2000))`（`system_info.h`），测完删。
 - **用户经常同时在用这台机器。上机测试会出声、切歌、重启的，先跟用户说一声。**
+
+## 同步小智上游、唤醒词（2026-11-05 从 README 挪来）
+
+- 同步上游：`git subtree pull --prefix=firmware https://github.com/78/xiaozhi-esp32.git <tag> --squash`。可能冲突的只有我们在小智文件里加的几段：`firmware/main/CMakeLists.txt`、`Kconfig.projbuild`、`application.cc`（`CONFIG_DIRECT_API` 开关），以及 `main/audio/audio_service.{h,cc}` 里给 mp3 / wav 合成和播放器用的 `PushPcmToPlaybackQueue`。
+- 唤醒词「糯米糯米」：乐鑫没有现成的 WakeNet 模型，用小智的自定义唤醒词——MultiNet7 中文命令词模型认拼音 `nuo mi nuo mi`，门槛 0.12（板子 `config.json` 里配，资源分区带 mn7_cn；改了要 `scripts/build.py` 重新生成配置、连资源分区一起刷）。MultiNet 每 32ms 要算 11ms，所以只在 VAD 判定有人说话时才喂：安静时存着最近 0.4 秒，开口时补进去，说完再多喂 0.6 秒。AFE 任务固定在核 0；建模型时的小块内存临时放 PSRAM。试过「嗨诺米」，置信度大多 0.2 上下，不如四个字稳。
 
 ## 架构速览
 
