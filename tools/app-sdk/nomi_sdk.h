@@ -19,7 +19,7 @@
 // 3：图片（ui_photo 等）、写卡（fs_write 等，权限 sd.write）、打开文件（manifest 的 opens、NOMI_EV_OPEN）、
 //    选文件（ui_files）、媒体库（library_list）
 // 4：手机连接（phone_*，权限 phone）、画布（ui_canvas、canvas_*）、屏幕常亮（screen_keep_on）
-// 5：摄像头（ui_camera、camera_shot、camera_ask，权限 camera）
+// 5：摄像头（ui_camera、camera_shot、camera_ask，权限 camera）、交给别的应用打开文件（open_file）
 
 #define NOMI_IMPORT(name) __attribute__((import_module("env"), import_name(#name)))
 #define NOMI_EXPORT(name) __attribute__((export_name(#name)))
@@ -169,6 +169,9 @@ NOMI_IMPORT(kv_set) int32_t kv_set(const char *key, const char *value);
 // （能记住），选中的应用界面挂上之后来 NOMI_EV_OPEN（新起的进程先来 SHOW）。这时用 open_path 取路径（sd:/ 开头），
 // 直接显示这个文件：小说翻到这本书、图片看这张、音乐放这首
 NOMI_IMPORT(open_path) int32_t open_path(char *buf, int32_t size);
+// （api 5）反过来：把卡上的一个文件交给系统打开（和「文件」里点它一样：默认应用 / 只有一个 / 弹出来选）。
+// 打开的应用从首页划回去时回到你。要 sd.read；没有这个文件 NOMI_E_NOT_FOUND
+NOMI_IMPORT(open_file) int32_t open_file(const char *path);
 
 // 选文件：系统的文件列表（和设备上的「文件」一个样），占当前页的一块（放在页面里，跟着页面上下滚）。从 dir
 // （sd:/ 开头，也是最上能到哪，"sd:/" 是整张卡）往下一层层点，顶上是路径和「上一级」。只列 exts 里的扩展名

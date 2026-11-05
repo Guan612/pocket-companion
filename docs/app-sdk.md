@@ -210,6 +210,7 @@ SD 卡由系统按需挂载（见 `nomi_sdcard.h`）：没插卡时 `sd:/` 的�
 
 - **打开文件**：manifest 的 `opens` 声明能开哪些扩展名。在「文件」里点了文件（或网页上点「设备上打开」）时，系统找能开的应用：记住了默认的用默认的；只有一个就用它；好几个就弹出来选，能勾「以后 .xxx 都用它」（应用管理里能清掉，应用删了也清掉）。选中的应用界面挂上之后收到 `NOMI_EV_OPEN`（新起的进程先来 `NOMI_EV_SHOW`），用 `open_path(buf, size)` 取路径（`sd:/` 开头），直接显示这个文件。
 - **选文件**：`ui_files(dir, exts, flags)` 在当前页放一个系统的文件列表（和「文件」一个样子）：从 `dir` 往下一层层点，顶上有路径和「上一级」，只列 `exts` 里的扩展名（`"mp3,flac"`，空 = 都列）。点了文件来 `NOMI_EV_FILE`（value 0）；`flags` 有 `NOMI_FILES_PICK_DIR` 时每层多一行「选这个文件夹」（value 1）。`files_picked(buf, size)` 取路径。
+- **交给别的应用打开**（api 5）：`open_file(path)` 把卡上的一个文件交给系统打开，和「文件」里点它走同一套（默认应用 / 只有一个 / 弹出来选）。打开的应用从首页划回去时回到你（只记一层），不回桌面。要 `sd.read`；没有这个文件返回 `NOMI_E_NOT_FOUND`。例子：相机的「照片」把最新那张交给图片应用。
 - **媒体库**：`library_list(kind, first, buf, size)`：系统把整张卡扫一遍，记下歌（`NOMI_LIB_AUDIO`：mp3 flac wav aac m4a）、书（`NOMI_LIB_BOOK`：txt）、图片（`NOMI_LIB_IMAGE`：jpg jpeg png）。返回这一类一共几个，`buf` 里从第 `first` 个起一行一个「`sd:/路径` TAB 大小」，按文件夹排。结果存在卡上 `nomi/cache/media/`：换了卡、剩余空间变了（关机期间在电脑上改过）、系统自己改过卡上的东西才重扫；kind 加 `NOMI_LIB_RESCAN` 强制重扫（给用户一个「重新找」）。应用别再自己整卡找（`fs_find` 留着兼容）。
 
 ### 播放（权限 `media`）
@@ -332,7 +333,7 @@ int32_t camera_ask(const char *question);   // 「问它」（还要 assistant�
 - 没有摄像头时 `camera_shot` / `camera_ask` 返回 `NOMI_E_NOT_FOUND`，`ui_camera` 的画面处显示「没有摄像头」。
 - 大模型自己的「看一眼摄像头」（`self.camera.look`）是系统的，不经过应用、不用装相机应用。
 
-例子：`apps/camera`（相机）：取景页三个按钮（拍照、问它、照片），照片存卡上 `DCIM/`，看照片用系统的 `ui_photo`，语音指令 `shoot`。
+例子：`apps/camera`（相机）：取景页三个按钮（拍照、问它、照片），照片存卡上 `DCIM/`；看照片不自己做，「照片」用 `open_file` 交给图片应用（打开 DCIM 相册、翻到最新那张，划回来回到相机）；语音指令 `shoot`。
 
 ### 网页（应用自带的设置页）
 
@@ -511,13 +512,13 @@ int32_t nomi_event(int32_t type, int32_t id, int32_t value)
 | 网页 | ✓ 应用自带设置页（`assets/web/`、`/app/<id>/`、`call` → `NOMI_EV_WEB`、`web_body` `web_reply`） |
 | 大模型 | ✓ manifest 的 `voice` + `self.app.command`、`voice_arg` `voice_reply` `assistant_context`；✗ `assistant_say` |
 | 手机 | ✓（api 4）蓝牙连 Gadgetbridge（装成 Bangle.js）：`phone_listen` `phone_read` `phone_send` `phone_connected`、`NOMI_EV_PHONE`；系统自己对时 |
-| 摄像头 | ✓（api 5）`ui_camera` `camera_shot` `camera_ask`（`nomi_camera.cc`：拍照、取景器、刷屏闸门） |
+| 摄像头 | ✓（api 5）`ui_camera` `camera_shot` `camera_ask`（`nomi_camera.cc`：拍照、取景器、刷屏闸门）；`open_file`（交给别的应用打开，划回来回到你） |
 | 其他 | ✓ `time_now` `timer_start` `timer_stop` `nomi_log`、`screen_keep_on`（api 4） |
 | 事件 | ✓ 点击、返回、关闭、定时器、语音、网页、播放、SHOW / HIDE；✗ 暂停 / 恢复（浮层、睡眠） |
 | 安装 | ✓ 网页上传 `.npk`、开机扫描、更新保留数据、应用管理和网页删除、机器内部的应用分区、预装应用（开机装、从 SD 卡搬数据）；✗ 自己选装在哪、挪位置、预装应用删了能恢复、从 SD 卡上的安装包装、权限确认界面 |
 | 工具 | ✓ `tools/app-sdk/`：`nomi_sdk.h`、`nomi_text.h`、`build.py`（编译 + 打包，去掉调试信息）、`wasm_info.py`（看导入导出）、`examples/counter` |
 
-| 自带应用 | ✓ `apps/music` v0.4：本地（按文件夹排队列、三种播放模式）、电台（台单在 kv 里、自带网页上增删排序、radio-browser 搜台）、播客（订阅、最新 10 期、每个播客记听到哪）、在线点歌（搜、歌词、封面）、首页卡片、自带网页（台单、订阅、音乐网站）、`play` `skip` `mode` `podcast` `subscribe` `online` `radio` 七个指令。固件里的台单 / 播客 / 在线业务已删（2026-11-03 第 ④ 步），老固件留在 NVS 里的数据不迁移（要腾地方用 `tools/erase_legacy_nvs.py` 清一次）；`apps/novel` v0.2（预装）：整张卡找 .txt 的书架（最近看的在前、读到百分之几）、阅读器、书签、目录（一批 40 章）、点中间出快速跳转（拖进度、上一章 / 下一章、目录、翻页方式五选一、回书架）、`open` `next_chapter` `prev_chapter` `chapter` 四个指令、当前页给大模型当上下文；`apps/camera` v0.1（**不预装**，网页上传装在 SD 卡上）：取景器、拍照存 `DCIM/`、看照片（删除）、问它、`shoot` 指令；`apps/map` v0.1（**不预装**，网页上传装在 SD 卡上）：卡上 `maps/*.nmap` 的道路（`tools/map/make_map.py` 用 OpenStreetMap 做）、车头朝上、步行 / 骑车 / 开车只画能走的路、手机导航的转向 / 距离 / 路名、手机定位的速度和轨迹 |
+| 自带应用 | ✓ `apps/music` v0.4：本地（按文件夹排队列、三种播放模式）、电台（台单在 kv 里、自带网页上增删排序、radio-browser 搜台）、播客（订阅、最新 10 期、每个播客记听到哪）、在线点歌（搜、歌词、封面）、首页卡片、自带网页（台单、订阅、音乐网站）、`play` `skip` `mode` `podcast` `subscribe` `online` `radio` 七个指令。固件里的台单 / 播客 / 在线业务已删（2026-11-03 第 ④ 步），老固件留在 NVS 里的数据不迁移（要腾地方用 `tools/erase_legacy_nvs.py` 清一次）；`apps/novel` v0.2（预装）：整张卡找 .txt 的书架（最近看的在前、读到百分之几）、阅读器、书签、目录（一批 40 章）、点中间出快速跳转（拖进度、上一章 / 下一章、目录、翻页方式五选一、回书架）、`open` `next_chapter` `prev_chapter` `chapter` 四个指令、当前页给大模型当上下文；`apps/camera` v0.2（**不预装**，网页上传装在 SD 卡上）：取景器、拍照存 `DCIM/`、「照片」交给图片应用、问它、`shoot` 指令；`apps/map` v0.1（**不预装**，网页上传装在 SD 卡上）：卡上 `maps/*.nmap` 的道路（`tools/map/make_map.py` 用 OpenStreetMap 做）、车头朝上、步行 / 骑车 / 开车只画能走的路、手机导航的转向 / 距离 / 路名、手机定位的速度和轨迹 |
 
 源码和安装包放在哪：
 

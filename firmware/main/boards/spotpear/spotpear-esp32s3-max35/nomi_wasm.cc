@@ -10,6 +10,7 @@
 #include "nomi_media.h"
 #include "nomi_flash_io.h"
 #include "nomi_music.h"
+#include "nomi_open.h"
 #include "nomi_phone.h"
 #include "nomi_photo.h"
 #include "nomi_pkg.h"
@@ -1806,6 +1807,24 @@ void assistant_context(wasm_exec_env_t env, const char* text) {
     p->context = text ? std::string(text).substr(0, 600) : "";
 }
 
+// （api 5）用系统的打开方式打开卡上的一个文件：和「文件」里点它一样（记住的默认应用 / 只有一个就用它 /
+// 好几个弹出来选）。打开的应用从首页划回去时回到你（相机的「照片」交给图片应用看）。要 sd.read
+int32_t open_file(wasm_exec_env_t env, const char* path) {
+    Proc* p = Ctx(env);
+    int32_t err;
+    std::string dev = Resolve(p, path, false, &err);
+    if (dev.empty()) return err;
+    if (dev.rfind("/sd/", 0) != 0) return E_DENIED;  // 只开卡上的（data:/ pkg:/ 别的应用读不到）
+    SdIfNeeded sd(dev);
+    if (sd.use && !*sd.use) return E_NO_SD;
+    struct stat st;
+    if (stat(dev.c_str(), &st) != 0) return E_NOT_FOUND;
+    DisplayLockGuard lock(display());
+    NomiOpen::Open(dev.substr(4));
+    nomi_app_set_return(p->pkg->id.c_str());
+    return 0;
+}
+
 // NOMI_EV_OPEN 要打开的文件（sd:/ 开头）
 int32_t open_path(wasm_exec_env_t env, char* buf, uint32_t size) {
     Proc* p = Ctx(env);
@@ -1957,6 +1976,7 @@ NativeSymbol kNatives[] = {
     {"assistant_context", (void*)assistant_context, "($)", nullptr},
     {"voice_arg", (void*)voice_arg, "(*~)i", nullptr},
     {"open_path", (void*)open_path, "(*~)i", nullptr},
+    {"open_file", (void*)open_file, "($)i", nullptr},
     {"voice_reply", (void*)voice_reply, "($i)", nullptr},
     {"web_body", (void*)voice_arg, "(*~)i", nullptr},
     {"web_reply", (void*)web_reply, "($)", nullptr},

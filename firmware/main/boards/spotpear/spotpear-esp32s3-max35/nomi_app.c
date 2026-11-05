@@ -23,6 +23,7 @@
 static lv_obj_t *s_layer;  // 应用层：全屏，没开应用（或睡着）时藏着
 static lv_obj_t *s_root;   // 开着的应用的界面
 static const nomi_app_t *s_app;
+static const nomi_app_t *s_return_to;  // 从首页划回去时回到它（nomi_app_set_return），关应用时清掉
 static bool s_hidden;
 static lv_obj_t *s_grid;  // 桌面
 static const nomi_app_t *s_apps[MAX_APPS + 1];
@@ -273,6 +274,7 @@ static void close_app(bool async)
     if (!s_app) return;
     const nomi_app_t *app = s_app;
     s_app = NULL;
+    s_return_to = NULL;
     if (app->close) app->close(app);
     if (s_root) {
         lv_anim_delete(s_root, set_root_x);
@@ -286,7 +288,9 @@ static void close_app(bool async)
 static void on_slid_out(lv_anim_t *a)
 {
     (void)a;
+    const nomi_app_t *back = s_return_to;  // close_app 会清掉它
     close_app(true);
+    if (back && !back->dimmed) nomi_app_open(back->id);
 }
 
 // 应用里的左边缘：按住往右拖，整个应用跟着手走；松手时拖够了就返回，不够就弹回去
@@ -390,6 +394,12 @@ bool nomi_app_open(const char *id)
 void nomi_app_close(void) { close_app(true); }
 
 const nomi_app_t *nomi_app_current(void) { return s_app; }
+
+void nomi_app_set_return(const char *caller)
+{
+    const nomi_app_t *app = caller ? find_app(caller) : NULL;
+    s_return_to = app && app != s_app ? app : NULL;
+}
 
 void nomi_apps_set_hidden(bool hidden)
 {

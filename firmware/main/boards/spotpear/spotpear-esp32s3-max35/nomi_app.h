@@ -73,6 +73,9 @@ const nomi_app_t *const *nomi_apps_list(void);
 bool nomi_app_open(const char *id);
 void nomi_app_close(void);
 const nomi_app_t *nomi_app_current(void);  // 开着的应用，没有为 NULL
+// 现在开着的应用是 caller 叫起来的（应用里调 open_file）：主人从它首页划回去时回到 caller，不回桌面。只记一层；
+// 开着的就是 caller 自己（比如弹了「用什么打开」还没选）时不记。显示锁里调
+void nomi_app_set_return(const char *caller);
 
 // 睡着时藏起应用层（应用不关），醒了再露出来
 void nomi_apps_set_hidden(bool hidden);
