@@ -3,8 +3,8 @@
 // 系统给能力：手机连接（phone_*：蓝牙收 Gadgetbridge 的消息）、画布（ui_canvas、canvas_*）、读卡、屏幕常亮。
 // 应用管业务：
 // - 道路：卡上 maps/*.nmap（电脑上用 tools/map/make_map.py 从 OpenStreetMap 做），按定位读周围 3×3 块（约 3 公里
-//   见方）。车头朝上画：自己的位置固定在下方，地图跟着朝向转。按出行方式（步行 / 骑车 / 开车）只画能走的路，
-//   缩放也跟着变（步行看近、开车看远）。走过的轨迹叠在上面。
+//   见方）。车头朝上画：自己的位置固定在下方，地图跟着朝向转。按出行方式（步行 / 骑车 / 开车）画能走的路——
+//   能走的亮、不能走的压暗垫底（切换时一眼能看出哪些路变了），缩放也跟着变（步行看近、开车看远）。走过的轨迹叠在上面。
 // - 导航：手机上用 OsmAnd 或 CoMaps 导航，Gadgetbridge 把转向、距离、路名、到达时间转过来，放在底栏。
 //   Gadgetbridge 不给路线形状，所以要走的那条路画不出来高亮。
 // - 定位：手机 GPS（Gadgetbridge 里给这台设备打开「使用手机的GPS数据」）。界面挂着时让手机推、拿下时停；
@@ -43,7 +43,7 @@ static int32_t g_asked_tick = -1000;
 // 出行方式
 static int g_mode;
 static const char *const kModeNames[] = {"步行", "骑车", "开车"};
-static const char *const kModeSubs[] = {"人行道、小路都画，看近一点", "画自行车能走的路", "只画车走的路，看远一点"};
+static const char *const kModeSubs[] = {"人行道、小路都画，看近一点", "亮的是自行车能走的路", "亮的是车能走的路，看远一点"};
 static const int kModeBits[] = {1, 2, 4};
 static const double kModeScale[] = {1.1, 0.65, 0.38};  // 每米几个像素
 static int32_t g_mode_rows[3];
@@ -479,9 +479,10 @@ static void draw_arrow(const Box *b, const char *a)
 
 static int fresh(void) { return g_fix && g_tick - g_fix_tick <= FRESH_S; }
 
-// 道路的样子：0 主干、1 次干、2 支路、3 小路
+// 道路的样子：0 主干、1 次干、2 支路、3 小路；不能走的压暗到 55% 垫底，亮暗是「这个模式能不能走」的信号
 static const int kRoadWidth[] = {7, 5, 3, 2};
-static const int kRoadColor[] = {0x8e94a3, 0x6b7180, 0x4b505e, 0x3b404c};
+static const int kRoadColor[] = {0x8e94a3, 0x6b7180, 0x4b505e, 0x474d5a};
+static const int kRoadGhost[] = {0x4e5159, 0x3a3e46, 0x292c33, 0x272a31};
 
 // 车头朝上：自己在 (cx, cy)，朝向指向屏幕上方；scale 是每米几个像素。h_top 以下才画（底栏不画）
 static void draw_roads(int cx, int cy, double scale, int bottom)
@@ -490,34 +491,37 @@ static void draw_roads(int cx, int cy, double scale, int bottom)
     double h = g_heading >= 0 ? g_heading : 0, ch = dcos(h), sh = dsin(h);
     double plat = g_lat * 1e5, plon = g_lon * 1e5;
     int bit = kModeBits[g_mode];
-    for (int cls = 3; cls >= 0; cls--) {  // 小路先画，主干压在上面
-        for (int t = 0; t < g_tile_n; t++) {
-            const uint8_t *p = g_tiles + g_tile[t].off, *end = p + g_tile[t].len;
-            double base_lat = g_tile[t].lat_i * 1000.0 - plat, base_lon = g_tile[t].lon_i * 1000.0 - plon;
-            int count = (int)rd16(p);
-            p += 2;
-            for (int i = 0; i < count && p + 4 <= end; i++) {
-                int c = p[0], modes = p[1], n = (int)rd16(p + 2);
-                const uint8_t *q = p + 4;
-                p = q + n * 4;
-                if (p > end) break;
-                if (c != cls || !(modes & bit) || n < 2) continue;
-                if (n > PTS_MAX) n = PTS_MAX;
-                int32_t minx = 1 << 30, maxx = -(1 << 30), miny = 1 << 30, maxy = -(1 << 30);
-                for (int k = 0; k < n; k++) {
-                    double dx = (base_lon + (int16_t)rd16(q + k * 4)) * m_lon;
-                    double dy = (base_lat + (int16_t)rd16(q + k * 4 + 2)) * m_lat;
-                    double rx = dx * ch - dy * sh, ry = dx * sh + dy * ch;
-                    int32_t sx = cx + (int32_t)(rx * scale), sy = cy - (int32_t)(ry * scale);
-                    g_pts[k * 2] = sx;
-                    g_pts[k * 2 + 1] = sy;
-                    if (sx < minx) minx = sx;
-                    if (sx > maxx) maxx = sx;
-                    if (sy < miny) miny = sy;
-                    if (sy > maxy) maxy = sy;
+    for (int pass = 0; pass < 2; pass++) {  // 先画不能走的（暗），能走的亮线压在上面；小路先画，主干最上
+        for (int cls = 3; cls >= 0; cls--) {
+            for (int t = 0; t < g_tile_n; t++) {
+                const uint8_t *p = g_tiles + g_tile[t].off, *end = p + g_tile[t].len;
+                double base_lat = g_tile[t].lat_i * 1000.0 - plat, base_lon = g_tile[t].lon_i * 1000.0 - plon;
+                int count = (int)rd16(p);
+                p += 2;
+                for (int i = 0; i < count && p + 4 <= end; i++) {
+                    int c = p[0], modes = p[1], n = (int)rd16(p + 2);
+                    const uint8_t *q = p + 4;
+                    p = q + n * 4;
+                    if (p > end) break;
+                    int ok = (modes & bit) != 0;
+                    if (c != cls || n < 2 || ok != (pass == 1)) continue;
+                    if (n > PTS_MAX) n = PTS_MAX;
+                    int32_t minx = 1 << 30, maxx = -(1 << 30), miny = 1 << 30, maxy = -(1 << 30);
+                    for (int k = 0; k < n; k++) {
+                        double dx = (base_lon + (int16_t)rd16(q + k * 4)) * m_lon;
+                        double dy = (base_lat + (int16_t)rd16(q + k * 4 + 2)) * m_lat;
+                        double rx = dx * ch - dy * sh, ry = dx * sh + dy * ch;
+                        int32_t sx = cx + (int32_t)(rx * scale), sy = cy - (int32_t)(ry * scale);
+                        g_pts[k * 2] = sx;
+                        g_pts[k * 2 + 1] = sy;
+                        if (sx < minx) minx = sx;
+                        if (sx > maxx) maxx = sx;
+                        if (sy < miny) miny = sy;
+                        if (sy > maxy) maxy = sy;
+                    }
+                    if (maxx < -20 || minx > 500 || maxy < -20 || miny > bottom + 20) continue;  // 不在屏幕上
+                    line(g_pts, n, kRoadWidth[cls], ok ? kRoadColor[cls] : kRoadGhost[cls]);
                 }
-                if (maxx < -20 || minx > 500 || maxy < -20 || miny > bottom + 20) continue;  // 不在屏幕上
-                line(g_pts, n, kRoadWidth[cls], kRoadColor[cls]);
             }
         }
     }
