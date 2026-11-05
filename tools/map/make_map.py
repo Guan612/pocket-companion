@@ -28,8 +28,8 @@ import time
 import urllib.parse
 import urllib.request
 
-MIRRORS = ['https://overpass-api.de/api/interpreter', 'https://overpass.private.coffee/api/interpreter',
-           'https://maps.mail.ru/osm/tools/overpass/api/interpreter']
+MIRRORS = ['https://maps.mail.ru/osm/tools/overpass/api/interpreter', 'https://overpass-api.de/api/interpreter',
+           'https://overpass.private.coffee/api/interpreter']
 CLASS = {}
 for k in ('motorway', 'trunk', 'primary', 'motorway_link', 'trunk_link', 'primary_link'):
     CLASS[k] = 0
@@ -59,22 +59,38 @@ def modes_of(tags):
     return m
 TILE = 0.01    # 一块多大（度）
 UNIT = 1e-5    # 点的单位（度），约 1 米
-CHUNK = 0.04   # 一次问 Overpass 多大一片（度），太大会超时
+CHUNK = 0.04   # 默认一次问 Overpass 多大一片（度）；公共服务器每次请求光排队就要几十秒，大范围用 --chunk 0.12 省时间
 
 
-def fetch(s, w, n, e):
+_good = 0  # 上次成功的镜像，下一片先问它
+
+
+def fetch(s, w, n, e, cache_dir):
+    """取一片的路。结果存进 cache_dir，重跑时取过的片直接读（大范围几百片，公共 Overpass 时不时 502 / 超时）"""
+    global _good
+    path = os.path.join(cache_dir, '%.3f_%.3f_%.3f_%.3f.json' % (s, w, n, e))
+    if os.path.exists(path):
+        return json.load(open(path, encoding='utf-8'))
     q = ('[out:json][timeout:120];way["highway"~"^(%s)$"](%.5f,%.5f,%.5f,%.5f);out tags geom;'
          % ('|'.join(CLASS), s, w, n, e))
     data = urllib.parse.urlencode({'data': q}).encode()
-    for attempt in range(6):
-        url = MIRRORS[attempt % len(MIRRORS)]
+    for attempt in range(20):
+        k = (_good + attempt) % len(MIRRORS)
+        url = MIRRORS[k]
         try:
             req = urllib.request.Request(url, data=data, headers={'User-Agent': 'pocket-companion-make-map/1'})
-            return json.load(urllib.request.urlopen(req, timeout=180))['elements']
-        except Exception as ex:  # 忙、超时：换一个镜像再来
+            elements = json.load(urllib.request.urlopen(req, timeout=180))['elements']
+        except Exception as ex:  # 忙、超时、限流：换一个镜像，越等越久
             print(f'  {url} 没成（{type(ex).__name__}），重试', file=sys.stderr)
-            time.sleep(5 + attempt * 5)
-    sys.exit('Overpass 一直不通，过会儿再试')
+            time.sleep(min(60, 5 + attempt * 5))
+            continue
+        _good = k
+        os.makedirs(cache_dir, exist_ok=True)
+        with open(path + '.tmp', 'w', encoding='utf-8') as f:
+            json.dump(elements, f)
+        os.replace(path + '.tmp', path)
+        return elements
+    sys.exit('Overpass 一直不通，过会儿再试（取到的片已存好，重跑接着取）')
 
 
 def clip(seg, x0, y0, x1, y1):
@@ -120,18 +136,20 @@ def main():
     ap.add_argument('--bbox', required=True, help='南,西,北,东（度），比如 30.62,104.02,30.70,104.12')
     ap.add_argument('--out', default='build/maps', help='输出到哪个文件夹')
     ap.add_argument('--upload', help='设备的 IP：做好直接传到卡上的 maps/')
+    ap.add_argument('--chunk', type=float, default=CHUNK, help='一次问多大一片（度），默认 %(default)s；城区太大会超时')
     args = ap.parse_args()
     s, w, n, e = (float(v) for v in args.bbox.split(','))
     if not (s < n and w < e) or (n - s) * (e - w) > 1:
         sys.exit('bbox 不对，或者太大（最多 1 平方度）')
 
     ways = {}
-    rows_q, cols_q = math.ceil((n - s) / CHUNK - 1e-9), math.ceil((e - w) / CHUNK - 1e-9)  # 小数累加会多出一排空框
+    chunk = args.chunk
+    rows_q, cols_q = math.ceil((n - s) / chunk - 1e-9), math.ceil((e - w) / chunk - 1e-9)  # 小数累加会多出一排空框
     for i in range(rows_q):
         for j in range(cols_q):
-            box = (s + i * CHUNK, w + j * CHUNK, min(s + (i + 1) * CHUNK, n), min(w + (j + 1) * CHUNK, e))
-            print('取 %.3f,%.3f – %.3f,%.3f' % box)
-            for el in fetch(*box):
+            box = (s + i * chunk, w + j * chunk, min(s + (i + 1) * chunk, n), min(w + (j + 1) * chunk, e))
+            print('取 %.3f,%.3f – %.3f,%.3f' % box, flush=True)
+            for el in fetch(*box, os.path.join(args.out, 'cache', args.name)):
                 if el.get('type') == 'way' and el.get('geometry'):
                     ways[el['id']] = el
     print(f'{len(ways)} 条路')
