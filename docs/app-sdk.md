@@ -376,8 +376,8 @@ void    web_reply(const char *text);         // 回给网页
 
 - **更新**：装同一个 `id` 的新版本，覆盖程序，**保留数据**。
 - **卸载**：删程序和数据，删之前确认一次。
-- **预装应用**：跟着固件走，包（`.npk`）打在资源分区里（板子目录的 `preinstall/`）。开机时，资源分区里的包比机器里装着的新、或者还没装，就装进机器内部的应用分区；SD 卡上装过同一个应用的，把它的 `data/` 搬过来，再删掉卡上那份。现在不能删（应用管理和网页上都没有删除）；从网页装同一个 id 的新版本能盖过它，下次固件里的版本更新时又换回来。
-  - 改了预装应用要重新打包放进去：`python tools/app-sdk/build.py apps/music -o firmware/main/boards/spotpear/spotpear-esp32s3-max35/preinstall/nomi.music.npk`（固件编译时不打包：IDF 的 Python 环境里没有 zig），在 `nomi_pkg.cc` 的 `kPreinstalled` 里登记。
+- **预装应用**：跟着固件走，包（`.npk`）打在资源分区里（`firmware/main/nomi/preinstall/`，按固件开着的能力挑）。开机时，资源分区里的包比机器里装着的新、或者还没装，就装进机器内部的应用分区；SD 卡上装过同一个应用的，把它的 `data/` 搬过来，再删掉卡上那份。现在不能删（应用管理和网页上都没有删除）；从网页装同一个 id 的新版本能盖过它，下次固件里的版本更新时又换回来。
+  - 改了预装应用要重新打包放进去：`python tools/app-sdk/build.py apps/music -o firmware/main/nomi/preinstall/nomi.music.npk`（固件编译时不打包：IDF 的 Python 环境里没有 zig），在 `nomi_pkg.cc` 的 `kPreinstalled` 里登记。
 
 ## 8. 安装位置和存储管理
 

@@ -25,7 +25,8 @@ static lv_obj_t *s_root;   // 开着的应用的界面
 static const nomi_app_t *s_app;
 static const nomi_app_t *s_return_to;  // 从首页划回去时回到它（nomi_app_set_return），关应用时清掉
 static bool s_hidden;
-static lv_obj_t *s_grid;  // 桌面
+static lv_obj_t *s_grid;  // 桌面（没有桌面那一格时为 NULL）
+static bool s_appmgr = true;  // 桌面上有没有「应用管理」（没有应用平台就没有）
 static const nomi_app_t *s_apps[MAX_APPS + 1];
 static int s_app_count;
 static const lv_font_t *s_font;
@@ -346,7 +347,7 @@ static void on_indev_pressed(lv_event_t *e)
 
 static const nomi_app_t *find_app(const char *id)
 {
-    if (strcmp(id, kAppMgr.id) == 0) return &kAppMgr;
+    if (strcmp(id, kAppMgr.id) == 0) return s_appmgr ? &kAppMgr : NULL;
     for (int i = 0; i < s_app_count; i++) {
         if (strcmp(s_apps[i]->id, id) == 0) return s_apps[i];
     }
@@ -472,7 +473,13 @@ static void rebuild_grid(void)
     if (!s_grid) return;
     lv_obj_clean(s_grid);
     for (int i = 0; i < s_app_count; i++) add_cell(s_apps[i]);
-    add_cell(&kAppMgr);
+    if (s_appmgr) add_cell(&kAppMgr);
+}
+
+void nomi_apps_set_appmgr(bool on)
+{
+    s_appmgr = on;
+    rebuild_grid();
 }
 
 void nomi_apps_add(const nomi_app_t *app)
@@ -524,6 +531,7 @@ static void on_launcher_edge(lv_event_t *e)
 
 static void build_launcher(lv_obj_t *tile)
 {
+    if (!tile) return;  // 没有桌面：应用（比如语音打开的）照样盖在卡片上，只是没处点
     s_grid = lv_obj_create(tile);
     lv_obj_remove_style_all(s_grid);
     lv_obj_set_size(s_grid, LV_PCT(100), LV_PCT(100));

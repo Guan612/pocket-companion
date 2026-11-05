@@ -1,6 +1,8 @@
 #include "nomi_font.h"
 
+#if CONFIG_NOMI_SDCARD
 #include "nomi_sdcard.h"
+#endif
 
 #include <dirent.h>
 #include <esp_log.h>
@@ -24,6 +26,7 @@ const lv_font_t* s_base = nullptr;
 lv_font_t s_reading;
 lv_font_t* s_ttf = nullptr;
 int s_users = 0;
+#if CONFIG_NOMI_SDCARD
 std::unique_ptr<NomiSdCard::Use> s_sd;  // 字体文件开着的时候卡一直挂着
 
 std::string FindTtf() {
@@ -41,6 +44,7 @@ std::string FindTtf() {
     std::sort(names.begin(), names.end());
     return std::string(kFontDir) + "/" + names[0];
 }
+#endif  // CONFIG_NOMI_SDCARD
 
 }  // namespace
 
@@ -55,6 +59,7 @@ const lv_font_t* AcquireReading() {
     if (s_users++ > 0) return &s_reading;
     s_reading = *s_base;
     s_reading.fallback = nullptr;
+#if CONFIG_NOMI_SDCARD
     s_sd = std::make_unique<NomiSdCard::Use>();
     std::string path = *s_sd ? FindTtf() : "";
     if (!path.empty()) {
@@ -75,6 +80,7 @@ const lv_font_t* AcquireReading() {
         }
     }
     if (!s_ttf) s_sd.reset();  // 没用上卡上的字体：不占着卡
+#endif
     return &s_reading;
 }
 
@@ -85,7 +91,9 @@ void ReleaseReading() {
         lv_tiny_ttf_destroy(s_ttf);
         s_ttf = nullptr;
     }
+#if CONFIG_NOMI_SDCARD
     s_sd.reset();
+#endif
 }
 
 }  // namespace NomiFont

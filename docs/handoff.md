@@ -22,19 +22,20 @@ Pocket Companion 是一个桌面语音伙伴：底座是小智 xiaozhi-esp32 v2.
 
 | 位置 | 是什么 |
 |---|---|
-| `firmware/main/boards/spotpear/spotpear-esp32s3-max35/` | 这块板子的全部自研代码（下面几行都在这里） |
-| `nomi_wasm.cc/.h` | 应用运行时：进程、所有系统接口（`ui_*` `media_*` `net_*` `kv_*` `voice_*` `web_*`）、语音 / 网页请求转给应用 |
-| `nomi_pkg.cc/.h` | 包管理：安装（tar 流）、扫描、预装、删除、应用网页 `/app/<id>/`、内部分区挂载 |
-| `nomi_flash_io.cc/.h` | 替栈在 PSRAM 的任务读写内部闪存（见「踩过的坑」） |
-| `nomi_radio.cc/.h` | 系统播放器：收流、本地文件（FLAC / WAV / MP3）、m4a、解码、对话时让路；放什么归应用（`Station.owner`），大模型工具只留 `self.radio.stop` |
-| `nomi_music.cc` / `nomi_music_local.cc` | 「正在放」的封面、歌词；本地文件读标签。放哪首、音乐网站都归应用 |
-| `nomi_ui.c/.h` | 主界面（表情、卡片、设置、对话浮层）；`ui_now_playing` 组件（系统收听页和应用卡片共用的「正在放」）；系统收听页只剩「正在放」（没装音乐应用时给提示） |
-| `nomi_app.c/.h` | 桌面和应用层（打开、右划返回、应用管理） |
-| `nomi_display.cc` | 界面和系统的胶水：界面要的文字、图片、按钮动作 |
-| `spotpear_esp32s3_max35.cc` | 板子初始化、大模型工具注册（含 `self.app.command`）、网页接口挂载（应用、SD 卡） |
-| `nomi_phone.cc/.h` | 手机连接：蓝牙（NimBLE）装成 Bangle.js 手表，收发 Gadgetbridge 的消息、对时 |
-| `nomi_canvas.cc/.h` | 画布控件：应用给一份线、多边形、圆、字的清单，屏幕刷新时照着画 |
-| `preinstall/nomi.music.npk` | 预装的音乐应用包（**手动打的，改了应用要重打**） |
+| `firmware/main/nomi/` | 自研固件代码，按能力分文件夹（下面几行都在这里，括号里是文件夹）。每项能力一个开关（`nomi/Kconfig`），见「能力开关」 |
+| `nomi_system.cc/.h`（core） | Nomi 怎么起来：板子最后调 `NomiSystem::Start`，这里按开着的能力启动各模块、登记大模型工具和网页接口 |
+| `nomi_wasm.cc/.h`（apps） | 应用运行时：进程、所有系统接口（`ui_*` `media_*` `net_*` `kv_*` `voice_*` `web_*`）、语音 / 网页请求转给应用 |
+| `nomi_pkg.cc/.h`（apps） | 包管理：安装（tar 流）、扫描、预装、删除、应用网页 `/app/<id>/`、内部分区挂载 |
+| `nomi_flash_io.cc/.h`（core） | 替栈在 PSRAM 的任务读写内部闪存（见「踩过的坑」） |
+| `nomi_radio.cc/.h`（player） | 系统播放器：收流、本地文件（FLAC / WAV / MP3）、m4a、解码、对话时让路；放什么归应用（`Station.owner`），大模型工具只留 `self.radio.stop` |
+| `nomi_music.cc` / `nomi_music_local.cc`（player） | 「正在放」的封面、歌词；本地文件读标签。放哪首、音乐网站都归应用 |
+| `nomi_ui.c/.h`（core） | 主界面（表情、卡片、设置、对话浮层）；`ui_now_playing` 组件（系统收听页和应用卡片共用的「正在放」）；系统收听页只剩「正在放」（没装音乐应用时给提示） |
+| `nomi_app.c/.h`（core） | 桌面和应用层（打开、右划返回、应用管理） |
+| `nomi_display.cc`（core） | 界面和系统的胶水：界面要的文字、图片、按钮动作 |
+| `boards/spotpear/spotpear-esp32s3-max35/` | 板子：引脚（`config.h`）、硬件初始化（屏幕、触摸、声音、电池、背光、按键、休眠，有的话摄像头、SD 卡引脚），最后 `NomiSystem::Start` |
+| `nomi_phone.cc/.h`（phone） | 手机连接：蓝牙（NimBLE）装成 Bangle.js 手表，收发 Gadgetbridge 的消息、对时 |
+| `nomi_canvas.cc/.h`（apps） | 画布控件：应用给一份线、多边形、圆、字的清单，屏幕刷新时照着画 |
+| `nomi/preinstall/nomi.music.npk` | 预装的音乐应用包（**手动打的，改了应用要重打**） |
 | `firmware/main/protocols/direct_api_config_*` | 网页设置页（页面 HTML 在 `direct_api_config_page.h`） |
 | `firmware/partitions/v2/16m_apps.csv` | 这块板子的分区表 |
 | `apps/music/` | 音乐应用源码：`main.c`（界面、分发、本地、电台）`podcast.c` `online.c` `assets/`（台单、网页） |
@@ -51,7 +52,7 @@ Windows，ESP-IDF v6.1。每个 PowerShell 先 `. C:\Espressif\tools\Microsoft.v
 ```powershell
 cd firmware
 idf.py build                      # 平时
-idf.py reconfigure build          # 板子目录里新加了 .cc（源文件是 glob 的，配置时才扫）
+idf.py reconfigure build          # nomi/ 或板子目录里新加了 .cc（源文件是 glob 的，配置时才扫）
 python scripts/build.py spotpear/spotpear-esp32s3-max35 --name spotpear-esp32s3-max35
                                   # 改了板子 config.json（分区表、sdkconfig 项）：重新生成 sdkconfig，全量编译
 idf.py reconfigure -DCMAKE_NINJA_FORCE_RESPONSE_FILE=1 build
@@ -63,7 +64,7 @@ idf.py -p COM11 flash             # 刷机（会写程序、资源、分区表�
 
 ```bash
 python tools/app-sdk/build.py apps/music        # 打到 apps/music/build/，网页「设备 → 应用」上传安装
-python tools/app-sdk/build.py apps/music -o firmware/main/boards/spotpear/spotpear-esp32s3-max35/preinstall/nomi.music.npk
+python tools/app-sdk/build.py apps/music -o firmware/main/nomi/preinstall/nomi.music.npk
                                                 # 改了音乐应用：重打预装包，再编固件（版本号要升，机器里才会换）
 python tools/app-sdk/wasm_info.py apps/music/build/app.wasm   # 看导入导出（查有没有意外的 memset 之类）
 ```
@@ -105,6 +106,30 @@ python tools/app-sdk/wasm_info.py apps/music/build/app.wasm   # 看导入导出�
 
 - 首页左右翻：历史、表情、收听卡片、时钟；往上推是桌面（应用网格）；下拉是设置；任何地方叫它说话从底下升起对话浮层，不翻页。
 - 收听卡片：装了带 `tile` 的应用就盖上一层（`nomi_ui_listen_slot`），系统收听页整层藏起来。音乐应用在卡片里用 `ui_now_playing`（和系统收听页同一个组件：左边封面、控制、进度，右边 7 行歌词），顶上一排放「本地 / 电台 / 播客 / 在线」入口。
+
+## 能力开关（2026-11-05，编译通过，未上机）
+
+Nomi 从板子目录挪到了 `firmware/main/nomi/`，按能力分文件夹，每项能力一个 Kconfig 开关（`nomi/Kconfig`，在小智的 `Kconfig.projbuild` 里 `rsource`）。`main` 组件是 `WHOLE_ARCHIVE` 链接的，编了就进固件，所以关掉的能力在 `nomi/nomi.cmake` 里整个文件夹不编。为的是以后换板子（小屏、没 SD 卡、没摄像头的）时能按需裁。
+
+| 开关 | 文件夹 | 依赖 | 关掉后 |
+|---|---|---|---|
+| `CONFIG_NOMI` | `core/` | PSRAM | 不用 Nomi（别的小智板子）。打开就有表情、对话记录、时钟闹钟天气、设置、对话浮层 |
+| `CONFIG_NOMI_SDCARD` | `sdcard/` | | 没有 SD 卡、网页文件管理、系统应用「文件」；看书补字的 `fonts/*.ttf` 不读 |
+| `CONFIG_NOMI_APPS` | `apps/` | SDCARD、S3 | 没有应用包、应用管理、打开方式；首页没有卡片位；桌面只剩「文件」（SD 也关了就没有桌面） |
+| `CONFIG_NOMI_PLAYER` | `player/` | APPS | 卡片位里没有系统的「正在放」（只等应用插卡片）、表情页没有「正在放」小条；`media` 权限的应用装不上；不预装音乐 |
+| `CONFIG_NOMI_READER` | `reader/` | APPS | 没有 `ui_reader` 等接口；不带 GBK 表、不预装小说 |
+| `CONFIG_NOMI_PHOTO` | `photo/` | APPS | 没有看图接口、电子相框（设置里「睡着时显示」没有「相册」）、网页预览；不预装图片 |
+| `CONFIG_NOMI_CAMERA` | `camera/` | S3 | 板子不初始化摄像头，没有 `self.camera.look`；`camera` 权限的应用装不上 |
+| `CONFIG_NOMI_PHONE` | `phone/` | NimBLE | 不连 Gadgetbridge；`phone` 权限的应用装不上 |
+| `CONFIG_NOMI_HOTSPOT` | `hotspot/` | | 断网只剩小智的配网热点 |
+
+- **板子和 Nomi 的分工**：板子文件只管引脚和硬件（屏幕、触摸、声音、电池、背光、按键、休眠），建 `NomiDisplay`，有 SD 卡就 `NomiSdCard::Configure` 给引脚，有摄像头就初始化后 `NomiCamera::Init`，最后 `NomiSystem::Start(display, {wake_screen})`；`StartNetwork` 之后调 `NomiSystem::OnNetworkStarted`；调暗前问 `NomiSystem::KeepBright`。启动顺序、大模型工具、网页接口都在 `core/nomi_system.cc`。
+- **跨能力的引用**一律 `#if CONFIG_NOMI_*` 包着；表达式里要 0 / 1 用 `core/nomi_caps.h` 的 `NOMI_HAS_*`（关掉的 `CONFIG_` 宏根本不存在）。头文件目录全加，只是不编源文件。
+- **界面**（`nomi_ui.c`、`nomi_app.c` 和模拟器共用，不能读 sdkconfig）：用 `get_int` 问 `has_tiles`、`has_player`、`has_launcher`、`has_apps`、`has_frame`，默认值都是 1，模拟器不认这几个键就照旧全有。卡片位跟应用平台（卡片是应用插的），系统的「正在放」兜底才跟播放器。现在只有一个卡片位，谁 `tile` 谁占。
+- **应用包**：安装时（网页上传、预装都走 `Install`）权限对应的能力没有就拒绝（`media` 播放器、`phone`、`camera`）；打开时 `MissingImports` 查导入的系统接口有没有接上，缺了就提示「这台设备没有…要用的功能」，不等调到才出错。开机扫描已装的不拦。
+- **预装**：`nomi.cmake` 按开关把 `nomi/preinstall/` 里要的文件拷进 `build/nomi_preinstall/` 再打进资源分区，`nomi_pkg.cc` 的 `kPreinstalled` 按同样的开关列。
+- **验证几种组合**：`python tools/nomi_variants.py --build`（IDF 环境里，在仓库根目录跑）。从全开编过的 `firmware/sdkconfig` 改出三份放在 `firmware/build/v*`（git 不管）：`min` 全关、`apps` 只有 SD 卡和应用平台、`sd` 有 SD 卡摄像头蓝牙热点但没有应用平台，逐个编。改了跨能力的代码后跑一遍。2026-11-05 程序大小：全开 4,210,240 字节；`sd` 3,957,232；`apps` 3,779,040；`min` 3,557,600（都还开着这块板子的蓝牙、摄像头 sdkconfig，换板子时连同 config.json 一起关能再小）。
+- **还没做**：屏幕尺寸（`FACE_W/H`、`nomi_ui.c` 里几十处像素按 480×320 写）、输入方式（全靠触摸手势）没抽象；卡片位只有一个。
 
 ## 手机连接、地图（2026-11-04）
 
@@ -185,7 +210,7 @@ python tools/app-sdk/wasm_info.py apps/music/build/app.wasm   # 看导入导出�
 
 分层照旧：系统给能力，应用管业务。
 
-- **系统**（板子目录）：`nomi_book.cc`（认 UTF-8 / GBK、按文件位置读一段转 UTF-8、找章节，不依赖设备，电脑上 zig c++ 能编）、`nomi_reader.cc`（阅读器控件：LVGL 断行排版、分页、往回翻、手势）、`nomi_font.cc`（看书的字：系统字 + 卡上 `fonts/*.ttf` 补字，tiny_ttf）。`nomi_wasm.cc` 加了 `ui_reader` `reader_goto` `reader_set_flags` `reader_text` `text_chapters` `text_chapter_at` `fs_find`，接口版本升到 2（`nomi_pkg.cc` 的 `kApi`、`nomi_sdk.h` 的 `NOMI_API`、`build.py` 的 `API`）。
+- **系统**（`nomi/reader/`）：`nomi_book.cc`（认 UTF-8 / GBK、按文件位置读一段转 UTF-8、找章节，不依赖设备，电脑上 zig c++ 能编）、`nomi_reader.cc`（阅读器控件：LVGL 断行排版、分页、往回翻、手势）、`nomi_font.cc`（看书的字：系统字 + 卡上 `fonts/*.ttf` 补字，tiny_ttf）。`nomi_wasm.cc` 加了 `ui_reader` `reader_goto` `reader_set_flags` `reader_text` `text_chapters` `text_chapter_at` `fs_find`，接口版本升到 2（`nomi_pkg.cc` 的 `kApi`、`nomi_sdk.h` 的 `NOMI_API`、`build.py` 的 `API`）。
 - **配置**：板子 `config.json` 开了 `LV_USE_TINY_TTF`（带文件读）和 LVGL 的 stdio 文件驱动（盘符 `S`，`S:/sd/...`），改了要用 `scripts/build.py` 重新生成 sdkconfig。SD 卡同时开的文件数 4 → 6。固件剩 6%。
 - **资源分区**：`preinstall/gbk.tab`（GBK 对照表 48KB，`tools/gen_gbk_table.py` 生成）、`preinstall/nomi.novel.npk`（改了应用要重打）。桌面上原来的「小说」占位应用删了。
 - **应用**（`apps/novel`）：书架（`fs_find` 整张卡找大于 16KB 的 .txt，上次的记在 kv、打开先显示再后台重找）、看书（点中间或长按出快速跳转：`ui_slider` 拖进度、上一章 / 下一章、目录、翻页方式五选一（滑 + 点上下 / 滑 + 点左右 / 只滑 / 只点上下 / 只点左右）、回书架；左边缘右划回书架；第一次打开弹一句「点屏幕中间」的提示）、书签（每本书一个 kv，翻页后 10 秒内存）、目录（一批 40 章，上一批 / 下一批）、语音 `open` `next_chapter` `prev_chapter` `chapter`、当前页给大模型当上下文。
@@ -236,7 +261,7 @@ python tools/app-sdk/wasm_info.py apps/music/build/app.wasm   # 看导入导出�
 
 用户要的：离线时网页控制也得有——设备自己开个热点，手机连上来用网页设置页控制。
 
-- **`nomi_hotspot.cc/.h`**（板子目录）：开机注册事件，断网满 60 秒开热点（开机没网、运行中断网都算；闪断不打扰），拿到 IP 自动关。**APSTA 模式**：`esp_wifi_set_mode(APSTA)` 只给跑着的站点加开一个 AP 面，重试照旧（绕开 WifiManager 的互斥，它只管自己那套）。SSID `Nomi-XXXX`（softAP MAC 后四位）、开放热点、captive portal（复用组件的 `DnsServer`，所有域名指到 192.168.4.1，手机连上自动弹设置页）。
+- **`nomi_hotspot.cc/.h`**（`nomi/hotspot/`）：开机注册事件，断网满 60 秒开热点（开机没网、运行中断网都算；闪断不打扰），拿到 IP 自动关。**APSTA 模式**：`esp_wifi_set_mode(APSTA)` 只给跑着的站点加开一个 AP 面，重试照旧（绕开 WifiManager 的互斥，它只管自己那套）。SSID `Nomi-XXXX`（softAP MAC 后四位）、开放热点、captive portal（复用组件的 `DnsServer`，所有域名指到 192.168.4.1，手机连上自动弹设置页）。
 - **网页服务不用动**：80 端口监听所有网卡，热点一开，全功能设置页自动从 `http://192.168.4.1/` 可达；`DeviceIp()`（config_server 和 nomi_display 两处）没 STA IP 时落到 AP。离线时没有协议（没 TLS ~30KB），内存够 AP + DNS 用。
 - **界面**：不做新浮层——设置→网络页里那张二维码直接换（`hotspot` 文本在设置页签名里，热点开了下次下拉自动重建；nomi_display 的胶水加了 `hotspot_mode`：`config` / `offline`）。离线热点标题「离线模式」，提示「连上会自动打开设置页」；配网热点照旧「配网中」。60 秒超时提示改成「下拉设置可扫码连热点控制」。
 - **换地方连新 Wi-Fi**（公司场景）：连着热点在网页上存公司 Wi-Fi（`/wifi/add`，本来就是这一份 SsidManager）→ 没联网时存完立刻触发一次扫描（不然退避最长 5 分钟才发现）→ 连上公司网后热点自动关，手机切到公司网照常访问设备。注意公司网开了 AP 隔离（客户端互相不通）时，手机访问不到设备，热点方案在**连不上任何网**时才好用。

@@ -46,7 +46,12 @@ public:
     // 设置页里选的调暗 / 息屏时间（秒），-1 表示从不
     static void GetIdleSeconds(int& dim_seconds, int& off_seconds);
 
+    // 板子建的那一个（还没建是 nullptr）。Nomi 自己的模块拿屏幕用它——板子单例没建完时也能用，
+    // 不像 Board::GetInstance() 在板子构造函数里调会自己等自己
+    static NomiDisplay* Get() { return instance_; }
+
 private:
+    static NomiDisplay* instance_;
     uint16_t* face_buf_ = nullptr;
     bool ui_ready_ = false;
 };

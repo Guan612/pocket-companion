@@ -657,6 +657,8 @@ config DIRECT_API
         设备直接调用 OpenAI 兼容的 ASR / LLM / TTS 接口，不连小智服务器，
         也跳过官方激活和 OTA。API 在设备的网页设置页里填写。
 
+rsource "nomi/Kconfig"
+
 choice XIAOZHI_NETWORK_TYPE
     prompt "Network Type"
     depends on BOARD_TYPE_WAVESHARE_ESP32_P4_NANO

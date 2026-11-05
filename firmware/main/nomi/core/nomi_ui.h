@@ -39,6 +39,13 @@ typedef enum {
 #define NOMI_KEY_OFF "off"                // NOMI_OFF_SECONDS 的下标
 #define NOMI_KEY_SLEEP_SHOW "sleep_show"  // 睡着时显示：0 时钟页，1 表情（还没对上时间时总是表情），2 相册（电子相框）
 #define NOMI_KEY_ONE_SHOT "one_shot"      // 一问一答：1 = 回答完一句就回待机，0 = 连续对话（默认）
+// 只读：这台设备有没有某项能力（固件按 CONFIG_NOMI_* 编进来的）。没有就不建对应的页面、选项。
+// 读的时候默认值都给 1：模拟器不认这几个键，照旧全有
+#define NOMI_KEY_HAS_TILES "has_tiles"        // 首页的卡片位：应用（manifest 里 "tile": true）把卡片插在这一格
+#define NOMI_KEY_HAS_PLAYER "has_player"      // 播放器：卡片位没被应用占着时系统自己的「正在放」、表情页左上角小条
+#define NOMI_KEY_HAS_FRAME "has_frame"        // 电子相框：设置里「睡着时显示」有没有「相册」
+#define NOMI_KEY_HAS_LAUNCHER "has_launcher"  // 桌面（表盘往上推）：有应用平台或系统应用（「文件」）才有
+#define NOMI_KEY_HAS_APPS "has_apps"          // 应用平台：桌面上有没有「应用管理」
 
 // 多久后调暗 / 息屏，-1 表示从不；设置页的选项和这里一一对应
 #define NOMI_DIM_SECONDS {30, 60, 120, 300, -1}

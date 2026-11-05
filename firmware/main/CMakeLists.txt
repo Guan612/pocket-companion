@@ -888,8 +888,6 @@ elseif(CONFIG_BOARD_TYPE_SPOTPEAR_ESP32S3_MAX35)
     set(BUILTIN_TEXT_FONT font_noto_sans_basic_20_4)
     set(BUILTIN_ICON_FONT font_material_symbols_20_4)
     set(DEFAULT_EMOJI_COLLECTION noto-color-emoji_128)
-    # 预装的应用包（.npk）打进资源分区，开机装进机器内部的应用分区（见 nomi_pkg.cc）
-    set(DEFAULT_ASSETS_EXTRA_FILES "${CMAKE_CURRENT_SOURCE_DIR}/boards/spotpear/spotpear-esp32s3-max35/preinstall")
 elseif(CONFIG_BOARD_TYPE_LCDWIKI_ES3C35P)
     set(BOARD_DIR "lcdwiki-es3c35p")
     set(BUILTIN_TEXT_FONT font_noto_sans_basic_20_4)
@@ -941,6 +939,9 @@ file(GLOB BOARD_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/boards/${BOARD_DIR}/*.c
 )
 list(APPEND SOURCES ${BOARD_SOURCES})
+
+# Nomi 界面和系统能力（Pocket Companion 自己的代码，按 CONFIG_NOMI_* 挑文件夹编译）
+include(${CMAKE_CURRENT_LIST_DIR}/nomi/nomi.cmake)  # 解析依赖那一遍 SOURCE_DIR 是编译目录，用 LIST_DIR
 
 # Select one audio engine for each chip family
 if(CONFIG_IDF_TARGET_ESP32S3 OR CONFIG_IDF_TARGET_ESP32P4 OR CONFIG_IDF_TARGET_ESP32S31)
@@ -1153,7 +1154,7 @@ idf_component_register(SRCS ${SOURCES}
                         app_update
                         spi_flash
                         mbedtls
-                        # spotpear-esp32s3-max35 的电台 / 播客取网页用（连接、握手有超时）。
+                        # Nomi 的播放器（收流）和应用平台（net_get）取网页用（连接、握手有超时）。
                         # 组件依赖在读到 CONFIG_ 之前就要定，没法按板子加；别的板子不引用就不会链进去
                         esp_http_client
                         console
@@ -1486,7 +1487,7 @@ else()
     message(STATUS "Assets partition not found, using v1 partition table")
 endif()
 
-# 应用包运行时（espressif/wasm-micro-runtime 2.4，spotpear-esp32s3-max35 用）：它的 esp-idf 平台层里
+# 应用包运行时（espressif/wasm-micro-runtime 2.4，Nomi 的应用平台 nomi/apps/ 用）：它的 esp-idf 平台层里
 # espidf_file.c 是给 WASI（标准 C 库的文件接口）用的，在 ESP-IDF 6 上编不过（缺 <sys/stat.h>、没有 renameat）。
 # 我们关了 WASI（CONFIG_WAMR_ENABLE_LIBC_WASI=n），文件读写走自己的系统接口，用不着它：不改下载来的组件，
 # 只把这个文件从它的编译里拿掉。平台层的其他文件也用 struct stat，给整个组件强制带上 <sys/stat.h>

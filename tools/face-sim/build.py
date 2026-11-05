@@ -12,7 +12,7 @@ import subprocess
 import sys
 
 HERE = pathlib.Path(__file__).resolve().parent
-FACE_DIR = HERE.parent.parent / "firmware" / "main" / "boards" / "spotpear" / "spotpear-esp32s3-max35"
+FACE_DIR = HERE.parent.parent / "firmware" / "main" / "nomi" / "core"
 FACE_SOURCES = [str(FACE_DIR / "face.c"), str(FACE_DIR / "raster.c")]
 EXPORTS = ["fb", "w", "h", "init", "set_mode", "get_mode", "set_level", "step", "render",
            "dirty_x0", "dirty_y0", "dirty_x1", "dirty_y1"]

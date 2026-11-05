@@ -1,7 +1,6 @@
 #include "nomi_sdcard.h"
 
 #include "application.h"
-#include "config.h"
 #include "nomi_files.h"
 
 #include <cJSON.h>
@@ -107,19 +106,29 @@ NomiSdCard& NomiSdCard::GetInstance() {
     return instance;
 }
 
+void NomiSdCard::Configure(const Pins& pins) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    pins_ = pins;
+    configured_ = true;
+}
+
 /* ---------- 挂载 / 卸载 ---------- */
 
 bool NomiSdCard::MountLocked() {
     if (card_) return true;
+    if (!configured_) {  // 板子没说卡接在哪：当没有卡座
+        state_ = kNoCard;
+        return false;
+    }
     if (!bus_ready_) {
         spi_bus_config_t bus = {};
-        bus.mosi_io_num = SD_MOSI_PIN;
-        bus.miso_io_num = SD_MISO_PIN;
-        bus.sclk_io_num = SD_CLK_PIN;
+        bus.mosi_io_num = pins_.mosi;
+        bus.miso_io_num = pins_.miso;
+        bus.sclk_io_num = pins_.clk;
         bus.quadwp_io_num = -1;
         bus.quadhd_io_num = -1;
         bus.max_transfer_sz = 4096;
-        esp_err_t err = spi_bus_initialize(SD_SPI_HOST, &bus, SPI_DMA_CH_AUTO);
+        esp_err_t err = spi_bus_initialize(pins_.host, &bus, SPI_DMA_CH_AUTO);
         if (err != ESP_OK) {
             ESP_LOGE(TAG, "spi_bus_initialize: %s", esp_err_to_name(err));
             state_ = kNoCard;
@@ -128,10 +137,10 @@ bool NomiSdCard::MountLocked() {
         bus_ready_ = true;
     }
     sdmmc_host_t host = SDSPI_HOST_DEFAULT();
-    host.slot = SD_SPI_HOST;
+    host.slot = pins_.host;
     sdspi_device_config_t slot = SDSPI_DEVICE_CONFIG_DEFAULT();
-    slot.host_id = SD_SPI_HOST;
-    slot.gpio_cs = SD_CS_PIN;
+    slot.host_id = pins_.host;
+    slot.gpio_cs = pins_.cs;
     esp_vfs_fat_mount_config_t mount = {};
     mount.format_if_mount_failed = false;  // 绝不自动格式化
     mount.max_files = 6;  // 看书时同时开着：书、补字的字体，再加放本地歌、应用读文件、章节缓存
@@ -176,11 +185,11 @@ void NomiSdCard::UnmountLocked() {
 
 void NomiSdCard::ReleaseBusLocked() {
     if (!bus_ready_) return;
-    spi_bus_free(SD_SPI_HOST);
+    spi_bus_free(pins_.host);
     bus_ready_ = false;
-    gpio_reset_pin(SD_MOSI_PIN);
-    gpio_reset_pin(SD_MISO_PIN);
-    gpio_reset_pin(SD_CS_PIN);
+    gpio_reset_pin(pins_.mosi);
+    gpio_reset_pin(pins_.miso);
+    gpio_reset_pin(pins_.cs);
     if (on_bus_released) on_bus_released();  // GPIO43 交给板子（功放）
 }
 

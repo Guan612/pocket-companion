@@ -1,0 +1,81 @@
+# Nomi 界面和系统能力（main/Kconfig.projbuild 里 rsource 进来）。
+#
+# 每项能力对应 nomi/ 下的一个文件夹，关掉的能力整个文件夹不编译（main 是 WHOLE_ARCHIVE，编了就会链进固件）。
+# 板子在 config.json 的 sdkconfig_append 里关掉自己没有或放不下的能力；没写的按下面的默认值。
+# 应用包用到这台机器没有的能力：装的时候按权限拒绝，打开时按缺的系统接口拒绝（nomi_pkg.cc、nomi_wasm.cc）。
+
+menu "Nomi 界面和系统能力"
+
+config NOMI
+    bool "Nomi 界面（表情、卡片、设置、对话浮层）"
+    depends on SPIRAM
+    default y if BOARD_TYPE_SPOTPEAR_ESP32S3_MAX35
+    default n
+    help
+        板子用 NomiDisplay 当屏幕，开机时调 NomiSystem::Start。表情、对话记录、时钟闹钟天气、
+        下拉设置、对话浮层都在 nomi/core/，打开 Nomi 就有，不能单独关。表情画布整屏放 PSRAM，所以要 PSRAM。
+
+if NOMI
+
+config NOMI_SDCARD
+    bool "SD 卡（挂载、网页文件管理、媒体库、系统应用「文件」）"
+    default y
+    help
+        nomi/sdcard/。板子开机前要用 NomiSdCard::Configure 告诉它卡接在哪几个脚上。
+
+config NOMI_APPS
+    bool "应用平台（WebAssembly 应用包、桌面、应用管理、打开方式、画布）"
+    depends on NOMI_SDCARD && IDF_TARGET_ESP32S3
+    default y
+    help
+        nomi/apps/，见 docs/app-sdk.md。运行时 wasm-micro-runtime 只按 esp32s3 引入（main/idf_component.yml）。
+        现在要 SD 卡：装在卡上的应用、应用读写卡上的文件都走 NomiSdCard。
+        关掉后桌面上只剩系统应用（比如「文件」），没有应用管理。
+
+config NOMI_PLAYER
+    bool "播放器（本地 FLAC/WAV/MP3/M4A、网络流、首页收听卡片）"
+    depends on NOMI_APPS
+    default y
+    help
+        nomi/player/。放什么归应用（音乐应用），系统只解码播放，所以依赖应用平台。
+        关掉后首页没有收听卡片，应用包的 media 权限装不上，预装包里不带音乐应用。
+
+config NOMI_READER
+    bool "阅读器（系统排版、分章、GBK 文本）"
+    depends on NOMI_APPS
+    default y
+    help
+        nomi/reader/，应用用 ui_reader 看书（小说应用）。关掉后不带 GBK 对照表和小说应用。
+
+config NOMI_PHOTO
+    bool "图片（解码 JPEG/PNG、看图、缩略图、电子相框）"
+    depends on NOMI_APPS
+    default y
+    help
+        nomi/photo/。关掉后睡着时不能显示相册，网页上不能预览卡上的图片，预装包里不带图片应用。
+
+config NOMI_CAMERA
+    bool "摄像头（大模型看一眼、取景器、拍照）"
+    depends on IDF_TARGET_ESP32S3
+    default y
+    help
+        nomi/camera/。板子负责按引脚初始化摄像头，再调 NomiCamera::Init。
+        关掉后板子不初始化摄像头，没有 self.camera.look 工具，应用包的 camera 权限装不上。
+
+config NOMI_PHONE
+    bool "手机连接（蓝牙装成 Bangle.js 手表，接 Gadgetbridge）"
+    depends on BT_NIMBLE_ENABLED
+    default y
+    help
+        nomi/phone/。要板子在 sdkconfig 里打开 NimBLE（CONFIG_BT_ENABLED、CONFIG_BT_NIMBLE_ENABLED）。
+        关掉后不对时、不收通知，应用包的 phone 权限装不上。
+
+config NOMI_HOTSPOT
+    bool "离线热点（断网时自己开个热点，手机扫码进设置页）"
+    default y
+    help
+        nomi/hotspot/。关掉后断网就只能用小智的配网热点。
+
+endif
+
+endmenu

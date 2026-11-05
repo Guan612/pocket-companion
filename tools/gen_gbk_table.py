@@ -1,6 +1,6 @@
 """生成 GBK → Unicode 对照表，阅读器读 GBK 编码的 TXT 用（nomi_book.cc）。
 
-输出 firmware/main/boards/spotpear/spotpear-esp32s3-max35/preinstall/gbk.tab，编译时打进资源分区
+输出 firmware/main/nomi/preinstall/gbk.tab，编译时打进资源分区
 （和预装应用包一起，见 main/CMakeLists.txt 的 DEFAULT_ASSETS_EXTRA_FILES），不占固件空间。
 
 格式：首字节 0x81–0xFE（126 个）× 尾字节 0x40–0xFE（191 个，0x7F 那格空着），每格 2 字节小端 Unicode，
@@ -11,7 +11,7 @@
 import pathlib
 import struct
 
-OUT = pathlib.Path(__file__).resolve().parent.parent / "firmware/main/boards/spotpear/spotpear-esp32s3-max35/preinstall/gbk.tab"
+OUT = pathlib.Path(__file__).resolve().parent.parent / "firmware/main/nomi/preinstall/gbk.tab"
 
 
 def main():

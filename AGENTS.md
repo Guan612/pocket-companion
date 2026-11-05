@@ -13,20 +13,21 @@ Pocket Companion：放在桌上的语音小伙伴。底座是小智 xiaozhi-esp3
 1. `docs/handoff.md`：现状、命令、架构、正在做的、已知问题、踩过的坑、约定。**接手先读它，做完一步记得更新它。**
 2. `docs/app-sdk.md`：应用包规范、系统接口、实现进度（写应用、加系统接口时看）。
 3. 按需：`docs/hardware.md`（引脚）、`docs/flash-partitions.md`（分区、哪些操作会清数据）、`docs/online-music.md`。
-4. `firmware/AGENTS.md` 是小智上游的规矩（板子身份、状态机、主循环不能堵……），改 `firmware/main/` 里板子目录以外的代码时照它来。
+4. `firmware/AGENTS.md` 是小智上游的规矩（板子身份、状态机、主循环不能堵……），改 `firmware/main/` 里 `nomi/` 和板子目录以外的代码时照它来。
 
 ## 代码在哪
 
 | 位置 | 是什么 |
 |---|---|
-| `firmware/main/boards/spotpear/spotpear-esp32s3-max35/` | 本项目自己的固件代码几乎都在这：界面（`nomi_ui.c`、`nomi_app.c`）、应用运行时（`nomi_wasm.cc`、`nomi_pkg.cc`）、播放器（`nomi_radio.cc`、`nomi_mp4.cc`）、阅读器（`nomi_reader.cc`、`nomi_book.cc`、`nomi_font.cc`）、SD 卡（`nomi_sdcard.cc`）、板子初始化（`spotpear_esp32s3_max35.cc`） |
-| 同上 `preinstall/` | 打进资源分区的东西：预装应用包、GBK 对照表（`gbk.tab`） |
+| `firmware/main/nomi/` | 本项目自己的固件代码几乎都在这，按能力分文件夹，每项能力一个 Kconfig 开关（`nomi/Kconfig`，关掉的文件夹不编译）：`core/`（表情、界面、设置、时钟、启动 `nomi_system.cc`）、`sdcard/`、`apps/`（应用运行时 `nomi_wasm.cc`、包管理 `nomi_pkg.cc`）、`player/`、`reader/`、`photo/`、`camera/`、`phone/`、`hotspot/` |
+| 同上 `preinstall/` | 打进资源分区的东西：预装应用包、GBK 对照表（`gbk.tab`）；按开着的能力挑（`nomi/nomi.cmake`） |
+| `firmware/main/boards/spotpear/spotpear-esp32s3-max35/` | 板子：只有引脚（`config.h`）、硬件初始化（`spotpear_esp32s3_max35.cc`）、sdkconfig 和分区表（`config.json`），最后交给 `NomiSystem::Start` |
 | `firmware/main/protocols/direct_api_*` | 直连协议、网页设置页（`direct_api_config_page.h`，设备和模拟器共用） |
 | `apps/<名字>/` | 应用包源码（`music`、`novel`），C 编成 WebAssembly |
 | `tools/app-sdk/` | SDK 头文件、`build.py`（编译打包）、`wasm_info.py` |
 | `tools/device-sim/` | 浏览器整机模拟器 |
 
-`firmware/` 是 subtree：更新底座用 `git subtree pull --prefix=firmware https://github.com/78/xiaozhi-esp32.git <tag> --squash`。改小智自己的文件要克制，能放板子目录就放板子目录。
+`firmware/` 是 subtree：更新底座用 `git subtree pull --prefix=firmware https://github.com/78/xiaozhi-esp32.git <tag> --squash`。改小智自己的文件要克制，能放 `nomi/` 或板子目录就放那里。
 
 ## 最重要的约定
 
@@ -49,7 +50,7 @@ Windows + ESP-IDF v6.1（小智 2.5 不支持 5.x）。PowerShell 里先 `. C:\E
 
 ```powershell
 idf.py build                       # 平时
-idf.py reconfigure build           # 板子目录里新加 / 删了源文件（源文件是 glob 的）
+idf.py reconfigure build           # nomi/ 或板子目录里新加 / 删了源文件（源文件是 glob 的）
 python scripts/build.py spotpear/spotpear-esp32s3-max35 --name spotpear-esp32s3-max35
                                    # 改了板子 config.json（sdkconfig 项、分区表）、或拉了带新组件的代码
 idf.py -p COM11 flash              # 刷机（不动 nvs 和应用分区）
@@ -59,7 +60,7 @@ idf.py -p COM11 flash              # 刷机（不动 nvs 和应用分区）
 
 ```bash
 python tools/app-sdk/build.py apps/novel        # 打到 apps/novel/build/
-python tools/app-sdk/build.py apps/novel -o firmware/main/boards/spotpear/spotpear-esp32s3-max35/preinstall/nomi.novel.npk
+python tools/app-sdk/build.py apps/novel -o firmware/main/nomi/preinstall/nomi.novel.npk
                                                 # 改了预装应用：先升 manifest 的版本号（不升机器里不会换），再重打、再编固件
 ```
 

@@ -1,25 +1,36 @@
 #include "nomi_wasm.h"
 
 #include "display/display.h"
-#include "nomi_book.h"
-#include "nomi_filelist.h"
-#include "nomi_files.h"
-#include "nomi_camera.h"
 #include "nomi_canvas.h"
 #include "nomi_display.h"
-#include "nomi_media.h"
+#include "nomi_filelist.h"
+#include "nomi_files.h"
 #include "nomi_flash_io.h"
-#include "nomi_music.h"
+#include "nomi_media.h"
 #include "nomi_open.h"
-#include "nomi_phone.h"
-#include "nomi_photo.h"
 #include "nomi_pkg.h"
-#include "nomi_radio.h"
-#include "nomi_reader.h"
 #include "nomi_sdcard.h"
 #include "nomi_style.h"
 #include "nomi_ui.h"
 #include "nomi_util.h"
+// 下面这些能力可以不编（nomi/Kconfig）：没编的那一组系统接口不登记，用到它们的应用打不开（MissingImports）
+#if CONFIG_NOMI_PLAYER
+#include "nomi_music.h"
+#include "nomi_radio.h"
+#endif
+#if CONFIG_NOMI_READER
+#include "nomi_book.h"
+#include "nomi_reader.h"
+#endif
+#if CONFIG_NOMI_PHOTO
+#include "nomi_photo.h"
+#endif
+#if CONFIG_NOMI_CAMERA
+#include "nomi_camera.h"
+#endif
+#if CONFIG_NOMI_PHONE
+#include "nomi_phone.h"
+#endif
 
 #include <cJSON.h>
 #include <dirent.h>
@@ -159,8 +170,13 @@ Proc* Ctx(wasm_exec_env_t env) {
 
 // 放的东西归这个应用、而且主人还要它放着（对话时让出来的也算）
 bool OwnsMedia(const Proc* p) {
+#if CONFIG_NOMI_PLAYER
     auto& radio = NomiRadio::GetInstance();
     return radio.Wanted() && radio.Current().owner == p->pkg->id;
+#else
+    (void)p;
+    return false;
+#endif
 }
 
 bool KeepResident(const Proc* p) { return p->shown || p->pkg->tile || OwnsMedia(p); }
@@ -226,8 +242,8 @@ void DropTile(Proc* p) {
 void TakeTile(Proc* p) {
     if (s_tile_owner && s_tile_owner != p) DropTile(s_tile_owner);
     s_tile_owner = p;
-    p->tile = nomi_ui_listen_slot();
-    lv_obj_clean(p->tile);
+    p->tile = nomi_ui_listen_slot();  // 没有播放器时首页没有收听卡片，是 nullptr（ui_tile 返回 E_DENIED）
+    if (p->tile) lv_obj_clean(p->tile);
 }
 
 lv_obj_t* Obj(Proc* p, int32_t id) {
@@ -581,6 +597,7 @@ void ui_open(wasm_exec_env_t env) {
     if (ui.ok() && !p->root) nomi_app_open(p->pkg->id.c_str());
 }
 
+#if CONFIG_NOMI_PLAYER
 /* ---------- ui_player：系统画的「正在放」（封面、歌名、进度、上一首 / 放停 / 下一首） ---------- */
 
 #define ICON_PLAY "\xEF\x81\x8B"
@@ -769,6 +786,7 @@ int32_t ui_player(wasm_exec_env_t env) {
     PlayerRefresh(p);
     return AddObj(proc, box);
 }
+#endif  // CONFIG_NOMI_PLAYER
 
 /* ---------- 存储 ---------- */
 
@@ -858,6 +876,7 @@ int32_t fs_read(wasm_exec_env_t env, const char* path, int32_t offset, void* buf
 
 /* ---------- 阅读器和书：ui_reader、text_chapters、fs_find ---------- */
 
+#if CONFIG_NOMI_READER
 constexpr int32_t READER_MENU = -1, READER_END = -2;  // NOMI_EV_READER 的 value（翻页时是位置，≥ 0）
 constexpr const char* kChapterCache = "/sd/nomi/cache/chapters";  // 章节缓存（第一次要把整本书读一遍）
 
@@ -925,6 +944,8 @@ int32_t reader_text(wasm_exec_env_t env, int32_t id, char* buf, uint32_t size) {
     return static_cast<int32_t>(n);
 }
 
+#endif  // CONFIG_NOMI_READER
+
 bool MakeDirs(const std::string& path) {
     for (size_t i = 1; i <= path.size(); i++) {
         if (i == path.size() || path[i] == '/') {
@@ -936,6 +957,7 @@ bool MakeDirs(const std::string& path) {
     return true;
 }
 
+#if CONFIG_NOMI_READER
 struct ChapterIndex {
     std::string path;
     int64_t size = -1, mtime = 0;
@@ -1046,6 +1068,8 @@ int32_t text_chapter_at(wasm_exec_env_t env, const char* path, int32_t offset) {
     return static_cast<int32_t>(it - ix->list.begin()) - 1;
 }
 
+#endif  // CONFIG_NOMI_READER
+
 bool SkipDir(const std::string& path, const char* name) {
     return name[0] == '.' || strcasecmp(name, "System Volume Information") == 0 || strcasecmp(name, "$RECYCLE.BIN") == 0 ||
            path == "/sd/nomi";  // 系统自己的（应用、缓存）
@@ -1111,8 +1135,6 @@ int32_t fs_find(wasm_exec_env_t env, const char* dir, const char* exts, int32_t 
 
 /* ---------- 图片：ui_grid、ui_thumb、ui_photo、photo_frame ---------- */
 
-constexpr int kThumbSize = 88;  // 一行 4 个（页面去掉两边留白 408 像素宽）
-enum { PHOTO_NEXT = 1, PHOTO_PREV = 2, PHOTO_MENU = 3 };  // NOMI_EV_PHOTO 的 value
 
 // 网格：控件一排排往右放、放满换行（缩略图墙）；ui_target 能指它
 int32_t ui_grid(wasm_exec_env_t env) {
@@ -1129,6 +1151,10 @@ int32_t ui_grid(wasm_exec_env_t env) {
     lv_obj_add_flag(g, kContainer);
     return AddObj(p, g);
 }
+
+#if CONFIG_NOMI_PHOTO
+constexpr int kThumbSize = 88;  // 一行 4 个（页面去掉两边留白 408 像素宽）
+enum { PHOTO_NEXT = 1, PHOTO_PREV = 2, PHOTO_MENU = 3 };  // NOMI_EV_PHOTO 的 value
 
 // 一张缩略图（方块、铺满裁切），点了来 NOMI_EV_CLICK。系统在后台解，解好的存在卡上，下次秒开
 int32_t ui_thumb(wasm_exec_env_t env, const char* path) {
@@ -1203,6 +1229,7 @@ int32_t photo_frame(wasm_exec_env_t env, const char* dir, int32_t seconds) {
     NomiPhoto::SetFrame(dev, seconds);
     return 0;
 }
+#endif  // CONFIG_NOMI_PHOTO
 
 /* ---------- 写文件：data:/ 随便写；sd:/ 要 sd.write（系统的 nomi/ 下面不让碰） ---------- */
 
@@ -1372,6 +1399,7 @@ int32_t files_picked(wasm_exec_env_t env, char* buf, uint32_t size) {
 
 /* ---------- 手机连接（权限 phone）：蓝牙收发 Gadgetbridge 的消息，系统只认类型，字段归应用 ---------- */
 
+#if CONFIG_NOMI_PHONE
 constexpr size_t kPhoneInbox = 16;  // 每个应用最多攒几条没取的（多了丢最老的）
 enum { PHONE_MESSAGE = 1, PHONE_CONNECTED = 2, PHONE_DISCONNECTED = 3 };  // NOMI_EV_PHONE 的 value
 
@@ -1450,6 +1478,7 @@ int32_t phone_send(wasm_exec_env_t env, const char* json) {
 }
 
 int32_t phone_connected(wasm_exec_env_t env) { return NomiPhone::Connected() ? 1 : 0; }
+#endif  // CONFIG_NOMI_PHONE
 
 // 界面在前台时不让屏幕睡（导航、计时这类）：1 开、0 关；应用退到后台、退出时自动放开。要 keep_awake 权限
 int32_t screen_keep_on(wasm_exec_env_t env, int32_t on) {
@@ -1461,6 +1490,7 @@ int32_t screen_keep_on(wasm_exec_env_t env, int32_t on) {
     return 0;
 }
 
+#if CONFIG_NOMI_CAMERA
 /* ---------- 摄像头（api 5，权限 camera）：取景器、拍照存卡、问大模型 ---------- */
 
 // 取景器：占满当前页（这页别放别的控件，标题给空字符串）：实时画面铺满整屏，系统刷新。
@@ -1515,6 +1545,7 @@ int32_t camera_ask(wasm_exec_env_t env, const char* question) {
     int32_t n = static_cast<int32_t>(jpeg.size());
     return NomiCamera::ask_handler(std::move(jpeg), question ? question : "") ? n : E_FAIL;
 }
+#endif  // CONFIG_NOMI_CAMERA
 
 /* ---------- 画布：应用自己画（线、实心多边形、圆、字），clear → 一样样加 → show ---------- */
 
@@ -1637,6 +1668,7 @@ int32_t kv_set(wasm_exec_env_t env, const char* key, const char* value) {
     return ok ? 0 : E_FAIL;
 }
 
+#if CONFIG_NOMI_PLAYER
 /* ---------- 播放（权限 media）：交给系统播放器，放的东西记在这个应用名下 ---------- */
 
 // 网上的一首 / 一期先探一下：https 的先试 http（不占 TLS 的内部 RAM）；按文件头认格式（扩展名、响应头
@@ -1752,6 +1784,7 @@ int32_t media_info(wasm_exec_env_t env, const char* path, char* buf, uint32_t si
     CopyOut(t.title + "\n" + t.artist + "\n" + std::to_string(duration), buf, size, &n);
     return n;
 }
+#endif  // CONFIG_NOMI_PLAYER
 
 /* ---------- 联网（权限 net） ---------- */
 
@@ -1776,12 +1809,16 @@ int32_t NetGet(Proc* p, const char* url, char* buf, uint32_t size, const char* u
         if (b.size() > scanned + mark.size()) scanned = b.size() - mark.size();
         return found >= count;
     };
+#if CONFIG_NOMI_PLAYER
     // 内部 RAM 只够同时一条 TLS：正在放的若是 https，先让出来，取完接着放
     auto& radio = NomiRadio::GetInstance();
     bool held = u.rfind("https://", 0) == 0 && radio.HoldForHttps();
+#endif
     std::string body;
     bool ok = nomi::HttpGet(u, body, std::min<size_t>(size, kMaxNet), nullptr, enough);
+#if CONFIG_NOMI_PLAYER
     if (held) radio.ReleaseHttpsHold();
+#endif
     if (!ok) return E_FAIL;
     size_t n = std::min<size_t>(body.size(), size);
     memcpy(buf, body.data(), n);
@@ -1919,7 +1956,6 @@ NativeSymbol kNatives[] = {
     {"ui_remove", (void*)ui_remove, "(i)", nullptr},
     {"ui_toast", (void*)ui_toast, "($)", nullptr},
     {"ui_open", (void*)ui_open, "()", nullptr},
-    {"ui_player", (void*)ui_player, "()i", nullptr},
     {"fs_list", (void*)fs_list, "($*~)i", nullptr},
     {"fs_size", (void*)fs_size, "($)i", nullptr},
     {"fs_read", (void*)fs_read, "($i*~)i", nullptr},
@@ -1929,21 +1965,11 @@ NativeSymbol kNatives[] = {
     {"fs_remove", (void*)fs_remove, "($)i", nullptr},
     {"fs_rename", (void*)fs_rename, "($$)i", nullptr},
     {"fs_mkdir", (void*)fs_mkdir, "($)i", nullptr},
-    {"ui_reader", (void*)ui_reader, "($ii)i", nullptr},
     {"ui_grid", (void*)ui_grid, "()i", nullptr},
-    {"ui_thumb", (void*)ui_thumb, "($)i", nullptr},
-    {"ui_photo", (void*)ui_photo, "($i)i", nullptr},
     {"ui_files", (void*)ui_files, "($$i)i", nullptr},
     {"files_picked", (void*)files_picked, "(*~)i", nullptr},
-    {"phone_listen", (void*)phone_listen, "($)i", nullptr},
-    {"phone_read", (void*)phone_read, "(*~)i", nullptr},
-    {"phone_send", (void*)phone_send, "($)i", nullptr},
-    {"phone_connected", (void*)phone_connected, "()i", nullptr},
     {"screen_keep_on", (void*)screen_keep_on, "(i)i", nullptr},
     {"ui_canvas", (void*)ui_canvas, "(i)i", nullptr},
-    {"ui_camera", (void*)ui_camera, "()i", nullptr},
-    {"camera_shot", (void*)camera_shot, "($)i", nullptr},
-    {"camera_ask", (void*)camera_ask, "($)i", nullptr},
     {"canvas_clear", (void*)canvas_clear, "(i)", nullptr},
     {"canvas_line", (void*)canvas_line, "(i*~ii)", nullptr},
     {"canvas_fill", (void*)canvas_fill, "(i*~i)", nullptr},
@@ -1951,26 +1977,8 @@ NativeSymbol kNatives[] = {
     {"canvas_text", (void*)canvas_text, "(iii$iii)i", nullptr},
     {"canvas_show", (void*)canvas_show, "(i)", nullptr},
     {"canvas_size", (void*)canvas_size, "(i)i", nullptr},
-    {"photo_show", (void*)photo_show, "(i$)", nullptr},
-    {"photo_set_flags", (void*)photo_set_flags, "(ii)", nullptr},
-    {"photo_preload", (void*)photo_preload, "($)", nullptr},
-    {"photo_frame", (void*)photo_frame, "($i)i", nullptr},
-    {"reader_goto", (void*)reader_goto, "(ii)", nullptr},
-    {"reader_set_flags", (void*)reader_set_flags, "(ii)", nullptr},
-    {"reader_text", (void*)reader_text, "(i*~)i", nullptr},
-    {"text_chapters", (void*)text_chapters, "($i*~)i", nullptr},
-    {"text_chapter_at", (void*)text_chapter_at, "($i)i", nullptr},
     {"kv_get", (void*)kv_get, "($*~)i", nullptr},
     {"kv_set", (void*)kv_set, "($$)i", nullptr},
-    {"media_play", (void*)media_play, "($$$iiii)i", nullptr},
-    {"media_meta", (void*)media_meta, "($$)", nullptr},
-    {"media_control", (void*)media_control, "(i)", nullptr},
-    {"media_seek", (void*)media_seek, "(i)", nullptr},
-    {"media_state", (void*)media_state, "()i", nullptr},
-    {"media_position", (void*)media_position, "()i", nullptr},
-    {"media_duration", (void*)media_duration, "()i", nullptr},
-    {"media_mine", (void*)media_mine, "()i", nullptr},
-    {"media_info", (void*)media_info, "($*~)i", nullptr},
     {"net_get", (void*)net_get, "($*~)i", nullptr},
     {"net_get_until", (void*)net_get_until, "($*~$i)i", nullptr},
     {"assistant_context", (void*)assistant_context, "($)", nullptr},
@@ -1984,7 +1992,62 @@ NativeSymbol kNatives[] = {
     {"timer_start", (void*)timer_start, "(iii)", nullptr},
     {"timer_stop", (void*)timer_stop, "(i)", nullptr},
     {"nomi_log", (void*)nomi_log, "($)", nullptr},
+#if CONFIG_NOMI_PLAYER
+    {"ui_player", (void*)ui_player, "()i", nullptr},
+    {"media_play", (void*)media_play, "($$$iiii)i", nullptr},
+    {"media_meta", (void*)media_meta, "($$)", nullptr},
+    {"media_control", (void*)media_control, "(i)", nullptr},
+    {"media_seek", (void*)media_seek, "(i)", nullptr},
+    {"media_state", (void*)media_state, "()i", nullptr},
+    {"media_position", (void*)media_position, "()i", nullptr},
+    {"media_duration", (void*)media_duration, "()i", nullptr},
+    {"media_mine", (void*)media_mine, "()i", nullptr},
+    {"media_info", (void*)media_info, "($*~)i", nullptr},
+#endif
+#if CONFIG_NOMI_READER
+    {"ui_reader", (void*)ui_reader, "($ii)i", nullptr},
+    {"reader_goto", (void*)reader_goto, "(ii)", nullptr},
+    {"reader_set_flags", (void*)reader_set_flags, "(ii)", nullptr},
+    {"reader_text", (void*)reader_text, "(i*~)i", nullptr},
+    {"text_chapters", (void*)text_chapters, "($i*~)i", nullptr},
+    {"text_chapter_at", (void*)text_chapter_at, "($i)i", nullptr},
+#endif
+#if CONFIG_NOMI_PHOTO
+    {"ui_thumb", (void*)ui_thumb, "($)i", nullptr},
+    {"ui_photo", (void*)ui_photo, "($i)i", nullptr},
+    {"photo_show", (void*)photo_show, "(i$)", nullptr},
+    {"photo_set_flags", (void*)photo_set_flags, "(ii)", nullptr},
+    {"photo_preload", (void*)photo_preload, "($)", nullptr},
+    {"photo_frame", (void*)photo_frame, "($i)i", nullptr},
+#endif
+#if CONFIG_NOMI_PHONE
+    {"phone_listen", (void*)phone_listen, "($)i", nullptr},
+    {"phone_read", (void*)phone_read, "(*~)i", nullptr},
+    {"phone_send", (void*)phone_send, "($)i", nullptr},
+    {"phone_connected", (void*)phone_connected, "()i", nullptr},
+#endif
+#if CONFIG_NOMI_CAMERA
+    {"ui_camera", (void*)ui_camera, "()i", nullptr},
+    {"camera_shot", (void*)camera_shot, "($)i", nullptr},
+    {"camera_ask", (void*)camera_ask, "($)i", nullptr},
+#endif
 };
+
+// 应用导入了固件里没有的系统接口（这台设备没编进来的能力，见 nomi/Kconfig；或者是给更新的固件写的）：
+// 返回前几个的名字，都有返回空。运行时加载时就按名字接好了系统接口，没接上的标着 linked = false
+std::string MissingImports(wasm_module_t module) {
+    std::string names;
+    int count = 0;
+    int32_t n = wasm_runtime_get_import_count(module);
+    for (int32_t i = 0; i < n; i++) {
+        wasm_import_t imp = {};
+        wasm_runtime_get_import_type(module, i, &imp);
+        if (imp.kind != WASM_IMPORT_EXPORT_KIND_FUNC || imp.linked) continue;
+        if (count++ < 3) names += (names.empty() ? "" : "、") + std::string(imp.name ? imp.name : "?");
+    }
+    if (count > 3) names += " 等 " + std::to_string(count) + " 个";
+    return names;
+}
 
 /* ---------- 进程 ---------- */
 
@@ -2030,6 +2093,14 @@ void RunProc(Proc* p) {
 
     char err[128] = "";
     wasm_module_t module = wasm_runtime_load(buf, st.st_size, err, sizeof(err));
+    // 不然要等它调到那个接口时才出错（界面开了一半）：打开前就说清楚
+    std::string missing = module ? MissingImports(module) : "";
+    if (!missing.empty()) {
+        ESP_LOGW(TAG, "%s imports missing natives: %s", pkg->id.c_str(), missing.c_str());
+        wasm_runtime_unload(module);
+        heap_caps_free(buf);
+        return Fail(p, "这台设备没有「" + pkg->name + "」要用的功能（" + missing + "）");
+    }
     wasm_module_inst_t inst = module ? wasm_runtime_instantiate(module, kWasmStack, 0, err, sizeof(err)) : nullptr;
     wasm_exec_env_t env = inst ? wasm_runtime_create_exec_env(inst, kWasmStack) : nullptr;
     wasm_function_inst_t fmain = inst ? wasm_runtime_lookup_function(inst, "nomi_main") : nullptr;
@@ -2220,14 +2291,18 @@ void Init(Display* display) {
         ESP_LOGE(TAG, "wasm_runtime_full_init failed");
         return;
     }
+#if CONFIG_NOMI_PHONE
     // 手机（蓝牙）发来的消息交给要这一类的应用；连上 / 断开告诉在收消息的应用
     NomiPhone::SetListeners(OnPhoneMessage, OnPhoneState);
+#endif
 
+#if CONFIG_NOMI_PLAYER
     // 应用放的歌 / 节目放完了（主循环里）：告诉那个应用，接着放什么由它定
     NomiRadio::GetInstance().on_finished = [](const NomiRadio::Station& item) {
         if (item.owner.empty()) return;
         if (ProcPtr p = FindOrSpawn(item.owner)) Post(p.get(), EV_MEDIA, 0, MEDIA_FINISHED);
     };
+#endif
 
     // 系统任务也是 pthread：扫描时会登记卡片应用、起进程
     s_jobs = xQueueCreate(4, sizeof(Job));
@@ -2325,12 +2400,14 @@ bool Back(const nomi_app_t* app) {
     return true;
 }
 
+#if CONFIG_NOMI_PLAYER
 void TileToggle() {
     auto& radio = NomiRadio::GetInstance();
     Proc* owner = s_tile_owner;
     if (radio.Wanted() || !owner || radio.Current().owner == owner->pkg->id) radio.Toggle();
     else Post(owner, EV_MEDIA, 0, MEDIA_PLAY);  // 停着的不是它的（或什么都没放过）：让卡片的应用决定放什么
 }
+#endif  // CONFIG_NOMI_PLAYER
 
 void StartBackground(const NomiPackage* pkg) {
     if (!Find(pkg->id)) Spawn(pkg, nullptr);
@@ -2357,6 +2434,7 @@ void Kill(const std::string& id) {
     }
 }
 
+#if CONFIG_NOMI_PLAYER
 bool MediaCommand(int code) {
     std::string owner = NomiRadio::GetInstance().Current().owner;
     if (owner.empty()) return false;
@@ -2365,6 +2443,7 @@ bool MediaCommand(int code) {
     Post(p.get(), EV_MEDIA, 0, code);
     return true;
 }
+#endif  // CONFIG_NOMI_PLAYER
 
 }  // namespace NomiWasm
 

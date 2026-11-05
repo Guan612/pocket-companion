@@ -37,10 +37,12 @@ void Kill(const std::string& id);
 
 // 系统的播放控件（收听页、ui_player）点了上一首 / 下一首：交给放这个的应用（code 2 下一首、3 上一首）。
 // 现在放的不是应用放的返回 false
+#if CONFIG_NOMI_PLAYER
 bool MediaCommand(int code);
 // 首页卡片（应用画的「正在放」）上点了放 / 停：在放就停；停着的是卡片应用自己的就接着放；
 // 别的交给卡片应用决定放什么（NOMI_MEDIA_PLAY）。LVGL 锁里调
 void TileToggle();
+#endif
 
 // 大模型调了 self.app.command：交给那个应用（没在跑就在后台拉起来），等它回话。出错时返回 "!原因"；
 // end_conversation 为 true 时应用希望这句说完就回待机（比如开始放歌了）

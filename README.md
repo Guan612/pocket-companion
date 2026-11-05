@@ -40,7 +40,7 @@ python scripts/build.py spotpear/spotpear-esp32s3-max35 --language zh-CN
 idf.py -p COMx flash monitor
 ```
 
-- 固件底座是 [小智 xiaozhi-esp32](https://github.com/78/xiaozhi-esp32) v2.5.2（git subtree 放在 `firmware/`）；我们的代码几乎都在 `firmware/main/boards/spotpear/spotpear-esp32s3-max35/` 和 `firmware/main/protocols/direct_api_*`。同步上游：`git subtree pull --prefix=firmware https://github.com/78/xiaozhi-esp32.git <tag> --squash`。
+- 固件底座是 [小智 xiaozhi-esp32](https://github.com/78/xiaozhi-esp32) v2.5.2（git subtree 放在 `firmware/`）；我们的代码几乎都在 `firmware/main/nomi/` 和 `firmware/main/protocols/direct_api_*`。同步上游：`git subtree pull --prefix=firmware https://github.com/78/xiaozhi-esp32.git <tag> --squash`。
 - 写应用：规范和系统接口见 [docs/app-sdk.md](docs/app-sdk.md)，`python tools/app-sdk/build.py apps/<名字>` 编译打包成 `.npk`，在网页设置页「设备 → 应用」上传安装。
 - 离线地图：`python tools/map/make_map.py --name 城市 --bbox 南,西,北,东 --pbf 省份.osm.pbf`（说明在脚本开头）。
 - 模拟器：`tools/device-sim`（整机：设备屏幕 + 手机打开设置页；先编译过一次固件，再 `python build.py && python serve.py`）、`tools/face-sim`（只看表情）。

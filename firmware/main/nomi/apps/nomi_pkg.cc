@@ -3,6 +3,7 @@
 #include "assets.h"
 #include "board.h"
 #include "display/display.h"
+#include "nomi_caps.h"
 #include "nomi_flash_io.h"
 #include "nomi_open.h"
 #include "nomi_sdcard.h"
@@ -22,6 +23,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <vector>
 
 #define TAG "NomiPkg"
 
@@ -32,8 +34,31 @@ constexpr size_t kMaxPackage = 4 * 1024 * 1024;
 constexpr size_t kMaxWasm = 1024 * 1024;
 constexpr size_t kMaxManifest = 16 * 1024;
 const char* const kPermissions[] = {"sd.read", "sd.write", "media", "assistant", "keep_awake", "net", "phone", "camera"};
-// 预装的应用包：资源分区里的文件名（板子目录 preinstall/ 下，tools/app-sdk/build.py 打的）
-const char* const kPreinstalled[] = {"nomi.music.npk", "nomi.novel.npk", "nomi.photo.npk"};
+// 预装的应用包：资源分区里的文件名（nomi/preinstall/ 下，tools/app-sdk/build.py 打的）。
+// 只预装这台固件有它要的能力的（nomi/nomi.cmake 按同样的开关挑文件打进资源分区）
+const std::vector<const char*> kPreinstalled = {
+#if CONFIG_NOMI_PLAYER
+    "nomi.music.npk",
+#endif
+#if CONFIG_NOMI_READER
+    "nomi.novel.npk",
+#endif
+#if CONFIG_NOMI_PHOTO
+    "nomi.photo.npk",
+#endif
+};
+
+// 权限对应的能力：这台固件没编进来（nomi/Kconfig）的，要它的应用装了也用不了
+struct Capability {
+    const char* permission;
+    bool present;
+    const char* name;
+};
+const Capability kCapabilities[] = {
+    {"media", NOMI_HAS_PLAYER, "播放器"},
+    {"phone", NOMI_HAS_PHONE, "手机连接"},
+    {"camera", NOMI_HAS_CAMERA, "摄像头"},
+};
 
 Display* display() { return NomiWasm::GetDisplay(); }  // 不在这调 Board::GetInstance()，见 nomi_wasm.h
 
@@ -216,6 +241,16 @@ std::string ParseManifest(const std::string& text, NomiPackage& pkg) {
     }
     cJSON_Delete(root);
     return problem;
+}
+
+// 装之前：应用要的权限里有这台设备没有的能力，就别装了（装上也打不开，见 NomiWasm 的 MissingImports）
+std::string MissingCapability(const NomiPackage& pkg) {
+    for (const auto& c : kCapabilities) {
+        if (!c.present && pkg.Has(c.permission)) {
+            return std::string("这台设备没有") + c.name + "，装不了「" + pkg.name + "」（它要 " + c.permission + " 权限）";
+        }
+    }
+    return "";
 }
 
 // 填好登记到桌面的那一项（指针都指向 pkg 自己的成员，pkg 不再搬家）
@@ -750,6 +785,7 @@ std::string NomiPkg::Install(const std::string& forced_base, size_t length,
                 break;
             }
             problem = ParseManifest(text, *pkg);
+            if (problem.empty()) problem = MissingCapability(*pkg);
             if (!problem.empty()) break;
             pkg->manifest = text;
             base = forced_base;

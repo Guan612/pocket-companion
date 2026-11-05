@@ -38,6 +38,9 @@ static uint16_t *s_buf;
 enum { PAGE_HIST, PAGE_FACE, PAGE_MUSIC, PAGE_CLOCK, PAGE_COUNT };
 static lv_obj_t *s_outer, *s_settings_tile, *s_main_tile, *s_launcher_tile;  // 外层：设置 / 主界面 / 桌面
 static lv_obj_t *s_modes, *s_chat_tile, *s_hist_tile, *s_music_tile, *s_clock_tile;
+// 设备有哪些能力（NOMI_KEY_HAS_*）。没有卡片位（没有应用平台）就不建那一格，没有桌面就不建桌面那一格
+// （s_music_tile、s_launcher_tile 为 NULL）；没有播放器时卡片位里没有系统的「正在放」，只等应用的卡片
+static bool s_has_tiles = true, s_has_player = true, s_has_launcher = true;
 // 「正在放」：左半边封面、标题、下面一行、上一首 / 放停 / 下一首、音量或进度，右半边 7 行歌词（第 4 行是
 // 唱到的这句）。系统收听页里一份；应用的首页卡片（应用包调 ui_now_playing）再建一份，一起在 radio_refresh 里对
 typedef struct {
@@ -183,7 +186,7 @@ static bool face_visible(void)
     if (lv_tileview_get_tile_active(s_outer) == s_settings_tile) return false;
     if (lv_tileview_get_tile_active(s_outer) == s_launcher_tile || nomi_app_current()) return false;
     lv_obj_t *tile = lv_tileview_get_tile_active(s_modes);
-    if (tile == s_hist_tile || tile == s_music_tile || tile == s_clock_tile) return false;
+    if (tile == s_hist_tile || (s_music_tile && tile == s_music_tile) || tile == s_clock_tile) return false;
     if (s_alarm_layer && !lv_obj_has_flag(s_alarm_layer, LV_OBJ_FLAG_HIDDEN)) return false;
     return !lv_obj_is_scrolling(s_outer) && !lv_obj_is_scrolling(s_modes);
 }
@@ -200,7 +203,8 @@ static bool in_conversation(nomi_state_t state)
 static bool face_in_front(void)
 {
     lv_obj_t *outer = lv_tileview_get_tile_active(s_outer);
-    return !nomi_app_current() && outer != s_settings_tile && outer != s_launcher_tile && current_page() == PAGE_FACE;
+    return !nomi_app_current() && outer != s_settings_tile && (!s_launcher_tile || outer != s_launcher_tile) &&
+           current_page() == PAGE_FACE;
 }
 
 static void set_sheet_y(void *obj, int32_t y) { lv_obj_set_y((lv_obj_t *)obj, y); }
@@ -429,6 +433,7 @@ static lv_obj_t *s_listen_slot;
 
 lv_obj_t *nomi_ui_listen_slot(void)
 {
+    if (!s_music_tile) return NULL;  // 没有卡片位（没有应用平台）
     if (!s_listen_slot) {
         s_listen_slot = lv_obj_create(s_music_tile);
         lv_obj_remove_style_all(s_listen_slot);
@@ -978,9 +983,12 @@ static void build_display_page(lv_obj_t *page)
     static const char *const dim[] = {"30 秒", "1 分", "2 分", "5 分", "从不", ""};
     static const char *const off[] = {"2 分", "5 分", "10 分", "30 分", "从不", ""};
     static const char *const sleep_show[] = {"时钟", "表情", "相册", ""};
+    static const char *const sleep_show_no_frame[] = {"时钟", "表情", ""};  // 没有图片能力：没有相框
+    bool frame = get_int(NOMI_KEY_HAS_FRAME, 1);
     add_slider(page, "亮度", NOMI_KEY_BRIGHTNESS, MIN_BRIGHTNESS, 80);
     add_choice(page, "多久后睡着", "睡着 30 秒后调暗", NOMI_KEY_DIM, dim, 1);
-    add_choice(page, "睡着时显示", "相册：轮播图片应用里设的相框相册，不调暗", NOMI_KEY_SLEEP_SHOW, sleep_show, 1);
+    add_choice(page, "睡着时显示", frame ? "相册：轮播图片应用里设的相框相册，不调暗" : NULL, NOMI_KEY_SLEEP_SHOW,
+               frame ? sleep_show : sleep_show_no_frame, 1);
     add_choice(page, "多久后息屏", NULL, NOMI_KEY_OFF, off, 1);
     const char *city = get_text("weather_city");
     lv_obj_t *item = add_item(page, "天气城市", "跟它说「我在深圳」也能改");
@@ -1097,7 +1105,7 @@ static void on_outer_scroll_end(lv_event_t *e)
     (void)e;
     lock_outer_if_settings();
     if (lv_tileview_get_tile_active(s_outer) == s_main_tile) disarm_action_button();
-    if (lv_tileview_get_tile_active(s_outer) == s_launcher_tile) nomi_launcher_shown();
+    if (s_launcher_tile && lv_tileview_get_tile_active(s_outer) == s_launcher_tile) nomi_launcher_shown();
 }
 
 #define TAB_BAR_W 92  // 设置页左边标签栏的宽度
@@ -1210,14 +1218,15 @@ static int current_page(void)
 {
     lv_obj_t *tile = lv_tileview_get_tile_active(s_modes);
     for (int page = 0; page < PAGE_COUNT; page++) {
-        if (tile == page_tile(page)) return page;
+        if (page_tile(page) && tile == page_tile(page)) return page;
     }
     return PAGE_FACE;
 }
 
-// 代码切页面（PAGE_*）
+// 代码切页面（PAGE_*）。没建的页（没有播放器时的收听页）不切
 static void show_page(int page, bool anim)
 {
+    if (!page_tile(page)) return;
     s_page_by_code = true;
     lv_tileview_set_tile(s_modes, page_tile(page), anim ? LV_ANIM_ON : LV_ANIM_OFF);
     s_page_by_code = false;
@@ -1228,12 +1237,14 @@ static void show_page(int page, bool anim)
 
 /* ---------- 页码小圆点 ---------- */
 
+// 一页一个点，没建的页不算
 static void update_dots(void)
 {
     if (!s_dots) return;
-    int page = current_page();
+    int page = current_page(), dot_index = 0;
     for (int i = 0; i < PAGE_COUNT; i++) {
-        lv_obj_t *dot = lv_obj_get_child(s_dots, i);
+        if (!page_tile(i)) continue;
+        lv_obj_t *dot = lv_obj_get_child(s_dots, dot_index++);
         lv_obj_set_style_bg_opa(dot, i == page ? LV_OPA_COVER : LV_OPA_40, 0);
     }
 }
@@ -1247,6 +1258,7 @@ static void create_dots(void)
     lv_obj_set_style_pad_column(s_dots, 8, 0);
     lv_obj_remove_flag(s_dots, LV_OBJ_FLAG_CLICKABLE);
     for (int i = 0; i < PAGE_COUNT; i++) {
+        if (!page_tile(i)) continue;
         lv_obj_t *dot = lv_obj_create(s_dots);
         lv_obj_remove_style_all(dot);
         lv_obj_set_size(dot, 6, 6);
@@ -1423,7 +1435,7 @@ static void now_view_refresh(now_view_t *v, int state, int kind, bool force)
 // 对一次收听页、应用卡片和左上角小条。force 时音量条也对一下
 static void radio_refresh(bool force)
 {
-    if (!s_music_tile) return;
+    if (!s_music_tile || !s_has_player) return;
     int state = get_int("radio_state", RADIO_OFF);
     int kind = get_int("music_playing", 0) ? 2 : get_int("pod_playing", 0) ? 1 : 0;
 
@@ -1628,10 +1640,20 @@ static void build_music_page(void)
     lv_obj_set_size(s_listen_sys, LV_PCT(100), LV_PCT(100));
     lv_obj_remove_flag(s_listen_sys, (lv_obj_flag_t)(LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE));
 
-    now_view_build(&s_now, s_listen_sys, false);
-
     lv_obj_add_flag(s_music_tile, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_add_event_cb(s_music_tile, on_face_pressed, LV_EVENT_PRESSED, NULL);
+
+    if (!s_has_player) {
+        // 没有播放器：系统没有「正在放」可显示，这一格只等应用插卡片
+        lv_obj_t *hint = lv_label_create(s_listen_sys);
+        lv_label_set_text(hint, "带卡片的应用装上后\n卡片会出现在这里");
+        lv_obj_set_style_text_align(hint, LV_TEXT_ALIGN_CENTER, 0);
+        lv_obj_set_style_text_opa(hint, LV_OPA_60, 0);
+        lv_obj_center(hint);
+        return;
+    }
+
+    now_view_build(&s_now, s_listen_sys, false);
 
     // 表情页左上角的小条（浮在主界面上，只在表情页显示）
     s_radio_mini = lv_obj_create(s_main_tile);
@@ -2043,24 +2065,28 @@ void nomi_ui_create(lv_obj_t *screen, uint16_t *face_buf, const lv_font_t *font,
     s_font = font;
     s_cb = *callbacks;
     s_subtitles_on = get_int(NOMI_KEY_SUBTITLES, 1);
+    s_has_tiles = get_int(NOMI_KEY_HAS_TILES, 1);
+    s_has_player = get_int(NOMI_KEY_HAS_PLAYER, 1);
+    s_has_launcher = get_int(NOMI_KEY_HAS_LAUNCHER, 1);
 
     lv_obj_set_style_bg_color(screen, lv_color_black(), 0);
     lv_obj_remove_flag(screen, LV_OBJ_FLAG_SCROLLABLE);
 
-    // 外层上下翻：设置在上（往下拉），主界面在中间，应用列表在下（往上推）
+    // 外层上下翻：设置在上（往下拉），主界面在中间，应用列表在下（往上推；没有桌面时只能往下拉）
     s_outer = add_tileview(screen);
     s_settings_tile = add_tile(s_outer, 0, 0, LV_DIR_BOTTOM, C_PAGE);
-    s_main_tile = add_tile(s_outer, 0, 1, LV_DIR_VER, 0x000000);
-    s_launcher_tile = add_tile(s_outer, 0, 2, LV_DIR_TOP, 0x000000);
+    s_main_tile = add_tile(s_outer, 0, 1, s_has_launcher ? LV_DIR_VER : LV_DIR_TOP, 0x000000);
+    if (s_has_launcher) s_launcher_tile = add_tile(s_outer, 0, 2, LV_DIR_TOP, 0x000000);
     lv_obj_add_event_cb(s_outer, on_outer_scroll, LV_EVENT_SCROLL_BEGIN, NULL);
     lv_obj_add_event_cb(s_outer, on_outer_scroll_end, LV_EVENT_SCROLL_END, NULL);
 
-    // 主界面里从左到右：历史对话、表情（首页）、电台、时钟
+    // 主界面里从左到右：历史对话、表情（首页）、卡片位（应用的卡片 / 系统的「正在放」，有应用平台才有）、时钟
     s_modes = add_tileview(s_main_tile);
-    s_hist_tile = add_tile(s_modes, PAGE_HIST, 0, LV_DIR_RIGHT, C_PAGE);
-    s_chat_tile = add_tile(s_modes, PAGE_FACE, 0, LV_DIR_HOR, 0x000000);
-    s_music_tile = add_tile(s_modes, PAGE_MUSIC, 0, LV_DIR_HOR, 0x000000);
-    s_clock_tile = add_tile(s_modes, PAGE_CLOCK, 0, LV_DIR_LEFT, 0x000000);
+    uint8_t col = 0;
+    s_hist_tile = add_tile(s_modes, col++, 0, LV_DIR_RIGHT, C_PAGE);
+    s_chat_tile = add_tile(s_modes, col++, 0, LV_DIR_HOR, 0x000000);
+    if (s_has_tiles) s_music_tile = add_tile(s_modes, col++, 0, LV_DIR_HOR, 0x000000);
+    s_clock_tile = add_tile(s_modes, col++, 0, LV_DIR_LEFT, 0x000000);
     lv_obj_add_event_cb(s_modes, on_page_changed, LV_EVENT_VALUE_CHANGED, NULL);
     lv_obj_add_event_cb(s_modes, on_modes_scroll, LV_EVENT_SCROLL_BEGIN, NULL);
 
@@ -2084,7 +2110,7 @@ void nomi_ui_create(lv_obj_t *screen, uint16_t *face_buf, const lv_font_t *font,
     lv_obj_add_flag(s_hist_list, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_add_event_cb(s_hist_list, on_face_pressed, LV_EVENT_PRESSED, NULL);
 
-    build_music_page();
+    if (s_music_tile) build_music_page();
     build_clock_page();
 
     // 以下浮在主界面上，左右切模式时不动
@@ -2119,8 +2145,9 @@ void nomi_ui_create(lv_obj_t *screen, uint16_t *face_buf, const lv_font_t *font,
 
     create_dots();
 
-    // 底部小横条：提示往上推是应用列表（和顶上提示下拉设置的那条对称）
+    // 底部小横条：提示往上推是应用列表（和顶上提示下拉设置的那条对称）；没有桌面就不画
     lv_obj_t *grip_bottom = lv_obj_create(s_main_tile);
+    if (!s_has_launcher) lv_obj_add_flag(grip_bottom, LV_OBJ_FLAG_HIDDEN);
     lv_obj_remove_style_all(grip_bottom);
     lv_obj_set_size(grip_bottom, 44, 4);
     lv_obj_set_style_radius(grip_bottom, 2, 0);
@@ -2130,6 +2157,7 @@ void nomi_ui_create(lv_obj_t *screen, uint16_t *face_buf, const lv_font_t *font,
 
     // 应用层盖在卡片上，对话浮层再盖在应用上（闹钟层响铃时才建，在最上面）
     nomi_apps_init(screen, s_launcher_tile, font, user_activity, go_home, apps_toast);
+    nomi_apps_set_appmgr(get_int(NOMI_KEY_HAS_APPS, 1));
     create_sheet(screen);
 
     build_settings();

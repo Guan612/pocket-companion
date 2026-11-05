@@ -15,7 +15,7 @@ HERE = pathlib.Path(__file__).resolve().parent
 FIRMWARE = HERE.parent.parent / "firmware"
 FONTS = FIRMWARE / "managed_components" / "78__xiaozhi-fonts"
 FONT_BIN = "font_noto_sans_common_20_4.bin"  # 设备上 BUILTIN_TEXT_FONT 对应的中文字体
-BOARD = FIRMWARE / "main" / "boards" / "spotpear" / "spotpear-esp32s3-max35"
+BOARD = FIRMWARE / "main" / "nomi" / "core"  # 界面代码（nomi_ui.c、nomi_app.c、表情），和设备同一份
 CJSON = FIRMWARE / "managed_components" / "espressif__cjson" / "cJSON"  # 表情脚本解析用，和设备同一份
 EXPORTS = [
     "sim_init", "sim_frame", "sim_clear_dirty", "sim_lcd",

@@ -11,7 +11,9 @@
 //   这块板（R30 不焊、功放常开）实测边读卡边放声音没问题。
 #pragma once
 
+#include <driver/gpio.h>
 #include <esp_timer.h>
+#include <hal/spi_types.h>
 #include <sd_protocol_types.h>
 
 #include <atomic>
@@ -27,7 +29,14 @@ public:
 
     static NomiSdCard& GetInstance();
 
-    // 卸载、释放 SPI 总线后调：板子把 GPIO43 还给功放
+    // 卡座接在哪（SPI 模式；卡座的 D1/D2、插卡检测脚用不上）。板子开机时调一次，没调过就当这台机器没有卡座
+    struct Pins {
+        spi_host_device_t host;
+        gpio_num_t cs, miso, clk, mosi;
+    };
+    void Configure(const Pins& pins);
+
+    // 卸载、释放 SPI 总线后调：卡的引脚和别的东西共用时，板子在这里收回来（SpotPear 板子把 GPIO43 还给功放）
     std::function<void()> on_bus_released;
 
     // 用卡前 Acquire（挂上了返回 true），用完 Release。最后一个 Release 后闲置一会儿自动卸载。
@@ -65,6 +74,8 @@ public:
 
 private:
     std::mutex mutex_;
+    Pins pins_ = {};
+    bool configured_ = false;
     sdmmc_card_t* card_ = nullptr;
     bool bus_ready_ = false;
     int users_ = 0;

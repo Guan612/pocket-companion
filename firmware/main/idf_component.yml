@@ -51,7 +51,7 @@ dependencies:
     version: ^2.1.7
     rules:
     - if: target in [esp32s3]
-  # spotpear-esp32s3-max35 的应用包（WebAssembly）运行时，见 docs/app-sdk.md
+  # Nomi 应用平台（nomi/apps/，CONFIG_NOMI_APPS）的 WebAssembly 运行时，见 docs/app-sdk.md
   espressif/wasm-micro-runtime:
     version: ^2.4.0~1
     rules:

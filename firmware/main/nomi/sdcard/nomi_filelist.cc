@@ -3,7 +3,7 @@
 #include "display/display.h"
 #include "nomi_sdcard.h"
 #include "nomi_style.h"
-#include "nomi_wasm.h"
+#include "nomi_display.h"
 
 #include <esp_log.h>
 #include <esp_pthread.h>
@@ -262,7 +262,7 @@ void Load(const StatePtr& st, const std::string& dir) {
     Note(st->body, "正在读…");
     lv_obj_t* scroller = lv_obj_get_parent(st->list);  // 换了一层回到顶上
     if (scroller) lv_obj_scroll_to_y(scroller, 0, LV_ANIM_OFF);
-    Display* display = NomiWasm::GetDisplay();
+    Display* display = NomiDisplay::Get();
     NomiFileList::RunInBackground([st, dir, gen, display] {
         std::vector<NomiFiles::Entry> entries;
         bool truncated = false;

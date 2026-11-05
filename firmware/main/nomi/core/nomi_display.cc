@@ -6,15 +6,22 @@
 #include "display/lvgl_display/lvgl_theme.h"
 #include "face_script.h"
 #include "nomi_clock.h"
+#include "nomi_caps.h"
 #include "nomi_font.h"
-#include "nomi_hotspot.h"
 #include "nomi_sheet.h"
+#include "nomi_ui.h"
+#include "settings.h"
+#if CONFIG_NOMI_HOTSPOT
+#include "nomi_hotspot.h"
+#endif
+#if CONFIG_NOMI_PHOTO
 #include "nomi_photo.h"
+#endif
+#if CONFIG_NOMI_PLAYER
 #include "nomi_music.h"
 #include "nomi_radio.h"
-#include "nomi_ui.h"
 #include "nomi_wasm.h"
-#include "settings.h"
+#endif
 #include "wifi_board.h"
 #if CONFIG_DIRECT_API
 #include "direct_api_config_server.h"
@@ -132,6 +139,23 @@ std::string VoiceLabel(const std::string& voice) {
     return cut == std::string::npos ? voice : voice.substr(cut + 1);
 }
 
+// 离线热点（没编进来时当它一直关着，只剩小智的配网热点）
+bool HotspotActive() {
+#if CONFIG_NOMI_HOTSPOT
+    return NomiHotspot::Active();
+#else
+    return false;
+#endif
+}
+
+#if CONFIG_NOMI_HOTSPOT
+std::string HotspotSsid() { return NomiHotspot::Ssid(); }
+std::string HotspotUrl() { return NomiHotspot::Url(); }
+#else
+std::string HotspotSsid() { return ""; }
+std::string HotspotUrl() { return ""; }
+#endif
+
 void ApplyAec(bool on) {
     Application::GetInstance().SetAecMode(on && NomiDisplay::aec_supported ? kAecOnDeviceSide : kAecOff);
 }
@@ -174,11 +198,19 @@ int GetInt(const char* key, int def) {
         return Settings(kDirectApiNs).GetString("one_shot") == "1";
     }
     if (!strcmp(key, "weather_code")) return NomiClock::GetInstance().WeatherCode();
+    if (!strcmp(key, NOMI_KEY_HAS_TILES)) return NOMI_HAS_APPS;  // 卡片是应用插的：有应用平台才有卡片位
+    if (!strcmp(key, NOMI_KEY_HAS_PLAYER)) return NOMI_HAS_PLAYER;
+    if (!strcmp(key, NOMI_KEY_HAS_FRAME)) return NOMI_HAS_PHOTO;
+    if (!strcmp(key, NOMI_KEY_HAS_APPS)) return NOMI_HAS_APPS;
+    // 桌面上至少有个系统应用「文件」（SD 卡）或装上的应用才有桌面
+    if (!strcmp(key, NOMI_KEY_HAS_LAUNCHER)) return NOMI_HAS_SDCARD || NOMI_HAS_APPS;
+#if CONFIG_NOMI_PLAYER
     if (!strcmp(key, "radio_state")) return NomiRadio::GetInstance().GetState();
     if (!strcmp(key, "pod_playing")) return NomiRadio::GetInstance().IsEpisode();
     if (!strcmp(key, "pod_pos")) return NomiRadio::GetInstance().Position();
     if (!strcmp(key, "pod_dur")) return NomiRadio::GetInstance().Current().duration;
     if (!strcmp(key, "music_playing")) return NomiMusic::GetInstance().Playing();
+#endif
     if (!strcmp(key, NOMI_KEY_PERSONA)) {
         // 按当前提示词反查是哪个预设；网页里改过就算自定义
         std::string prompt = Settings(kDirectApiNs).GetString("prompt");
@@ -283,20 +315,20 @@ const char* GetText(const char* key) {
         }
     } else if (!strcmp(key, "hotspot")) {
         // 离线热点或配网热点，都不在时是空的（设置页签名里有它，热点开了下次下拉会重建出二维码）
-        if (NomiHotspot::Active()) {
-            text = NomiHotspot::Ssid();
+        if (HotspotActive()) {
+            text = HotspotSsid();
         } else {
             text = WifiManager::GetInstance().GetApSsid();
         }
     } else if (!strcmp(key, "hotspot_url")) {
-        if (NomiHotspot::Active()) {
-            text = NomiHotspot::Url();
+        if (HotspotActive()) {
+            text = HotspotUrl();
         } else if (WifiManager::GetInstance().IsConfigMode()) {
             text = WifiManager::GetInstance().GetApWebUrl();
         }
     } else if (!strcmp(key, "hotspot_mode")) {
         // "offline" 离线热点 / "config" 配网热点 / 空都不是，网络页拿它换标题和提示语
-        if (NomiHotspot::Active()) {
+        if (HotspotActive()) {
             text = "offline";
         } else if (WifiManager::GetInstance().IsConfigMode()) {
             text = "config";
@@ -321,6 +353,7 @@ const char* GetText(const char* key) {
         text = NomiClock::GetInstance().WeatherCity();
     } else if (!strcmp(key, "alarms")) {
         text = NomiClock::GetInstance().AlarmsText();
+#if CONFIG_NOMI_PLAYER
     } else if (!strcmp(key, "radio_name")) {
         text = NomiRadio::GetInstance().StationName();
     } else if (!strcmp(key, "radio_title")) {
@@ -332,16 +365,21 @@ const char* GetText(const char* key) {
         text = NomiMusic::GetInstance().LyricsWindow();
     } else if (!strcmp(key, "music_hint")) {
         text = NomiMusic::GetInstance().Hint();
+#endif
     }
     return text.c_str();
 }
 
 // 封面：歌和应用给的节目封面（media_meta）都在 NomiMusic，两块缓冲轮着用，换图时 version 加一
 const uint16_t* GetImage(const char* key, int* size, int* version) {
+#if CONFIG_NOMI_PLAYER
     if (!strcmp(key, "pod_cover") || !strcmp(key, "music_cover")) {
         *size = NomiMusic::kCoverSize;
         return NomiMusic::GetInstance().Cover(*version);
     }
+#else
+    (void)key, (void)size, (void)version;
+#endif
     return nullptr;
 }
 
@@ -353,6 +391,7 @@ void Action(const char* name) {
         NomiClock::GetInstance().Snooze();
     } else if (!strncmp(name, "alarm_delete:", 13)) {
         NomiClock::GetInstance().DeleteAlarm(atoi(name + 13));
+#if CONFIG_NOMI_PLAYER
     } else if (!strcmp(name, "radio_toggle")) {
         NomiRadio::GetInstance().Toggle();
     } else if (!strcmp(name, "tile_toggle")) {
@@ -365,6 +404,7 @@ void Action(const char* name) {
         auto& radio = NomiRadio::GetInstance();
         radio.SeekTo(atoi(name + 12));
         if (!radio.Wanted()) radio.Toggle();
+#endif
     } else if (!strcmp(name, "abort_speaking")) {
         // 对话浮层的 ×：正在说话就打断（Schedule 进主循环，协议要在那边发）；
         // 别的状态不动对话，浮层自己收就行
@@ -373,8 +413,10 @@ void Action(const char* name) {
         }
     } else if (!strcmp(name, "reconfigure_wifi")) {
         app.Schedule([]() {
+#if CONFIG_NOMI_HOTSPOT
             // 配网热点和离线热点用同一个 AP 接口，先收掉我们的
             NomiHotspot::StopForConfigMode();
+#endif
             static_cast<WifiBoard&>(Board::GetInstance()).EnterWifiConfigMode();
         });
     } else if (!strcmp(name, "factory_reset")) {
@@ -402,6 +444,7 @@ void Action(const char* name) {
 
 }  // namespace
 
+NomiDisplay* NomiDisplay::instance_ = nullptr;
 bool NomiDisplay::aec_supported = false;
 std::function<void()> NomiDisplay::on_user_activity;
 std::function<void()> NomiDisplay::on_power_timing_changed;
@@ -434,7 +477,9 @@ NomiDisplay::NomiDisplay(esp_lcd_panel_io_handle_t panel_io, esp_lcd_panel_handl
                          int width, int height, int offset_x, int offset_y, bool mirror_x,
                          bool mirror_y, bool swap_xy)
     : SpiLcdDisplay(panel_io, panel, width, height, offset_x, offset_y, mirror_x, mirror_y,
-                    swap_xy, NomiDisplayOptions()) {}
+                    swap_xy, NomiDisplayOptions()) {
+    instance_ = this;
+}
 
 void NomiDisplay::GetIdleSeconds(int& dim_seconds, int& off_seconds) {
     static const int dim[] = NOMI_DIM_SECONDS;
@@ -489,6 +534,7 @@ void NomiDisplay::SetupUI() {
         .history_get = HistoryGet,
         .history_dropped = HistoryDropped,
         .get_image = GetImage,
+#if CONFIG_NOMI_PHOTO
         .frame = [](bool on) {
             if (!on) {
                 NomiPhoto::FrameStop();
@@ -499,6 +545,9 @@ void NomiDisplay::SetupUI() {
                 if (NomiDisplay::on_user_activity) NomiDisplay::on_user_activity();
             });
         },
+#else
+        .frame = nullptr,  // 没有图片能力：睡着时不能显示相册
+#endif
     };
     // 先用内置字体，资源分区里的完整中文字体加载后会经 SetTextFont 换上
     nomi_ui_create(screen, face_buf_, &BUILTIN_TEXT_FONT, &callbacks);

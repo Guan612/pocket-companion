@@ -6,25 +6,16 @@
 #include "config.h"
 #include "mcp_server.h"
 #include "esp32_camera.h"
-#if CONFIG_DIRECT_API
-#include "direct_api_config_server.h"
-#include "direct_api_protocol.h"
-#endif
-#include "nomi_camera.h"
 #include "nomi_clock.h"
 #include "nomi_display.h"
-#include "nomi_music.h"
-#include "nomi_open.h"
-#include "nomi_files.h"
-#include "nomi_filesapp.h"
-#include "nomi_hotspot.h"
-#include "nomi_phone.h"
-#include "nomi_photo.h"
-#include "nomi_pkg.h"
-#include "nomi_radio.h"
-#include "nomi_sdcard.h"
-#include "nomi_wasm.h"
+#include "nomi_system.h"
 #include "nomi_ui.h"
+#if CONFIG_NOMI_CAMERA
+#include "nomi_camera.h"
+#endif
+#if CONFIG_NOMI_SDCARD
+#include "nomi_sdcard.h"
+#endif
 #include "power_save_timer.h"
 #include "wifi_board.h"
 
@@ -44,6 +35,9 @@
 #include <mutex>
 
 #define TAG "SpotpearMax35"
+
+// 这里只管这块板子的引脚和硬件；界面和系统能力（应用、播放、SD 卡上的东西……）在 main/nomi/，
+// 开机最后交给 NomiSystem::Start，开哪些能力看 nomi/Kconfig 的 CONFIG_NOMI_*
 
 // esp32-camera 内部的启停（driver/cam_hal.c，没进公开头文件）：只停 DMA 和场同步中断，
 // 传感器、帧缓冲、采集任务都留着，再 cam_start() 从下一帧接着收
@@ -119,7 +113,9 @@ private:
         ESP_ERROR_CHECK(esp_lcd_panel_swap_xy(panel, DISPLAY_SWAP_XY));
         ESP_ERROR_CHECK(esp_lcd_panel_mirror(panel, DISPLAY_MIRROR_X, DISPLAY_MIRROR_Y));
         ESP_ERROR_CHECK(esp_lcd_panel_disp_on_off(panel, true));
+#if CONFIG_NOMI_CAMERA
         NomiCamera::GatePanel(panel);  // 摄像头收帧时先别刷屏（两边的 DMA 抢 PSRAM，见 nomi_camera.h）
+#endif
 
         display_ = new NomiDisplay(panel_io, panel, DISPLAY_WIDTH, DISPLAY_HEIGHT,
                                    DISPLAY_OFFSET_X, DISPLAY_OFFSET_Y, DISPLAY_MIRROR_X,
@@ -222,14 +218,11 @@ private:
     }
 
     void InitializePowerSave() {
-        // 放歌不算忙：待机时后台还在放（电台、歌、节目）不挡睡着——屏幕按设置变时钟/表情、
-        // 调暗、息屏，歌继续放；摸一下屏幕照常回原来的页面
-        Application::GetInstance().SetPlaybackAllowsSleep([]() { return NomiRadio::GetInstance().Wanted(); });
         const esp_timer_create_args_t dim_args = {
             .callback = [](void* arg) {
                 auto* self = static_cast<SpotpearMax35Board*>(arg);
                 // 电子相框在放就不调暗（当相框用就是要亮着看），到息屏时间照样关
-                if (self->sleeping_ && !NomiPhoto::FrameActive()) self->GetBacklight()->SetBrightness(DIM_BRIGHTNESS);
+                if (self->sleeping_ && !NomiSystem::KeepBright()) self->GetBacklight()->SetBrightness(DIM_BRIGHTNESS);
             },
             .arg = this,
             .dispatch_method = ESP_TIMER_TASK,
@@ -257,6 +250,8 @@ private:
         };
     }
 
+#if CONFIG_NOMI_CAMERA
+    // 摄像头只给 Nomi 用（大模型看一眼、相机应用），关了 CONFIG_NOMI_CAMERA 就不初始化
     void InitializeCamera() {
         camera_config_t config = {};
         config.pin_pwdn = CAMERA_PIN_PWDN;
@@ -298,6 +293,20 @@ private:
             NomiCamera::Init();  // 拍照、取景器都在 nomi_camera.cc
         }
     }
+#endif
+
+#if CONFIG_NOMI_SDCARD
+    // TF 卡的引脚交给 Nomi（用的时候它自己挂载）。卸载后把 GPIO43 还给功放（R30 焊上的板子它是功放开关），
+    // 电平按现在出不出声来
+    void InitializeSdCard() {
+        auto& sd = NomiSdCard::GetInstance();
+        sd.Configure({SD_SPI_HOST, SD_CS_PIN, SD_MISO_PIN, SD_CLK_PIN, SD_MOSI_PIN});
+        sd.on_bus_released = [this]() {
+            gpio_set_direction(AUDIO_CODEC_PA_PIN, GPIO_MODE_OUTPUT);
+            gpio_set_level(AUDIO_CODEC_PA_PIN, GetAudioCodec()->output_enabled() ? 1 : 0);
+        };
+    }
+#endif
 
     // BOOT 键说话：默认按住说话（像对讲机），设置里可改成点一下开始、说完自动结束
     bool HoldToTalk() { return NomiDisplay::GetSavedInt(NOMI_KEY_TALK_KEY, 0) == 0; }
@@ -343,144 +352,6 @@ private:
                                EnterWifiConfigMode();
                                return true;
                            });
-        // 表情脚本：主人明确要表演时大模型调这个工具；平时它在回复开头写 <face>…</face>（见 NomiDisplay::FacePrompt）
-        mcp_server.AddTool("self.face.play",
-                           "让你的脸表演一段动作。主人明确要你做表情、做鬼脸、跳舞、弹吉他之类时用；"
-                           "script 是表情脚本 JSON（步骤数组，格式和回复里的 <face> 一样）。",
-                           PropertyList({Property("script", kPropertyTypeString)}),
-                           [this](const PropertyList& properties) -> ToolResult {
-                               std::string error;
-                               if (!display_->PlayFace(properties["script"].value<std::string>(), error)) {
-                                   return std::unexpected(error);
-                               }
-                               return std::string("正在表演");
-                           });
-        // 时钟页：闹钟、倒计时提醒、天气城市
-        auto& clock = NomiClock::GetInstance();
-        clock.RegisterTools();
-        clock.on_ring_start = [this](const std::string& time, const std::string& label) {
-            NomiRadio::GetInstance().SetAlarmHold(true);  // 电台先停，别和铃声混在一起
-            WakeScreen();  // 睡着 / 息屏也要亮起来
-            GetBacklight()->RestoreBrightness();
-            display_->ShowAlarm(time, label);
-        };
-        clock.on_ring_stop = [this]() {
-            display_->HideAlarm();
-            NomiRadio::GetInstance().SetAlarmHold(false);
-        };
-        // 播放器：系统只留「停 / 暂停」这一个工具，放什么、换哪个都归应用（self.app.command）
-        NomiRadio::GetInstance().RegisterTools();
-        // 应用包的指令：哪些应用有哪些指令写在每轮的系统提示里（NomiPkg::PromptContext），这里只一个通用入口，
-        // 装、删应用不用改工具列表
-        mcp_server.AddTool(
-            "self.app.command",
-            "让装好的应用做事（比如音乐应用放歌）。能用的 app、command 见系统提示里「装好的应用能做的事」；"
-            "arg 按指令说明填，没有就空字符串。",
-            PropertyList({Property("app", kPropertyTypeString), Property("command", kPropertyTypeString),
-                          Property("arg", kPropertyTypeString, std::string("")).SetMaxLength(200)}),
-            [](const PropertyList& p) -> ToolResult {
-                bool end = false;
-                std::string r = NomiWasm::VoiceCommand(p["app"].value<std::string>(),
-                                                       p["command"].value<std::string>(),
-                                                       p["arg"].value<std::string>(), &end);
-                if (!r.empty() && r[0] == '!') return std::unexpected(r.substr(1));
-#if CONFIG_DIRECT_API
-                if (end) DirectApiProtocol::ExitAfterReply();  // 开始放了：这句说完就回待机，声音才出得来
-#endif
-                return r;
-            });
-        // TF 卡卸载后把 GPIO43 还给功放（R30 焊上的板子它是功放开关），电平按现在出不出声来
-        NomiSdCard::GetInstance().on_bus_released = [this]() {
-            gpio_set_direction(AUDIO_CODEC_PA_PIN, GPIO_MODE_OUTPUT);
-            gpio_set_level(AUDIO_CODEC_PA_PIN, GetAudioCodec()->output_enabled() ? 1 : 0);
-        };
-#if CONFIG_DIRECT_API
-        // 每轮对话的系统提示词里带上现在几点、天气、已设的闹钟（设"明早 7 点"要知道今天是哪天）、
-        // 装好的应用能做什么（放歌、电台、播客都在里面）
-        DirectApiProtocol::context_provider = []() {
-            return NomiClock::GetInstance().PromptContext() + "\n" + NomiPkg::GetInstance().PromptContext() + "\n" +
-                   NomiWasm::PromptContext();
-        };
-        DirectApiConfigServer::on_city_changed = []() { NomiClock::GetInstance().RefreshWeather(); };
-        // 网页设置页的「应用」卡片：上传 .npk 安装、列出、删除
-        DirectApiConfigServer::AddUploadHandler(
-            "/apps/install", [](size_t length, const std::function<int(char*, size_t)>& read) {
-                return NomiPkg::GetInstance().InstallJson(length, read);
-            });
-        DirectApiConfigServer::AddJsonHandler("/apps.json", false,
-                                              [](const std::string&) { return NomiPkg::GetInstance().ListJson(); });
-        DirectApiConfigServer::AddJsonHandler("/apps/remove", true, [](const std::string& body) {
-            return NomiPkg::GetInstance().RemoveJson(body);
-        });
-        DirectApiConfigServer::AddJsonHandler("/apps/open", true, [](const std::string& body) {
-            return NomiPkg::GetInstance().OpenJson(body);
-        });
-        // 应用自带的网页设置页：/app/<id>/ 是包里的 assets/web/，POST /app/<id>/call 交给应用
-        DirectApiConfigServer::AddPrefixHandler(
-            "/app/", [](const std::string& uri, bool post, const std::string& body, std::string& type,
-                        std::string& out) { return NomiPkg::GetInstance().WebRequest(uri, post, body, type, out); });
-        // 网页设置页的「SD 卡」卡片：每次读都当场检测
-        DirectApiConfigServer::AddJsonHandler("/sd.json", false,
-                                              [](const std::string&) { return NomiSdCard::GetInstance().StatusJson(); });
-        // 卡上的图片当场解成 BMP（网页预览用）：/sd/preview/<宽>x<高>/<路径>
-        DirectApiConfigServer::AddPrefixHandler(
-            "/sd/preview/", [](const std::string& uri, bool, const std::string&, std::string& type, std::string& out) {
-                return NomiPhoto::PreviewBmp(uri, type, out);
-            });
-        // 网页的文件管理：列、新建文件夹、改名、删除、下载（边读边发）
-        DirectApiConfigServer::AddJsonHandler("/sd/list", true, NomiFiles::ListJson);
-        DirectApiConfigServer::AddJsonHandler("/sd/mkdir", true, NomiFiles::MkdirJson);
-        DirectApiConfigServer::AddJsonHandler("/sd/rename", true, NomiFiles::RenameJson);
-        DirectApiConfigServer::AddJsonHandler("/sd/delete", true, NomiFiles::DeleteJson);
-        DirectApiConfigServer::AddJsonHandler("/sd/open", true, NomiOpen::OpenJson);  // 在设备上打开
-        DirectApiConfigServer::AddStreamHandler(
-            "/sd/file/", [](const std::string& uri, const DirectApiConfigServer::StreamBegin& begin,
-                            const DirectApiConfigServer::StreamWrite& write) {
-                return NomiFiles::Download(uri, begin, write);
-            });
-        // 往卡上传文件（字体、书）：请求体第一行是卡上的路径
-        DirectApiConfigServer::AddUploadHandler(
-            "/sd/upload", [](size_t length, const std::function<int(char*, size_t)>& read) {
-                return NomiSdCard::GetInstance().UploadJson(length, read);
-            });
-        DirectApiProtocol::face_prompt = NomiDisplay::FacePrompt();
-        DirectApiProtocol::face_handler = [this](const std::string& json, std::string& error) {
-            return display_->PlayFace(json, error);
-        };
-        // 应用的「问它」（camera_ask）：照片挂上，待机就开始对话、在说话就打断转去听、已经在听就跟着这一轮发
-        NomiCamera::ask_handler = [](std::string jpeg, const std::string& question) {
-            DirectApiProtocol::AttachImage(std::move(jpeg), true, question);
-            Application::GetInstance().Schedule([]() {
-                auto& app = Application::GetInstance();
-                auto state = app.GetDeviceState();
-                if (state == kDeviceStateIdle) app.ToggleChatState();
-                else if (state == kDeviceStateSpeaking) app.AbortSpeaking(kAbortReasonNone);
-            });
-            return true;
-        };
-        // 让大模型看一眼摄像头：拍照和编码要一两秒，放到独立任务里做，别卡主循环；
-        // 拍好的 JPEG 经 AttachImage 交给直连协议，由它随下一轮请求发给视觉模型（见 Chat()）
-        mcp_server.AddTool("self.camera.look",
-                           "看一眼摄像头拍到的画面并说出看到了什么。主人让你看东西、认东西、读画面上的文字、"
-                           "描述眼前的场景时调用；question 写上你想从画面里知道的问题。",
-                           PropertyList({Property("question", kPropertyTypeString)}),
-                           [this](const PropertyList& properties) -> ToolResult {
-                               (void)properties;
-                               if (xTaskCreate(
-                                       [](void* arg) {
-                                           (void)arg;
-                                           std::string jpeg = NomiCamera::Capture();
-                                           if (!jpeg.empty()) {
-                                               DirectApiProtocol::AttachImage(std::move(jpeg));
-                                           }
-                                           vTaskDelete(nullptr);
-                                       },
-                                       "cam_look", 8192, this, 3, nullptr) != pdPASS) {
-                                   return std::unexpected("相机忙，稍后再试");
-                               }
-                               return std::string("已拍下画面，照片随后作为用户消息发给你");
-                           });
-#endif
     }
 
 public:
@@ -491,29 +362,30 @@ public:
         InitializeTouch();
         InitializePowerSave();
         InitializeBattery();
+#if CONFIG_NOMI_CAMERA
         InitializeCamera();
+#endif
+#if CONFIG_NOMI_SDCARD
+        InitializeSdCard();
+#endif
         InitializeButtons();
         InitializeTools();
-        NomiClock::GetInstance().Start();  // 时区、闹钟；联网后自己对时、拉天气
-        NomiRadio::GetInstance().Start();  // 收流 / 解码任务（平时睡着）；放什么由应用决定
-        NomiMusic::GetInstance().Start();  // 下封面的后台任务
-        NomiWasm::Init(display_);          // 应用包的运行时（docs/app-sdk.md）
-        NomiPhoto::Start(display_);        // 后台解图（缩略图、看图、电子相框）
-        {
-            DisplayLockGuard lock(display_);
-            NomiFilesApp::Register();      // 系统应用「文件」
-        }
-        NomiOpen::Start();                 // 记住的「用什么打开」
-        NomiPkg::GetInstance().Start();    // 预装应用、迁老数据、扫装好的应用包，登记到桌面
-        NomiPhone::Start();                // 蓝牙连手机（Gadgetbridge）
+        NomiSystem::Start(display_, {
+                                        // 闹钟响了：睡着 / 息屏 / 调暗了都亮起来
+                                        .wake_screen =
+                                            [this]() {
+                                                WakeScreen();
+                                                GetBacklight()->RestoreBrightness();
+                                            },
+                                    });
         GetBacklight()->RestoreBrightness();
     }
 
     // 离线热点的事件要挂在默认事件循环上，而循环是 WifiManager::Initialize 建的（构造函数里还没有，
-    // 在那儿注册会 abort——崩过一轮），所以等网络栈起来再初始化
+    // 在那儿注册会 abort——崩过一轮），所以等网络栈起来再交给 Nomi
     void StartNetwork() override {
         WifiBoard::StartNetwork();
-        NomiHotspot::Init();
+        NomiSystem::OnNetworkStarted();
     }
 
     // 焊了 ES7210 的版本由它录音：双麦克风 + 喇叭回采（MIC3），能做设备端回声消除；

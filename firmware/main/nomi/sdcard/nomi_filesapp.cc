@@ -3,13 +3,15 @@
 #include "display/display.h"
 #include "nomi_app.h"
 #include "nomi_filelist.h"
+#include "nomi_display.h"
 #include "nomi_files.h"
-#include "nomi_open.h"
 #include "nomi_sdcard.h"
 #include "nomi_sheet.h"
 #include "nomi_style.h"
 #include "nomi_ui.h"
-#include "nomi_wasm.h"
+#if CONFIG_NOMI_APPS
+#include "nomi_open.h"
+#endif
 
 #include <ctime>
 #include <string>
@@ -42,7 +44,7 @@ void OnDelete(lv_event_t* e) {
     std::string rel = s_menu_rel;
     NomiSheet::Close();
     nomi_ui_notify("正在删…", 1500);
-    Display* display = NomiWasm::GetDisplay();
+    Display* display = NomiDisplay::Get();
     NomiFileList::RunInBackground([rel, display] {
         std::string err;
         {
@@ -64,6 +66,7 @@ void ShowMenu(const std::string& rel, const NomiFiles::Entry& e) {
         s_menu_delete = nullptr;
     });
     s_menu_rel = rel;
+#if CONFIG_NOMI_APPS
     if (!e.dir) {
         NomiSheet::AddButton(
             panel, "打开方式…", C_TEXT,
@@ -74,6 +77,7 @@ void ShowMenu(const std::string& rel, const NomiFiles::Entry& e) {
             },
             nullptr);
     }
+#endif
     NomiSheet::AddButton(panel, e.dir ? "删除（连里面的东西）" : "删除", C_DANGER, OnDelete, nullptr);
     NomiSheet::AddButton(panel, "取消", C_MUTED, [](lv_event_t*) { NomiSheet::Close(); }, nullptr);
 }
@@ -91,7 +95,12 @@ void FilesOpen(const nomi_app_t*, lv_obj_t* root) {
     lv_obj_set_scrollbar_mode(page, LV_SCROLLBAR_MODE_AUTO);
     lv_label_set_text(lv_label_create(page), "文件");
     NomiFileList::Options opt;
+#if CONFIG_NOMI_APPS
     opt.on_pick = [](const std::string& rel, bool) { NomiOpen::Open(rel); };
+#else
+    // 没有应用平台：文件只能看、删，打不开
+    opt.on_pick = [](const std::string&, bool) { nomi_ui_notify("这台设备没有能打开文件的应用", 2500); };
+#endif
     opt.on_long = ShowMenu;
     s_list = NomiFileList::Create(page, s_dir, opt);
 }

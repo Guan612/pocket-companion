@@ -55,11 +55,13 @@ struct nomi_app {
     bool system;              // 系统应用（文件）：桌面上排在应用包后面、应用管理前面
 };
 
-// launcher_tile：外层翻页里放桌面的那一格；user_activity：应用里有触摸时调（重置休眠计时）；
+// launcher_tile：外层翻页里放桌面的那一格（可以为 NULL：没有桌面）；user_activity：应用里有触摸时调（重置休眠计时）；
 // go_home：桌面上左边缘右划时调，回表盘；toast：弹一句提示
 void nomi_apps_init(lv_obj_t *screen, lv_obj_t *launcher_tile, const lv_font_t *font, void (*user_activity)(void),
                     void (*go_home)(void), void (*toast)(const char *text));
 void nomi_apps_set_font(const lv_font_t *font);
+// 桌面上放不放「应用管理」（默认放；没有应用平台的设备不放）
+void nomi_apps_set_appmgr(bool on);
 
 // 桌面上加一个应用（排在已有的后面、应用管理前面）/ 去掉一个（开着的话先关掉）。app 要一直有效直到去掉
 void nomi_apps_add(const nomi_app_t *app);
