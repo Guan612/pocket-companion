@@ -2,8 +2,13 @@
 
     python tools/map/make_map.py --name 成都 --bbox 30.62,104.02,30.70,104.12
     python tools/map/make_map.py --name 成都 --bbox 30.62,104.02,30.70,104.12 --upload 192.168.1.40
+    python tools/map/make_map.py --name 成都 --bbox 30.38,103.70,30.95,104.40 --pbf sichuan-latest.osm.pbf
 
-数据来自 OpenStreetMap（Overpass 接口，© OpenStreetMap contributors，ODbL），坐标 WGS-84，和手机 GPS 一致。
+数据来自 OpenStreetMap（© OpenStreetMap contributors，ODbL），坐标 WGS-84，和手机 GPS 一致。两种取法：
+  --pbf 本地的 OSM 整包（推荐，范围大也快）：省级包在 https://download.openstreetmap.fr/extracts/asia/china/
+        （比如 sichuan-latest.osm.pbf，一百多 MB），要 pip install osmium（清华镜像没有 3.14 的包，
+        加 --index-url https://pypi.org/simple）
+  不给 --pbf 就问公共 Overpass 接口：不用下载，但每次请求光排队就要几十秒、时常 502 / 超时，只适合小范围
 道路分四档：0 主干（motorway trunk primary 和匝道） 1 次干（secondary tertiary） 2 支路（residential service
 等） 3 小路（人行道、台阶、自行车道、小径）。每条路还记着谁能走（步行 1、骑车 2、开车 4），设备上按选的
 出行方式只画能走的；按 OSM 的默认（高速只给车、人行道只给人……），再看 foot / bicycle / motor_vehicle /
@@ -93,6 +98,41 @@ def fetch(s, w, n, e, cache_dir):
     sys.exit('Overpass 一直不通，过会儿再试（取到的片已存好，重跑接着取）')
 
 
+TAG_KEYS = ('highway', 'foot', 'bicycle', 'motor_vehicle', 'motorcar', 'motorroad')
+
+
+def read_pbf(path, s, w, n, e):
+    """从本地 OSM 整包里挑出碰到 bbox 的路，结构和 Overpass 回来的一样（tags、geometry）"""
+    try:
+        import osmium
+    except ImportError:
+        sys.exit('要先 pip install osmium（清华镜像没有就加 --index-url https://pypi.org/simple）')
+
+    ways = {}
+
+    class Roads(osmium.SimpleHandler):
+        def way(self, way):
+            if way.tags.get('highway') not in CLASS:
+                return
+            geom = []
+            for nd in way.nodes:
+                if nd.location.valid():
+                    geom.append({'lat': nd.location.lat, 'lon': nd.location.lon})
+            if len(geom) < 2:
+                return
+            if (max(g['lat'] for g in geom) < s or min(g['lat'] for g in geom) > n
+                    or max(g['lon'] for g in geom) < w or min(g['lon'] for g in geom) > e):
+                return
+            tags = {k: way.tags.get(k) for k in TAG_KEYS if k in way.tags}
+            ways[way.id] = {'type': 'way', 'id': way.id, 'tags': tags, 'geometry': geom}
+
+    print(f'读 {path}（整包要过一遍，四川一百多 MB 的包二十秒左右）', flush=True)
+    # 只放过带 highway 的路；点一个不能少（要它们的坐标）
+    Roads().apply_file(path, locations=True, idx='flex_mem',
+                       filters=[osmium.filter.KeyFilter('highway').enable_for(osmium.osm.WAY)])
+    return ways
+
+
 def clip(seg, x0, y0, x1, y1):
     """Liang–Barsky：线段裁到矩形里，裁不出东西返回 None"""
     (ax, ay), (bx, by) = seg
@@ -137,21 +177,25 @@ def main():
     ap.add_argument('--out', default='build/maps', help='输出到哪个文件夹')
     ap.add_argument('--upload', help='设备的 IP：做好直接传到卡上的 maps/')
     ap.add_argument('--chunk', type=float, default=CHUNK, help='一次问多大一片（度），默认 %(default)s；城区太大会超时')
+    ap.add_argument('--pbf', help='本地 OSM 整包（.osm.pbf），给了就不问 Overpass')
     args = ap.parse_args()
     s, w, n, e = (float(v) for v in args.bbox.split(','))
     if not (s < n and w < e) or (n - s) * (e - w) > 1:
         sys.exit('bbox 不对，或者太大（最多 1 平方度）')
 
     ways = {}
-    chunk = args.chunk
-    rows_q, cols_q = math.ceil((n - s) / chunk - 1e-9), math.ceil((e - w) / chunk - 1e-9)  # 小数累加会多出一排空框
-    for i in range(rows_q):
-        for j in range(cols_q):
-            box = (s + i * chunk, w + j * chunk, min(s + (i + 1) * chunk, n), min(w + (j + 1) * chunk, e))
-            print('取 %.3f,%.3f – %.3f,%.3f' % box, flush=True)
-            for el in fetch(*box, os.path.join(args.out, 'cache', args.name)):
-                if el.get('type') == 'way' and el.get('geometry'):
-                    ways[el['id']] = el
+    if args.pbf:
+        ways = read_pbf(args.pbf, s, w, n, e)
+    else:
+        chunk = args.chunk
+        rows_q, cols_q = math.ceil((n - s) / chunk - 1e-9), math.ceil((e - w) / chunk - 1e-9)  # 小数累加会多出一排空框
+        for i in range(rows_q):
+            for j in range(cols_q):
+                box = (s + i * chunk, w + j * chunk, min(s + (i + 1) * chunk, n), min(w + (j + 1) * chunk, e))
+                print('取 %.3f,%.3f – %.3f,%.3f' % box, flush=True)
+                for el in fetch(*box, os.path.join(args.out, 'cache', args.name)):
+                    if el.get('type') == 'way' and el.get('geometry'):
+                        ways[el['id']] = el
     print(f'{len(ways)} 条路')
 
     lat0, lon0 = math.floor(s / TILE), math.floor(w / TILE)
