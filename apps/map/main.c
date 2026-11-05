@@ -4,9 +4,10 @@
 // 应用管业务：
 // - 道路：卡上 maps/*.nmap（电脑上用 tools/map/make_map.py 从 OpenStreetMap 做），按定位读周围 3×3 块（约 3 公里
 //   见方）。车头朝上画：自己的位置固定在下方，地图跟着朝向转。按出行方式（步行 / 骑车 / 开车）画能走的路——
-//   能走的亮、不能走的压暗垫底（切换时一眼能看出哪些路变了），缩放也跟着变（步行看近、开车看远）。走过的轨迹叠在上面。
+//   能走的亮、不能走的压暗垫底（切换时一眼能看出哪些路变了），缩放也跟着变（步行看近、开车看远）。
+//   不存轨迹：走过的路画出来对导航没用，还白占内存。还没走的路线 Gadgetbridge 也不给（nav 消息只有
+//   转向、距离、路名、到达时间，没有坐标），所以地图上没有路线高亮，该往哪走看底栏。
 // - 导航：手机上用 OsmAnd 或 CoMaps 导航，Gadgetbridge 把转向、距离、路名、到达时间转过来，放在底栏。
-//   Gadgetbridge 不给路线形状，所以要走的那条路画不出来高亮。
 // - 定位：手机 GPS（Gadgetbridge 里给这台设备打开「使用手机的GPS数据」）。界面挂着时让手机推、拿下时停；
 //   在导航或定位一直在来时屏幕常亮。
 // - 点屏幕出菜单：换出行方式。
@@ -17,14 +18,12 @@
 #define C_TEXT 0xe8eaf0
 #define C_MUTED 0x8b90a0
 #define C_DIM 0x3a3f50
-#define C_ACCENT 0x6aa6ff
 #define C_WARM 0xffc857
 #define C_DANGER 0xff6b6b
 #define C_BG 0x000000
 #define C_BAR 0x0d0f14
 
 #define PI 3.14159265358979
-#define TRACK_MAX 240
 #define FRESH_S 10   // 定位多久以内算新的（秒）
 #define REASK_S 30   // 这么久没收到定位就再让手机推一次
 #define PACK_MAX 8
@@ -56,11 +55,11 @@ static double g_dist_m = -1;  // 到下一个路口多少米；单位认不出�
 // 定位（{"t":"gps",…}）
 static int g_fix;
 static int32_t g_fix_tick = -1000;
-static double g_lat, g_lon, g_lat0, g_lon0, g_coslat0;
+static double g_lat, g_lon;
 static double g_speed = -1;    // 千米每小时
 static double g_heading = -1;  // 度，北 0 顺时针；不知道为 -1
-static float g_tx[TRACK_MAX], g_ty[TRACK_MAX];  // 走过的轨迹：离第一个点往东、往北多少米（环形）
-static int g_track_n, g_track_head;
+static int g_prev_ok;          // 有没有上一次的定位（算朝向、滤飘动用）
+static double g_prev_lat, g_prev_lon;
 
 // 卡上的地图包、读进来的周围 3×3 块
 static struct {
@@ -303,16 +302,6 @@ static void on_nav(const char *json, const char *end)
     g_nav = a || i || e || g_dist_raw[0];  // 只有 "t" = 导航结束了
 }
 
-static void track_add(double x, double y)
-{
-    g_tx[g_track_head] = (float)x;
-    g_ty[g_track_head] = (float)y;
-    g_track_head = (g_track_head + 1) % TRACK_MAX;
-    if (g_track_n < TRACK_MAX) g_track_n++;
-}
-
-static int track_index(int i) { return (g_track_head - g_track_n + i + TRACK_MAX) % TRACK_MAX; }
-
 static void on_gps(const char *json, const char *end)
 {
     char v[40];
@@ -321,27 +310,23 @@ static void on_gps(const char *json, const char *end)
     if (nomi_json_field(json, end, "lon", v, sizeof(v)) < 0 && nomi_json_field(json, end, "long", v, sizeof(v)) < 0) return;
     double lon = parse_double(v);
     if (lat == 0 && lon == 0) return;
-    if (!g_fix) {
-        g_lat0 = lat;
-        g_lon0 = lon;
-        g_coslat0 = dcos(lat);
-    }
     g_fix = 1;
     g_lat = lat;
     g_lon = lon;
     g_fix_tick = g_tick;
     g_speed = nomi_json_field(json, end, "speed", v, sizeof(v)) >= 0 ? parse_double(v) : -1;
     double course = nomi_json_field(json, end, "course", v, sizeof(v)) >= 0 ? parse_double(v) : -1;
-    double x = (lon - g_lon0) * 111320.0 * g_coslat0, y = (lat - g_lat0) * 110574.0;
-    if (g_track_n == 0) {
-        track_add(x, y);
-    } else {
-        int last = track_index(g_track_n - 1);
-        double dx = x - g_tx[last], dy = y - g_ty[last];
-        if (__builtin_sqrt(dx * dx + dy * dy) >= 3) {  // 走了 3 米以上才记一个点、算朝向（原地不动时定位会飘）
+    if (g_prev_ok) {
+        double dx = (lon - g_prev_lon) * 111320.0 * dcos(lat), dy = (lat - g_prev_lat) * 110574.0;
+        if (__builtin_sqrt(dx * dx + dy * dy) >= 3) {  // 走了 3 米以上才动基准点、算朝向（原地不动时定位会飘）
             if (course < 0) g_heading = bearing(dx, dy);
-            track_add(x, y);
+            g_prev_lat = lat;
+            g_prev_lon = lon;
         }
+    } else {
+        g_prev_ok = 1;
+        g_prev_lat = lat;
+        g_prev_lon = lon;
     }
     if (course >= 0 && g_speed >= 1) g_heading = course;
     update_tiles();
@@ -527,23 +512,6 @@ static void draw_roads(int cx, int cy, double scale, int bottom)
     }
 }
 
-static void draw_track(int cx, int cy, double scale)
-{
-    if (g_track_n < 2) return;
-    double h = g_heading >= 0 ? g_heading : 0, ch = dcos(h), sh = dsin(h);
-    double px = (g_lon - g_lon0) * 111320.0 * g_coslat0, py = (g_lat - g_lat0) * 110574.0;
-    for (int i = 0; i < g_track_n; i++) {
-        int k = track_index(i);
-        double dx = g_tx[k] - px, dy = g_ty[k] - py;
-        double rx = dx * ch - dy * sh, ry = dx * sh + dy * ch;
-        g_pts[i * 2] = cx + (int32_t)(rx * scale);
-        g_pts[i * 2 + 1] = cy - (int32_t)(ry * scale);
-    }
-    g_pts[g_track_n * 2] = cx;  // 接到现在的位置
-    g_pts[g_track_n * 2 + 1] = cy;
-    line(g_pts, g_track_n + 1, 4, C_ACCENT);
-}
-
 // 自己：朝上的白三角（不知道朝向时是个圆点），外面描一圈黑边看得清
 static void draw_me(int cx, int cy)
 {
@@ -569,13 +537,12 @@ static void draw_north(int x, int y)
     canvas_circle(g_canvas, nx, ny, 4, 0, C_DANGER);
 }
 
-// 地图那一块：道路、轨迹、自己、指北针；bottom 以下留给底栏
+// 地图那一块：道路、自己、指北针；bottom 以下留给底栏
 static void draw_map(int cx, int cy, int bottom)
 {
     double scale = kModeScale[g_mode];
     if (g_fix) {
         draw_roads(cx, cy, scale, bottom);
-        draw_track(cx, cy, scale);
         draw_me(cx, cy);
     }
     draw_north(452, 30);
