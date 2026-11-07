@@ -2050,6 +2050,19 @@ static void on_face_touch(lv_event_t *e)
     face_look_at((p.x - (a.x1 + FACE_W / 2)) / 150.0f, (p.y - (a.y1 + FACE_H / 2)) / 100.0f);
 }
 
+// 在表情上轻点一下（按得短、没滑动翻页）：戳它，它有反应（见 face_poke）。位置换算和 on_face_touch 一样
+static void on_face_poke(lv_event_t *e)
+{
+    (void)e;
+    lv_indev_t *indev = lv_indev_active();
+    if (!indev) return;
+    lv_point_t p;
+    lv_indev_get_point(indev, &p);
+    lv_area_t a;
+    lv_obj_get_coords(s_canvas, &a);
+    face_poke((p.x - (a.x1 + FACE_W / 2)) / 150.0f, (p.y - (a.y1 + FACE_H / 2)) / 100.0f);
+}
+
 static lv_obj_t *add_tile(lv_obj_t *tileview, uint8_t col, uint8_t row, lv_dir_t dir, uint32_t bg)
 {
     lv_obj_t *tile = lv_tileview_add_tile(tileview, col, row, dir);
@@ -2116,6 +2129,7 @@ void nomi_ui_create(lv_obj_t *screen, uint16_t *face_buf, const lv_font_t *font,
     lv_obj_add_event_cb(s_canvas, on_face_touch, LV_EVENT_PRESSING, NULL);
     lv_obj_add_event_cb(s_canvas, on_face_touch, LV_EVENT_RELEASED, NULL);
     lv_obj_add_event_cb(s_canvas, on_face_touch, LV_EVENT_PRESS_LOST, NULL);
+    lv_obj_add_event_cb(s_canvas, on_face_poke, LV_EVENT_SHORT_CLICKED, NULL);
 
     // 历史对话页：一列消息，上下滚动；进来时按回调里的记录重建
     s_hist_list = lv_obj_create(s_hist_tile);

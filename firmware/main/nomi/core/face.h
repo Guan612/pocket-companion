@@ -39,6 +39,10 @@ void face_look_at(float x, float y);
 // 手指离开了：眼睛再盯一小会儿（约 0.45 秒）就回到状态自己的视线
 void face_look_release(void);
 
+// 在脸上轻点了一下（x、y 同 face_look_at，是点的位置）。第一下吓一跳：闭紧眼、被戳扁、往反方向躲，再睁大眼看点的地方；
+// 1.6 秒内接着点：两三下觉得痒，眯眼笑；点个没完就皱眉扭头。盖过状态和表情脚本，演完回去；睡着、正在醒时不理
+void face_poke(float x, float y);
+
 // 睡着：闭眼、收手、缓慢呼吸，盖过当前状态；醒来后回到原状态
 void face_set_sleep(int sleeping);
 

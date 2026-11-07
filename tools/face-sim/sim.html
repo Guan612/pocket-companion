@@ -21,7 +21,7 @@ canvas{display:block;width:min(720px,calc(100vw - 68px));aspect-ratio:3/2;image-
 </head>
 <body>
 <h1>设备模拟器 · 480×320</h1>
-<p>运行的是固件里的 face.c 和 raster.c（firmware/main/nomi/core/） 编译出的 WebAssembly，和板子上同一份代码。按键 1–6 或空格（等同 BOOT 键）切换。在屏幕上按住鼠标，眼睛会看向光标。</p>
+<p>运行的是固件里的 face.c 和 raster.c（firmware/main/nomi/core/） 编译出的 WebAssembly，和板子上同一份代码。按键 1–6 或空格（等同 BOOT 键）切换。在屏幕上按住鼠标，眼睛会看向光标；轻点一下是戳它（连着点两三下会笑，点个没完会不高兴）。</p>
 <div class="bar" id="bar"></div>
 <div class="device"><canvas id="lcd" width="480" height="320"></canvas></div>
 <div id="stats"></div>
@@ -62,9 +62,18 @@ const STEP=1/60, FRAME_MS=33, AUTO_MS=3500;
     const r=lcd.getBoundingClientRect(),k=W/r.width;
     e.sim_look_at(((ev.clientX-r.left)*k-W/2)/150,((ev.clientY-r.top)*k-H/2)/100);
   };
-  lcd.addEventListener('pointerdown',ev=>{lcd.setPointerCapture(ev.pointerId);look(ev)});
+  // 轻点一下（按下不到 400 毫秒、没怎么移动，和设备上 LVGL 的 SHORT_CLICKED 一样）= 戳它
+  let downAt=0,downX=0,downY=0;
+  lcd.addEventListener('pointerdown',ev=>{lcd.setPointerCapture(ev.pointerId);look(ev);downAt=performance.now();downX=ev.clientX;downY=ev.clientY});
   lcd.addEventListener('pointermove',ev=>{if(ev.buttons)look(ev)});
-  ['pointerup','pointercancel'].forEach(n=>lcd.addEventListener(n,()=>e.sim_look_release()));
+  lcd.addEventListener('pointerup',ev=>{
+    e.sim_look_release();
+    if(performance.now()-downAt<400&&Math.hypot(ev.clientX-downX,ev.clientY-downY)<10){
+      const r=lcd.getBoundingClientRect(),k=W/r.width;
+      e.sim_poke(((ev.clientX-r.left)*k-W/2)/150,((ev.clientY-r.top)*k-H/2)/100);
+    }
+  });
+  lcd.addEventListener('pointercancel',()=>e.sim_look_release());
 
   let last=performance.now(),acc=0;
   setInterval(()=>{

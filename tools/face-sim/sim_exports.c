@@ -15,6 +15,7 @@ void sim_set_level(float level) { face_set_level(level); }
 void sim_step(float dt) { face_step(dt); }
 void sim_look_at(float x, float y) { face_look_at(x, y); }
 void sim_look_release(void) { face_look_release(); }
+void sim_poke(float x, float y) { face_poke(x, y); }
 
 // 返回本帧脏区面积，脏区坐标用 sim_dirty_* 取
 int sim_render(void)

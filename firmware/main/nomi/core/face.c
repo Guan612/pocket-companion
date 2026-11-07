@@ -27,10 +27,43 @@ typedef struct {
 static struct {
     spring_t open, gx, gy, mouth, wide, tilt, hl, hr, smile, happy, blush;
     spring_t browu, browd, sweat, prop;  // 表情脚本用：眉毛、汗滴的淡入淡出，道具弹出来
+    spring_t sq;  // 挤压拉伸：0 是原样，正的拉长变窄，负的压扁变宽
+    spring_t dx;  // 整张脸左右躲闪的偏移（被戳时往反方向缩一下再弹回来）
 } P;
 
 static float s_bob, s_time, s_mode_time;
+// 挤压拉伸不用每个动作单独写：看 s_bob（脸上下的位置）动得多快、速度变得多急。
+// 动得快就顺着拉长；往下动突然变成往上（落地、点头到底）就压扁一下再弹回来
+static float s_bob_prev, s_bob_v;
+static int s_bob_fresh = 1;  // 刚初始化：上一帧的位置还没有，这一帧不算速度
+// 比这还快（逻辑像素 / 秒）就是瞬移，不是在动：换状态、入睡醒来时 s_bob 会直接跳几个像素，不算撞了一下。
+// 现有动作最快的是开心刚进来连蹦（约 63），表情脚本的 bounce 约 47
+#define BOB_V_MAX 90.0f
+#define SQ_KICK 0.09f        // 速度每变 1 像素 / 秒，挤压拉伸弹簧挨多大一下
+#define SQ_STRETCH 0.0016f   // 每 1 像素 / 秒的速度拉长多少
+#define SQ_STRETCH_MAX 0.12f
+#define SQ_LIMIT 0.3f  // 画的时候最多压扁 / 拉长到这个程度
+// 被戳（face_poke）：第一下吓一跳；连着戳两三下觉得痒、笑；戳个没完就不高兴
+static float s_poke_t = -1;     // 这次反应演了多久，<0 表示没在演
+static float s_poke_since = 99;  // 离上次被戳多久，用来数是不是连着戳
+static float s_poke_x, s_poke_y;
+static int s_poke_n;  // 连着戳了第几下
+#define POKE_STREAK_S 1.6f  // 这么久之内再戳算连着戳
 static float s_next_blink, s_blink_t, s_next_look, s_look_x, s_look_y;
+// 待机的眼神有目标：大部分时间看着你（正前方），偶尔瞟开一下再看回来，不是满屏随便挑点看
+static int s_look_away;  // 1 = 正瞟着别处
+// 盯着一个地方时眼睛也不是死的：每零点几秒挪一点点（注视微动）
+static float s_next_micro, s_micro_x, s_micro_y;
+static float s_breath_ph;    // 呼吸的相位：快慢带随机起伏，不是固定频率
+static float s_variant_rate = 1;  // 这一次动作的快慢（0.85～1.15），同一个动作每次演都不完全一样
+// 对话前后的过渡（face_set_mode 里起头）：
+//   ATTEND 被叫到（待机 → 听 / 想）：「嗯？」愣一下、眨眼、眉毛一挑、眼睛看过来、往上一提，小手晚一点才放到耳边
+//   AFTER  说完了（对话 → 待机）：不马上自己玩，看着你停一会儿、点个头；刚才在说话 / 开心就保持笑眼
+enum { TRANS_NONE, TRANS_ATTEND, TRANS_AFTER };
+static int s_trans, s_trans_smile;
+static float s_trans_t = -1;
+#define ATTEND_S 0.6f
+#define AFTER_S 1.7f
 static float s_blink_since = 10;  // 距离上一次眨眼开始多久，给"顺带眨一下"限频用
 static int s_blink_again, s_blink_second;  // 这一下眨完要不要紧接着再眨一下 / 现在正是紧接着的那一下
 static float s_last_gx, s_last_gy;         // 上一帧的目标视线，用来发现视线突然跳开
@@ -46,7 +79,7 @@ static float s_fall_t = -1;  // 入睡动画进行了多久，<0 表示没在播
 #define FALL_ASLEEP_S 2.2f   // 入睡动画时长，播完 Z 才开始冒
 
 // 同一个状态里轮换几个动作，等得久也不单调。进入状态先放第 0 个（最能说明状态的那个）：
-//   待机：0 随机张望（大部分时间）｜1 左右张望 2 原地蹦两下 3 歪一下头 4 偷笑一下（偶尔插一个）
+//   待机：0 看着你、偶尔瞟开（大部分时间）｜1 左右张望 2 原地蹦两下 3 歪一下头 4 偷笑一下（偶尔插一个）
 //   聆听：0 手放耳边｜1 边听边点头 2 歪着头认真听
 //   思考：0 托腮看左上｜1 眼珠慢慢转一圈 2 抬头看头顶闪烁的三个点（在问大模型）3 挠头使劲想
 //   说话：0 平常讲｜1 跟着话的起伏点头 2 歪头晃着讲 3 眼睛往上看、像在想词
@@ -79,6 +112,25 @@ static float frand(void)
     s_rng ^= s_rng >> 17;
     s_rng ^= s_rng << 5;
     return (s_rng >> 8) / 16777216.0f;
+}
+
+static float hash1(int i)
+{
+    uint32_t h = (uint32_t)i * 0x9E3779B1u;
+    h ^= h >> 15;
+    h *= 0x85EBCA77u;
+    h ^= h >> 13;
+    return (h & 0xFFFF) / 32767.5f - 1;
+}
+
+// 平滑的随机起伏（一维梯度噪声），大约 -1～1，x 每走 1 换一个拐点。拿来代替固定频率的正弦：
+// 正弦看几遍就知道是在循环，这个不重复。不动 s_rng，不影响别的随机数
+static float noise1(float x)
+{
+    const float fl = floorf(x), f = x - fl;
+    const int i = (int)fl;
+    const float a = hash1(i) * f, b = hash1(i + 1) * (f - 1), u = f * f * (3 - 2 * f);
+    return (a + (b - a) * u) * 2;
 }
 
 // 请求眨一下眼，prob 是概率。正在眨、或离上一次眨眼太近（不到 0.9 秒）就算了，免得视线乱跳时眨个不停
@@ -141,17 +193,48 @@ void face_init(uint32_t seed)
     P.browd = spring(0, 160, 14);
     P.sweat = spring(0, 120, 14);
     P.prop = spring(0, 220, 11);  // 阻尼小一点，出现时会略微冲过头再回来
+    P.sq = spring(0, 260, 18);    // 欠阻尼：压扁后会回弹一点点再停
+    P.dx = spring(0, 200, 13);
+    s_bob_fresh = 1;
+    s_bob_v = 0;
+    s_poke_t = -1;
+    s_poke_since = 99;
+    s_poke_n = 0;
     s_time = s_mode_time = 0;
     s_next_blink = 2;
     s_blink_t = -1;
     s_next_look = 1;
+    s_look_away = 0;
+    s_look_x = s_look_y = 0;
+    s_next_micro = 0;
+    s_micro_x = s_micro_y = 0;
+    s_breath_ph = 0;
+    s_variant_rate = 1;
+    s_trans = TRANS_NONE;
+    s_trans_t = -1;
     s_first = 1;
 }
 
 void face_set_mode(face_mode_t mode)
 {
+    const face_mode_t prev = s_mode;
     s_mode = mode;
     s_mode_time = 0;
+    s_variant_rate = 0.85f + frand() * 0.3f;
+    // 对话前后的过渡：被叫到先「嗯？」一下；说完看着你停一会儿。睡着时不演（醒来另有伸懒腰）
+    s_trans_t = -1;
+    if (!s_sleep && prev == FACE_IDLE && (mode == FACE_LISTEN || mode == FACE_THINK)) {
+        s_trans = TRANS_ATTEND;
+        s_trans_t = 0;
+    } else if (!s_sleep && prev != FACE_IDLE && mode == FACE_IDLE) {
+        s_trans = TRANS_AFTER;
+        s_trans_t = 0;
+        s_trans_smile = prev == FACE_SPEAK || prev == FACE_HAPPY;
+        // 演完接着看你一会儿再开始瞟
+        s_look_away = 0;
+        s_look_x = s_look_y = 0;
+        s_next_look = AFTER_S + 1.5f + frand() * 2.5f;
+    }
     // 一醒来就要听 / 想 / 说（比如睡着时直接按住 BOOT）：不伸懒腰，直接进这个动作，免得两套动作混在一起
     if (mode != FACE_IDLE) s_wake_t = -1;
     s_variant = 0;
@@ -189,6 +272,7 @@ static void next_variant(void)
         s_variant = bag_pick(s_mode);
         s_variant_len = 2.6f + frand() * 1.2f;
     }
+    s_variant_rate = 0.85f + frand() * 0.3f;
     s_variant_time = 0;
     request_blink(0.35f);  // 换了动作，常顺带眨一下
 }
@@ -260,10 +344,27 @@ void face_look_release(void)
         s_touch_age = TOUCH_LOOK_TIMEOUT_S - TOUCH_LOOK_LINGER_S;
 }
 
+void face_poke(float x, float y)
+{
+    if (s_sleep || s_wake_t >= 0) return;  // 睡着、正在醒都不理（点屏幕叫醒它那一下不算戳）
+    x = x < -1 ? -1 : (x > 1 ? 1 : x);
+    y = y < -1 ? -1 : (y > 1 ? 1 : y);
+    s_poke_n = s_poke_since < POKE_STREAK_S ? s_poke_n + 1 : 1;
+    if (s_poke_n > 9) s_poke_n = 9;
+    s_poke_since = 0;
+    s_poke_t = 0;
+    s_poke_x = x;
+    s_poke_y = y;
+    P.sq.v -= s_poke_n == 1 ? 4.5f : 2.5f;  // 被戳得一扁
+    // 戳在一侧：往反方向躲一下（戳在正中间就只是往后缩）
+    if (fabsf(x) > 0.15f) P.dx.v -= (x > 0 ? 1 : -1) * (s_poke_n == 1 ? 70 : 40);
+}
+
 void face_set_sleep(int sleeping)
 {
     if (s_sleep && !sleeping) s_wake_t = s_mode == FACE_IDLE ? 0 : -1;  // 醒来回到待机才伸懒腰
     if (!s_sleep && sleeping) s_fall_t = 0;  // 从醒着到睡着，先犯困再闭眼
+    if (sleeping) s_poke_t = s_trans_t = -1;
     if (sleeping) s_wake_t = -1;
     else s_fall_t = -1;
     s_sleep = sleeping;
@@ -331,37 +432,61 @@ void face_step(float dt)
     P.wide.t = m == FACE_LISTEN ? 1.15f : 1;
     P.happy.t = P.blush.t = m == FACE_HAPPY ? 1 : 0;
     P.smile.t = (m == FACE_HAPPY || m == FACE_SPEAK) ? 1 : 0;
-    P.tilt.t = m == FACE_CONFUSED ? 0.3f * sinf(s_time * 2) : (m == FACE_THINK ? -0.12f : 0);
+    // 头一直有一点点不规则的晃（几乎看不出来，但整张脸不再是死的）；疑惑时歪头左右看，停顿也不规则
+    const float sway = 0.08f * noise1(s_time * 0.35f + 3.1f);
+    P.tilt.t = m == FACE_CONFUSED ? 0.32f * noise1(s_time * 0.9f) : (m == FACE_THINK ? -0.12f : 0) + sway;
     P.hl.t = (m == FACE_SPEAK || m == FACE_HAPPY) ? 1 : 0;
     P.hr.t = m == FACE_IDLE ? 0 : 1;
 
+    // 待机眼神：看着你 2～6 秒 → 瞟开 0.5～1.5 秒（三成会接着再瞟另一处）→ 看回来，看你的时候也不是正正的死盯
     s_next_look -= dt;
     if (s_next_look < 0) {
-        s_look_x = frand() * 2 - 1;
-        s_look_y = (frand() * 2 - 1) * 0.6f;
-        s_next_look = 1 + frand() * 2.2f;
+        if (!s_look_away || frand() < 0.3f) {
+            const float side = frand() < 0.5f ? -1.0f : 1.0f;
+            s_look_away = 1;
+            s_look_x = side * (0.45f + frand() * 0.55f);
+            s_look_y = (frand() * 2 - 1) * 0.6f;
+            s_next_look = 0.5f + frand() * 1.0f;
+        } else {
+            s_look_away = 0;
+            s_look_x = (frand() * 2 - 1) * 0.12f;
+            s_look_y = (frand() * 2 - 1) * 0.1f;
+            s_next_look = 2 + frand() * 4;
+        }
+    }
+    // 注视微动：每 0.25～0.7 秒挪一点点，弹簧会把它抹成很轻的漂移
+    s_next_micro -= dt;
+    if (s_next_micro < 0) {
+        s_micro_x = (frand() * 2 - 1) * 0.05f;
+        s_micro_y = (frand() * 2 - 1) * 0.1f;
+        s_next_micro = 0.25f + frand() * 0.45f;
     }
     float gx = 0, gy = 0;
     if (m == FACE_IDLE) {
         gx = s_look_x;
         gy = s_look_y;
     } else if (m == FACE_THINK) {
-        gx = -0.7f;
-        gy = -0.8f;
-    } else if (m == FACE_SPEAK) {
-        gx = sinf(s_time * 0.9f) * 0.25f;
-    } else if (m == FACE_CONFUSED) {
-        gx = sinf(s_time * 2.4f) * 0.8f;
+        gx = -0.7f + 0.12f * noise1(s_time * 0.5f);
+        gy = -0.8f + 0.08f * noise1(s_time * 0.4f + 7);
+    } else if (m == FACE_SPEAK) {  // 边说边看你，眼神不规则地飘一点
+        gx = 0.3f * noise1(s_time * 0.45f + 11);
+        gy = 0.15f * noise1(s_time * 0.35f + 13);
+    } else if (m == FACE_CONFUSED) {  // 左看看右看看，在两边各停一会儿
+        gx = 0.8f * tanhf(2.5f * noise1(s_time * 0.8f + 5));
     }
+    gx += s_micro_x;
+    gy += s_micro_y;
 
-    s_bob = sinf(s_time * 1.7f) * 1.5f - (m == FACE_LISTEN ? 2 : 0);
+    // 呼吸：快慢、深浅都带一点随机起伏
+    s_breath_ph += dt * 1.7f * (1 + 0.25f * noise1(s_time * 0.15f + 21));
+    s_bob = sinf(s_breath_ph) * 1.5f * (1 + 0.3f * noise1(s_time * 0.11f + 17)) - (m == FACE_LISTEN ? 2 : 0);
     if (m == FACE_HAPPY) s_bob -= fabsf(sinf(s_mode_time * 9)) * 7 * expf(-s_mode_time * 1.2f);
 
-    // 当前动作对上面默认姿势的改动（动作列表见 kVariants）
+    // 当前动作对上面默认姿势的改动（动作列表见 kVariants）。同一个动作每次快慢略有不同（s_variant_rate）
     s_variant_time += dt;
     if (s_variant_time >= s_variant_len) next_variant();
     const int v = s_variant;
-    const float vt = s_variant_time;
+    const float vt = s_variant_time * s_variant_rate;
     int want_sweat = 0;
     if (m == FACE_THINK) {
         if (v == 1) {  // 眼珠慢慢转一圈，手放下
@@ -432,6 +557,33 @@ void face_step(float dt)
         want_sweat = 1;
     }
 
+    // 对话前后的过渡（见 TRANS_*）：盖过上面的状态和动作；手指、表情脚本、被戳还是在它上面
+    int brow_up = 0;
+    if (s_trans_t >= 0) {
+        s_trans_t += dt;
+        const float t = s_trans_t;
+        if (s_trans == TRANS_ATTEND) {
+            P.open.t = t < 0.1f ? 0.02f : (blink ? 0.02f : 1);  // 先眨一下
+            P.wide.t = t < 0.1f ? 1 : 1.2f;                      // 再睁大
+            gx = s_micro_x;  // 看过来（正前方 = 看着你）
+            gy = -0.05f + s_micro_y;
+            brow_up = t < 0.5f;
+            if (t < 0.32f) P.hl.t = P.hr.t = 0;  // 手晚一点才上来
+            if (t >= 0.08f && t < 0.38f) s_bob -= 3 * sinf((t - 0.08f) / 0.3f * PI_F);  // 往上一提（会自动拉长）
+            if (t >= ATTEND_S) s_trans_t = -1;
+        } else {
+            gx = s_micro_x;  // 说完了，看着你
+            gy = 0.05f + s_micro_y;
+            if (s_trans_smile && t < 1.0f) P.smile.t = 1;
+            if (t >= 0.35f && t < 0.8f) {  // 点个头
+                const float nod = sinf((t - 0.35f) / 0.45f * PI_F);
+                s_bob += 2.5f * nod;
+                gy += 0.2f * nod;
+            }
+            if (t >= AFTER_S) s_trans_t = -1;
+        }
+    }
+
     // 手指按在屏幕上：眼睛看向手指（表情脚本明确写了视线的话，下面还是脚本说了算）
     if (s_touch_age >= 0 && !s_sleep) {
         gx = s_touch_x;
@@ -483,11 +635,47 @@ void face_step(float dt)
         default: break;
         }
     }
-    P.browu.t = st && st->brow == FACE_BROW_UP;
+    P.browu.t = (st && st->brow == FACE_BROW_UP) || brow_up;
     P.browd.t = st && st->brow == FACE_BROW_DOWN;
     P.sweat.t = (st && st->sweat) || want_sweat;
     P.prop.t = st && st->nstrokes ? 1 : 0;
     if (P.prop.t == 0 && P.prop.x < 0.02f) s_prop_step = -1;
+
+    // 被戳了（face_poke）：盖过状态和表情脚本，演完回去。被戳那一下的压扁、躲闪在 face_poke 里已经弹出去了
+    s_poke_since += dt;
+    if (s_poke_t >= 0) {
+        s_poke_t += dt;
+        const float t = s_poke_t;
+        if (s_poke_n == 1) {  // 吓一跳：眼睛闭紧、被戳扁（压扁时五官自己会往下沉），然后睁大眼看是谁戳的
+            P.smile.t = 0;
+            if (t < 0.16f) {
+                P.open.t = 0.02f;
+            } else {
+                P.open.t = blink ? 0.02f : 1;
+                P.wide.t = 1.14f;
+                gx = s_poke_x;
+                gy = s_poke_y;
+            }
+            if (t > 0.9f) s_poke_t = -1;
+        } else if (s_poke_n <= 3) {  // 痒：眯眼笑、脸红、扭一扭、小蹦一下
+            P.smile.t = 1;
+            P.blush.t = 0.7f;
+            P.tilt.t = 0.2f * sinf(t * 16) * expf(-t * 2.5f);
+            gx = 0;
+            gy = 0.3f;
+            if (t < 0.6f) s_bob -= fabsf(sinf(t * PI_F / 0.3f)) * 3;
+            if (t > 1.3f) s_poke_t = -1;
+        } else {  // 戳个没完：皱眉、眯眼，扭头不看你
+            const float away = s_poke_x > 0 ? -1.0f : 1.0f;
+            P.smile.t = 0;
+            P.browd.t = 1;
+            P.open.t = blink ? 0.02f : 0.6f;
+            P.tilt.t = -away * 0.15f;
+            gx = away * 0.9f;
+            gy = 0.1f;
+            if (t > 1.8f) s_poke_t = -1;
+        }
+    }
     // 换眼型：先压扁，压到最扁时换成新的，再撑开
     if (want_eyes != s_eye_next) {
         s_eye_next = want_eyes;
@@ -510,6 +698,7 @@ void face_step(float dt)
     P.gy.t = gy;
     P.mouth.t = speech_level();
 
+    float stretch_extra = 0;  // 不靠速度、动作自己要的拉长（伸懒腰）
     if (s_sleep) {
         P.open.t = 0.02f;
         P.gx.t = P.gy.t = P.mouth.t = P.tilt.t = 0;
@@ -534,9 +723,10 @@ void face_step(float dt)
             s_bob = 3 * (t < FALL_ASLEEP_S ? t / FALL_ASLEEP_S : 1);  // 脸慢慢沉下去
         }
     } else if (s_wake_t >= 0) {
-        // 醒来伸懒腰：眯开一条缝 → 用力眨一下 → 睁大眼、举起小手、抬脸晃一下 → 放下回到待机
+        // 醒来伸懒腰：眯开一条缝 → 用力眨一下 → 睁大眼、举起小手、抬脸晃一下（整张脸往上拉长） → 放下回到待机
         s_wake_t += dt;
         float t = s_wake_t;
+        if (t >= 0.55f && t < 1.4f) stretch_extra = 0.12f * sinf((t - 0.55f) / 0.85f * PI_F);
         if (t < 0.35f) {
             P.open.t = 0.18f;
             s_bob = 3;
@@ -558,8 +748,20 @@ void face_step(float dt)
         }
     }
 
-    spring_t *all[] = {&P.open, &P.gx,    &P.gy,    &P.mouth, &P.wide,  &P.tilt, &P.hl, &P.hr,
-                       &P.smile, &P.happy, &P.blush, &P.browu, &P.browd, &P.sweat, &P.prop};
+    // 挤压拉伸：见 s_bob_prev 的说明。往上的加速度（往下动被顶住、落地）压扁，动得快顺着拉长
+    float vb = s_bob_fresh ? 0 : (s_bob - s_bob_prev) / dt;
+    s_bob_fresh = 0;
+    s_bob_prev = s_bob;
+    if (fabsf(vb) > BOB_V_MAX) {
+        vb = s_bob_v;  // 瞬移：当没发生，速度接着用上一帧的
+    } else {
+        P.sq.v += (vb - s_bob_v) * SQ_KICK;
+        s_bob_v = vb;
+    }
+    P.sq.t = fminf(fabsf(vb) * SQ_STRETCH, SQ_STRETCH_MAX) + stretch_extra;
+
+    spring_t *all[] = {&P.open,  &P.gx,    &P.gy,    &P.mouth, &P.wide,  &P.tilt, &P.hl, &P.hr, &P.smile,
+                       &P.happy, &P.blush, &P.browu, &P.browd, &P.sweat, &P.prop, &P.sq, &P.dx};
     for (unsigned i = 0; i < sizeof(all) / sizeof(all[0]); i++) spring_step(all[i], dt);
 }
 
@@ -691,8 +893,12 @@ static void draw_face(raster_t *r)
     const float gx = P.gx.x, gy = P.gy.x, mo = P.mouth.x, sm = P.smile.x;
     const face_mode_t m = s_mode;
 
-    rxf_t base = rxf_translate(rxf_identity(), cx, cy);
+    rxf_t base = rxf_translate(rxf_identity(), cx + P.dx.x, cy);  // dx：被戳时整张脸往旁边躲
     base = rxf_translate(rxf_rotate(base, P.tilt.x * 0.3f), -cx, -cy);
+
+    // 挤压拉伸：体积不变，拉长就变窄、压扁就变宽；脸像立在地上，压扁时五官往下沉、两眼分开一点
+    const float stretch = P.sq.x < -SQ_LIMIT ? -SQ_LIMIT : (P.sq.x > SQ_LIMIT ? SQ_LIMIT : P.sq.x);
+    const float body_y = 1 + stretch, body_x = 1 / body_y;
 
     // 眼睛：常规是竖胶囊，开心/说话时先压扁再长成 ∩ 弧线；表情脚本能换成别的眼型（换的时候先压扁再撑开）
     float sq = s_eye_switch < 0 ? 1 : fabsf(1 - 2 * s_eye_switch / EYE_SWITCH_S);
@@ -704,11 +910,12 @@ static void draw_face(raster_t *r)
     for (int s = -1; s <= 1; s += 2) {
         const float az = s * EYE_AZ0 + yaw;
         const float fore = cosf(az) / cosf(EYE_AZ0);  // 相对静止时的正对程度：1 不变，<1 被转到侧面
-        float x = cx + EYE_R * sinf(az), y = cy - 10 + bob + gy * 4 - mo * 3, w = 9 * wide;
+        float x = cx + EYE_R * sinf(az) * (1 + (body_x - 1) * 0.5f);
+        float y = cy - 10 + bob + gy * 4 - mo * 3 - stretch * 20, w = 9 * wide;
         eye_x[(s + 1) / 2] = x;
         eye_y[(s + 1) / 2] = y;
         eye_fore[(s + 1) / 2] = fore;
-        rxf_t em = rxf_scale(rxf_translate(base, x, y), fore, sq * pitch_squash);
+        rxf_t em = rxf_scale(rxf_translate(base, x, y), fore * body_x, sq * pitch_squash * body_y);
         switch (s_eye_kind) {
         case FACE_EYES_RING: {  // NOMI 的"0"：细线描边的竖向圆角框（底色是黑的，里面再填一块黑就成了描边）
             const float ow = 12 * wide, oh = 21 * wide, lw = 2.4f;
