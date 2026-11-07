@@ -8,6 +8,14 @@
 #define LH 160.0f  // 逻辑高
 #define SCALE 2.0f
 
+// 眼睛的球面模型：两只眼睛在半径 EYE_R 的球面上，静止时各偏离正前方 EYE_AZ0 弧度，正好是左右各 30（EYE_R * sin(EYE_AZ0)）。
+// 视线 -1～1 对应头转的角度：左右最多 EYE_YAW_MAX 弧度，上下最多 EYE_PITCH_MAX 弧度（上下只带来一点点压扁）。
+// 以后要调"转头幅度"改 EYE_YAW_MAX；改 EYE_AZ0 时要同时改 EYE_R 保持眼距
+#define EYE_AZ0 0.5f
+#define EYE_R 62.57f  // 30 / sin(0.5)
+#define EYE_YAW_MAX 0.28f
+#define EYE_PITCH_MAX 0.35f
+
 #define WHITE RGB565(255, 255, 255)
 #define BLACK RGB565(8, 8, 10)
 #define BLUSH RGB565(235, 235, 245)
@@ -23,6 +31,10 @@ static struct {
 
 static float s_bob, s_time, s_mode_time;
 static float s_next_blink, s_blink_t, s_next_look, s_look_x, s_look_y;
+static float s_blink_since = 10;  // 距离上一次眨眼开始多久，给"顺带眨一下"限频用
+static int s_blink_again, s_blink_second;  // 这一下眨完要不要紧接着再眨一下 / 现在正是紧接着的那一下
+static float s_last_gx, s_last_gy;         // 上一帧的目标视线，用来发现视线突然跳开
+static float s_touch_x, s_touch_y, s_touch_age = -1;  // 手指指的方向；age < 0 表示没在跟
 static float s_level = -1;
 static face_mode_t s_mode = FACE_IDLE;
 static uint32_t s_rng;
@@ -34,12 +46,23 @@ static float s_fall_t = -1;  // 入睡动画进行了多久，<0 表示没在播
 #define FALL_ASLEEP_S 2.2f   // 入睡动画时长，播完 Z 才开始冒
 
 // 同一个状态里轮换几个动作，等得久也不单调。进入状态先放第 0 个（最能说明状态的那个）：
-//   待机：0 随机张望（大部分时间）｜1 左右张望 2 原地蹦两下 3 歪一下头（偶尔插一个）
-//   聆听：0 手放耳边｜1 边听边点头
+//   待机：0 随机张望（大部分时间）｜1 左右张望 2 原地蹦两下 3 歪一下头 4 偷笑一下（偶尔插一个）
+//   聆听：0 手放耳边｜1 边听边点头 2 歪着头认真听
 //   思考：0 托腮看左上｜1 眼珠慢慢转一圈 2 抬头看头顶闪烁的三个点（在问大模型）3 挠头使劲想
-static const int kVariants[FACE_MODE_COUNT] = {4, 2, 4, 1, 1, 1};
+//   说话：0 平常讲｜1 跟着话的起伏点头 2 歪头晃着讲 3 眼睛往上看、像在想词
+//   开心：0 刚开心时连蹦几下｜1 左右摇摆 2 再蹦几下
+//   疑惑：0 歪头左右看｜1 慢慢摇头 2 眼神游移、冒一滴汗
+// 抽下一个动作用"洗牌袋"：一轮里每个动作各出现一次再重新洗牌，不会连着重复，也不会老是抽到同几个
+static const int kVariants[FACE_MODE_COUNT] = {5, 3, 4, 4, 3, 3};
+#define VARIANT_MAX 8
 static int s_variant;
 static float s_variant_time, s_variant_len;
+typedef struct {
+    uint8_t order[VARIANT_MAX];
+    uint8_t n, pos;  // 这一袋有 n 个，已经抽了 pos 个
+    int8_t last;     // 最近抽出（或演过）的一个
+} bag_t;
+static bag_t s_bags[FACE_MODE_COUNT];  // 每个状态一袋，离开再回来接着抽
 
 static spring_t spring(float x, float k, float d) { return (spring_t){x, 0, x, k, d}; }
 
@@ -58,9 +81,51 @@ static float frand(void)
     return (s_rng >> 8) / 16777216.0f;
 }
 
+// 请求眨一下眼，prob 是概率。正在眨、或离上一次眨眼太近（不到 0.9 秒）就算了，免得视线乱跳时眨个不停
+static void request_blink(float prob)
+{
+    if (s_sleep || s_blink_t >= 0 || s_blink_since < 0.9f || frand() >= prob) return;
+    s_blink_t = 0;
+    s_blink_since = 0;
+    s_next_blink = 2.2f + frand() * 3.5f;  // 刚眨过，定时的那个重新数
+}
+
+// 从这个状态的洗牌袋里抽下一个动作。待机的 0 是平常张望，穿插在特殊动作之间，不进袋子
+static int bag_pick(face_mode_t m)
+{
+    bag_t *b = &s_bags[m];
+    const int lo = m == FACE_IDLE ? 1 : 0, cnt = kVariants[m] - lo;
+    if (cnt <= 0) return 0;
+    if (b->pos >= b->n) {  // 一轮抽完了，重新洗牌
+        b->n = (uint8_t)cnt;
+        b->pos = 0;
+        for (int i = 0; i < cnt; i++) b->order[i] = (uint8_t)(lo + i);
+        for (int i = cnt - 1; i > 0; i--) {
+            const int j = (int)(frand() * (i + 1));
+            const uint8_t t = b->order[i];
+            b->order[i] = b->order[j];
+            b->order[j] = t;
+        }
+        // 新一轮的第一个不能和上一轮最后演的相同
+        if (cnt > 1 && b->order[0] == b->last) {
+            const int j = 1 + (int)(frand() * (cnt - 1));
+            const uint8_t t = b->order[0];
+            b->order[0] = b->order[j];
+            b->order[j] = t;
+        }
+    }
+    b->last = (int8_t)b->order[b->pos++];
+    return b->last;
+}
+
 void face_init(uint32_t seed)
 {
     s_rng = seed ? seed : 0x9e3779b9u;
+    for (int i = 0; i < FACE_MODE_COUNT; i++) s_bags[i] = (bag_t){.last = -1};
+    s_blink_since = 10;
+    s_blink_again = s_blink_second = 0;
+    s_last_gx = s_last_gy = 0;
+    s_touch_age = -1;
     P.open = spring(1, 260, 18);
     P.gx = spring(0, 90, 12);
     P.gy = spring(0, 90, 12);
@@ -92,21 +157,40 @@ void face_set_mode(face_mode_t mode)
     s_variant = 0;
     s_variant_time = 0;
     s_variant_len = mode == FACE_IDLE ? 6 + frand() * 6 : 2.4f;
+    if (mode != FACE_IDLE) {
+        // 进来先演了第 0 个：袋里接着抽的不能马上又是它
+        bag_t *b = &s_bags[mode];
+        b->last = 0;
+        if (b->pos < b->n && b->order[b->pos] == 0) {
+            if (b->n - b->pos > 1) {
+                const uint8_t t = b->order[b->pos];
+                b->order[b->pos] = b->order[b->n - 1];
+                b->order[b->n - 1] = t;
+            } else {
+                b->pos = b->n;  // 袋里只剩它，丢掉，下回重新洗牌
+            }
+        }
+    }
+    request_blink(0.4f);  // 换了状态，常顺带眨一下
 }
 
-// 换下一个动作：待机多数时间回到张望，偶尔插个短动作；其他状态随机换，不连着重复
+// 换下一个动作：待机多数时间回到张望，偶尔插个短动作；其他状态从洗牌袋里抽
 static void next_variant(void)
 {
-    const int n = kVariants[s_mode];
     if (s_mode == FACE_IDLE) {
-        s_variant = s_variant == 0 ? 1 + (int)(frand() * (n - 1)) : 0;
-        s_variant_len = s_variant == 0 ? 6 + frand() * 6 : 1.4f;
-    } else if (n > 1) {
-        int next = (int)(frand() * (n - 1));
-        s_variant = next >= s_variant ? next + 1 : next;
+        if (s_variant == 0) {
+            s_variant = bag_pick(s_mode);
+            s_variant_len = s_variant == 4 ? 1.9f : 1.4f;
+        } else {
+            s_variant = 0;
+            s_variant_len = 6 + frand() * 6;
+        }
+    } else if (kVariants[s_mode] > 1) {
+        s_variant = bag_pick(s_mode);
         s_variant_len = 2.6f + frand() * 1.2f;
     }
     s_variant_time = 0;
+    request_blink(0.35f);  // 换了动作，常顺带眨一下
 }
 
 /* ---------- 表情脚本播放 ---------- */
@@ -159,6 +243,23 @@ const char *face_mode_name(face_mode_t mode)
 
 void face_set_level(float level) { s_level = level; }
 
+// 手指一直按着时，触摸事件每 30 毫秒来一次；万一松手事件丢了（比如触摸被别的控件抢走），超时也会松开
+#define TOUCH_LOOK_TIMEOUT_S 1.2f
+#define TOUCH_LOOK_LINGER_S 0.45f  // 手指离开后，眼睛还盯着那里多久
+
+void face_look_at(float x, float y)
+{
+    s_touch_x = x < -1 ? -1 : (x > 1 ? 1 : x);
+    s_touch_y = y < -1 ? -1 : (y > 1 ? 1 : y);
+    s_touch_age = 0;
+}
+
+void face_look_release(void)
+{
+    if (s_touch_age >= 0 && s_touch_age < TOUCH_LOOK_TIMEOUT_S - TOUCH_LOOK_LINGER_S)
+        s_touch_age = TOUCH_LOOK_TIMEOUT_S - TOUCH_LOOK_LINGER_S;
+}
+
 void face_set_sleep(int sleeping)
 {
     if (s_sleep && !sleeping) s_wake_t = s_mode == FACE_IDLE ? 0 : -1;  // 醒来回到待机才伸懒腰
@@ -201,17 +302,30 @@ void face_step(float dt)
     }
     s_prop_t += dt;
 
+    // 眨眼：定时的兜底（2～5.5 秒一次，偶尔连眨两下）；视线突然跳开、换动作、换状态时另外会顺带眨一下
+    s_blink_since += dt;
     s_next_blink -= dt;
     if (s_next_blink < 0) {
         s_blink_t = 0;
+        s_blink_since = 0;
         s_next_blink = 2 + frand() * 3.5f;
+        if (s_blink_second) s_blink_second = s_blink_again = 0;  // 这就是连眨的第二下，不再接第三下
+        else s_blink_again = frand() < 0.15f;
     }
     int blink = 0;
     if (s_blink_t >= 0) {
         s_blink_t += dt;
         blink = s_blink_t < 0.11f;
-        if (s_blink_t > 0.22f) s_blink_t = -1;
+        if (s_blink_t > 0.22f) {
+            s_blink_t = -1;
+            if (s_blink_again) {
+                s_blink_again = 0;
+                s_blink_second = 1;
+                s_next_blink = 0.08f;  // 隔一小会儿再眨一下
+            }
+        }
     }
+    if (s_touch_age >= 0 && (s_touch_age += dt) > TOUCH_LOOK_TIMEOUT_S) s_touch_age = -1;
 
     P.open.t = blink ? 0.02f : (m == FACE_THINK ? 0.72f : 1);
     P.wide.t = m == FACE_LISTEN ? 1.15f : 1;
@@ -248,6 +362,7 @@ void face_step(float dt)
     if (s_variant_time >= s_variant_len) next_variant();
     const int v = s_variant;
     const float vt = s_variant_time;
+    int want_sweat = 0;
     if (m == FACE_THINK) {
         if (v == 1) {  // 眼珠慢慢转一圈，手放下
             P.open.t = blink ? 0.02f : 0.85f;
@@ -276,8 +391,51 @@ void face_step(float dt)
         gy = 0;
     } else if (m == FACE_IDLE && v == 2) {  // 原地蹦两下
         if (vt < 0.9f) s_bob -= fabsf(sinf(vt * PI_F / 0.45f)) * 5;
+    } else if (m == FACE_LISTEN && v == 2) {  // 歪着头认真听，眼睛睁得更大
+        P.tilt.t = 0.4f;
+        P.wide.t = 1.2f;
+        gx = 0.35f;
+        gy = -0.15f;
     } else if (m == FACE_IDLE && v == 3) {  // 歪一下头
         P.tilt.t = vt < 1.0f ? 0.35f : 0;
+    } else if (m == FACE_IDLE && v == 4) {  // 偷笑一下：眼睛弯成弧线，脸微微泛红，眼神往下躲
+        const int on = vt < 1.5f;
+        P.smile.t = on;
+        P.blush.t = on ? 0.7f : 0;
+        P.tilt.t = on ? 0.12f : 0;
+        gx = 0;
+        gy = 0.25f;
+    } else if (m == FACE_SPEAK && v == 1) {  // 跟着话的起伏点头
+        const float nod = fmaxf(0, sinf(vt * 5.5f)) * (0.35f + P.mouth.x);
+        s_bob += nod * 2.2f;
+        gy = 0.2f * nod;
+    } else if (m == FACE_SPEAK && v == 2) {  // 歪头晃着讲
+        P.tilt.t = 0.25f * sinf(vt * 1.6f);
+        gx = 0.3f + sinf(s_time * 0.9f) * 0.2f;
+    } else if (m == FACE_SPEAK && v == 3) {  // 眼睛往上看，像在想怎么说
+        P.open.t = blink ? 0.02f : 0.92f;
+        gx = 0.5f;
+        gy = -0.7f;
+    } else if (m == FACE_HAPPY && v == 1) {  // 开心地左右摇摆
+        P.tilt.t = 0.35f * sinf(vt * 4.5f);
+        s_bob -= fabsf(sinf(vt * 4.5f)) * 2;
+    } else if (m == FACE_HAPPY && v == 2) {  // 再蹦几下，越蹦越小
+        s_bob -= fabsf(sinf(vt * 8.5f)) * 6 * expf(-vt * 0.9f);
+    } else if (m == FACE_CONFUSED && v == 1) {  // 慢慢摇头
+        gx = sinf(vt * 4.2f) * 0.9f;
+        P.tilt.t = 0.12f * sinf(vt * 4.2f + 1.5f);
+    } else if (m == FACE_CONFUSED && v == 2) {  // 眼神游移，冒一滴汗
+        static const float dart[4][2] = {{-0.9f, -0.2f}, {0.8f, 0.3f}, {-0.3f, 0.7f}, {0.9f, -0.4f}};
+        const int k = (int)(vt * 2.4f) % 4;
+        gx = dart[k][0];
+        gy = dart[k][1];
+        want_sweat = 1;
+    }
+
+    // 手指按在屏幕上：眼睛看向手指（表情脚本明确写了视线的话，下面还是脚本说了算）
+    if (s_touch_age >= 0 && !s_sleep) {
+        gx = s_touch_x;
+        gy = s_touch_y;
     }
 
     // 表情脚本这一步写了的部分，盖过上面按状态算出来的
@@ -327,7 +485,7 @@ void face_step(float dt)
     }
     P.browu.t = st && st->brow == FACE_BROW_UP;
     P.browd.t = st && st->brow == FACE_BROW_DOWN;
-    P.sweat.t = st && st->sweat;
+    P.sweat.t = (st && st->sweat) || want_sweat;
     P.prop.t = st && st->nstrokes ? 1 : 0;
     if (P.prop.t == 0 && P.prop.x < 0.02f) s_prop_step = -1;
     // 换眼型：先压扁，压到最扁时换成新的，再撑开
@@ -340,6 +498,14 @@ void face_step(float dt)
         if (s_eye_switch >= EYE_SWITCH_S / 2) s_eye_kind = s_eye_next;
         if (s_eye_switch >= EYE_SWITCH_S) s_eye_switch = s_eye_kind != s_eye_next ? 0 : -1;
     }
+    // 视线突然跳开（左右张望、换了新的看点、手指刚按下来……）时顺带眨一下，像真人扫视时那样
+    if (fabsf(gx - s_last_gx) + fabsf(gy - s_last_gy) * 1.5f > 0.7f) request_blink(0.35f);
+    s_last_gx = gx;
+    s_last_gy = gy;
+    // 手指跟着走时弹簧硬一点，眼睛跟得上
+    const int following = s_touch_age >= 0 && !s_sleep;
+    P.gx.k = P.gy.k = following ? 170 : 90;
+    P.gx.d = P.gy.d = following ? 16 : 12;
     P.gx.t = gx;
     P.gy.t = gy;
     P.mouth.t = speech_level();
@@ -531,12 +697,18 @@ static void draw_face(raster_t *r)
     // 眼睛：常规是竖胶囊，开心/说话时先压扁再长成 ∩ 弧线；表情脚本能换成别的眼型（换的时候先压扁再撑开）
     float sq = s_eye_switch < 0 ? 1 : fabsf(1 - 2 * s_eye_switch / EYE_SWITCH_S);
     if (sq < 0.08f) sq = 0.08f;
-    float eye_x[2], eye_y[2];
+    // 视线不是把两只眼睛一起平移：两只眼睛长在一个球面上，视线是头转的方向（见 EYE_* 的说明）。
+    // 转向一侧时，那一侧的眼睛被"转到侧面"变窄、挪得少，另一侧的变宽、挪得多，两眼也靠近一点
+    const float yaw = gx * EYE_YAW_MAX, pitch_squash = cosf(gy * EYE_PITCH_MAX);
+    float eye_x[2], eye_y[2], eye_fore[2];
     for (int s = -1; s <= 1; s += 2) {
-        float x = cx + s * 30 + gx * 8, y = cy - 10 + bob + gy * 4 - mo * 3, w = 9 * wide;
+        const float az = s * EYE_AZ0 + yaw;
+        const float fore = cosf(az) / cosf(EYE_AZ0);  // 相对静止时的正对程度：1 不变，<1 被转到侧面
+        float x = cx + EYE_R * sinf(az), y = cy - 10 + bob + gy * 4 - mo * 3, w = 9 * wide;
         eye_x[(s + 1) / 2] = x;
         eye_y[(s + 1) / 2] = y;
-        rxf_t em = rxf_scale(rxf_translate(base, x, y), 1, sq);
+        eye_fore[(s + 1) / 2] = fore;
+        rxf_t em = rxf_scale(rxf_translate(base, x, y), fore, sq * pitch_squash);
         switch (s_eye_kind) {
         case FACE_EYES_RING: {  // NOMI 的"0"：细线描边的竖向圆角框（底色是黑的，里面再填一块黑就成了描边）
             const float ow = 12 * wide, oh = 21 * wide, lw = 2.4f;
@@ -569,7 +741,8 @@ static void draw_face(raster_t *r)
         }
     }
     if (s_eye_kind == FACE_EYES_SHADES) {
-        raster_line(r, base, eye_x[0] + 13, eye_y[0] - 3, eye_x[1] - 13, eye_y[1] - 3, 3, WHITE, 1);
+        raster_line(r, base, eye_x[0] + 13.5f * eye_fore[0], eye_y[0] - 3, eye_x[1] - 13.5f * eye_fore[1], eye_y[1] - 3, 3,
+                    WHITE, 1);
     }
 
     // 眉毛：上扬是眼睛上方一道弧，皱眉是往中间压下来的斜线

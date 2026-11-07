@@ -33,6 +33,12 @@ const char *face_mode_name(face_mode_t mode);
 // 说话音量 0..1，由音频播放驱动；传负数表示没有真实音量，说话时用模拟音量
 void face_set_level(float level);
 
+// 让它看向某处：x、y 在 -1～1（和表情脚本的 look 一样，x 正是往右、y 正是往下）。手指按在屏幕上时每次触摸事件调一次。
+// 一段时间（1.2 秒）没再调就自动松开；盖过状态自带的视线，但表情脚本明确写了 look 的步骤仍以脚本为准
+void face_look_at(float x, float y);
+// 手指离开了：眼睛再盯一小会儿（约 0.45 秒）就回到状态自己的视线
+void face_look_release(void);
+
 // 睡着：闭眼、收手、缓慢呼吸，盖过当前状态；醒来后回到原状态
 void face_set_sleep(int sleeping);
 
