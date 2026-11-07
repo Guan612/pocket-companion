@@ -124,10 +124,15 @@ void Application::Initialize() {
 
         switch (event) {
             case NetworkEvent::Scanning:
-                display->ShowNotification(Lang::Strings::SCANNING_WIFI, 30000);
+                // 断网后台重试时不弹（见 WifiBoard::ShouldAnnounceNetworkProgress）；找到热点会接着弹"连接 xxx..."，
+                // 所以扫描这条只留几秒，不挂 30 秒
+                if (Board::GetInstance().ShouldAnnounceNetworkProgress()) {
+                    display->ShowNotification(Lang::Strings::SCANNING_WIFI, 5000);
+                }
                 xEventGroupSetBits(event_group_, MAIN_EVENT_NETWORK_DISCONNECTED);
                 break;
             case NetworkEvent::Connecting: {
+                if (!Board::GetInstance().ShouldAnnounceNetworkProgress()) break;
                 if (data.empty()) {
                     // Cellular network - registering without carrier info yet
                     display->SetStatus(Lang::Strings::REGISTERING_NETWORK);

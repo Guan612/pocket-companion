@@ -76,6 +76,8 @@ public:
     virtual NetworkInterface* GetNetwork() = 0;
     virtual void StartNetwork() = 0;
     virtual void SetNetworkEventCallback(NetworkEventCallback callback) { (void)callback; }
+    // 要不要弹"扫描 / 连接 Wi-Fi..."这类联网进度提示。默认要；Wi-Fi 板子在断网后台反复重试时返回 false，别一直弹
+    virtual bool ShouldAnnounceNetworkProgress() { return true; }
     virtual const char* GetNetworkStateIcon() = 0;
     virtual bool GetBatteryLevel(int &level, bool& charging, bool& discharging);
     virtual std::string GetSystemInfoJson();

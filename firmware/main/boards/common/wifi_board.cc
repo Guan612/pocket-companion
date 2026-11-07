@@ -160,6 +160,12 @@ void WifiBoard::SetNetworkEventCallback(NetworkEventCallback callback) {
     network_event_callback_ = std::move(callback);
 }
 
+bool WifiBoard::ShouldAnnounceNetworkProgress() {
+    // 只在一次连接尝试的头 60 秒里提示（开机、网页提交了新 Wi-Fi 之后）。超时后站点在后台按退避间隔反复重试，
+    // 连上过又掉线后的重试也是：每一轮都弹一次"连接 xxx..."就成了断网时一直在提示，这些都不弹，状态栏图标已经显示离线
+    return connect_timer_ != nullptr && esp_timer_is_active(connect_timer_);
+}
+
 void WifiBoard::OnWifiConnectTimeout(void* arg) {
     // 连不上不再切配网模式：站点留着按退避间隔继续扫（10 秒起步，最长 5 分钟一轮），
     // 网络一恢复就连上、照常激活；断网期间时钟、闹钟和 SD 卡上的本地应用照常能用。
